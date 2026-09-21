@@ -1,0 +1,456 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>羽毛球场预约</title>
+<style>
+:root{
+  --bg:#0d1117;
+  --bg-elev:#161b22;
+  --bg-input:#0b0f16;
+  --border:#262d38;
+  --border-strong:#39414d;
+  --text:#e6edf3;
+  --text-dim:#8b949e;
+  --text-mute:#6b7280;
+  --primary:#2f81f7;
+  --primary-hover:#4b95f9;
+  --success:#2ea043;
+  --success-hover:#3fb950;
+  --purple:#a371f7;
+}
+
+* { box-sizing: border-box; }
+
+html { color-scheme: dark; }
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI",
+       "PingFang SC", "Microsoft YaHei", sans-serif;
+  max-width: 1080px; margin: 24px auto; padding: 0 20px;
+  min-height: 100vh;
+  color: var(--text);
+  background:
+    radial-gradient(1100px 560px at 15% -12%, rgba(47,129,247,.13), transparent 62%),
+    radial-gradient(900px 520px at 100% 0%, rgba(163,113,247,.10), transparent 58%),
+    var(--bg);
+  background-attachment: fixed;
+  -webkit-font-smoothing: antialiased;
+}
+
+h1 { font-size: 22px; margin: 0 0 18px; font-weight: 700; letter-spacing: .3px; }
+
+.card {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  padding: 12px 16px; border-radius: 10px;
+  box-shadow: 0 1px 2px rgba(0,0,0,.5), 0 12px 28px -20px rgba(0,0,0,.9);
+  margin-bottom: 12px;
+}
+
+.row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+.row label { font-size: 13px; color: var(--text-dim); }
+
+input, select {
+  padding: 7px 10px; border: 1px solid var(--border);
+  border-radius: 6px; font-size: 13px;
+  background: var(--bg-input); color: var(--text);
+  transition: border-color .15s, box-shadow .15s, background .15s;
+}
+input::placeholder { color: #58616e; }
+input:hover, select:hover { border-color: var(--border-strong); }
+input:focus, select:focus {
+  outline: none; border-color: var(--primary);
+  background: #0e1520;
+  box-shadow: 0 0 0 3px rgba(47,129,247,.18);
+}
+select option { background: var(--bg-elev); color: var(--text); }
+
+#token { flex: 1; min-width: 260px; }
+
+button {
+  padding: 7px 16px; border: 1px solid transparent; border-radius: 6px;
+  cursor: pointer; font-size: 13px; font-weight: 500;
+  transition: background .15s, border-color .15s, filter .15s, transform .06s;
+}
+button:active:enabled { transform: translateY(1px); }
+button:disabled {
+  background: #21262d !important; color: #55606e !important;
+  border-color: var(--border) !important; cursor: not-allowed;
+}
+
+.primary { background: var(--primary); color: #fff; }
+.primary:hover:enabled { background: var(--primary-hover); }
+
+.auto { background: linear-gradient(180deg, #3b8ef8, #1f6feb); color: #fff; }
+.auto:hover:enabled { filter: brightness(1.12); }
+
+.dot {
+  display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+  background: #3a4351; transition: background .2s, box-shadow .2s;
+}
+.dot.on { background: var(--success-hover); box-shadow: 0 0 0 3px rgba(63,185,80,.16); }
+
+.mini {
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 12px; color: var(--text-dim);
+}
+
+.section { margin-top: 18px; }
+.section h2 {
+  font-size: 14px; color: #c3cbd6; margin: 0 0 8px;
+  padding-left: 8px; border-left: 3px solid var(--primary);
+  font-weight: 600;
+}
+
+.grid, .avail-grid { display: flex; flex-wrap: wrap; gap: 8px; }
+
+.court {
+  padding: 10px 18px; border-radius: 8px; font-size: 13px;
+  background: linear-gradient(180deg, #3588f8, #1f6feb);
+  color: #fff; cursor: pointer; text-align: center;
+  min-width: 66px; user-select: none;
+  border: 1px solid rgba(255,255,255,.10);
+  box-shadow: 0 1px 2px rgba(0,0,0,.45);
+  transition: filter .15s, box-shadow .15s, transform .06s;
+}
+.court:hover {
+  filter: brightness(1.12);
+  box-shadow: 0 6px 18px -6px rgba(47,129,247,.75);
+}
+.court:active { transform: translateY(1px); }
+
+.avail-btn {
+  padding: 9px 16px; border-radius: 8px; font-size: 13px;
+  background: linear-gradient(180deg, #2ea043, #217a33);
+  color: #fff; border: 1px solid rgba(255,255,255,.10); cursor: pointer;
+  box-shadow: 0 1px 2px rgba(0,0,0,.45);
+  transition: filter .15s, box-shadow .15s, transform .06s;
+}
+.avail-btn:hover {
+  filter: brightness(1.14);
+  box-shadow: 0 6px 18px -6px rgba(63,185,80,.7);
+}
+.avail-btn:active { transform: translateY(1px); }
+
+.hint { color: var(--text-mute); font-size: 12px; padding: 6px 0; }
+
+.log {
+  background: #080b10; color: #c9d1d9;
+  border: 1px solid var(--border);
+  padding: 10px 14px; border-radius: 8px;
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 12px; max-height: 320px; overflow-y: auto;
+  margin-top: 18px; white-space: pre-wrap; line-height: 1.55;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.03);
+}
+.log .l-INFO { color: #7ee787; }
+.log .l-WARNING { color: #ffa657; }
+.log .l-ERROR { color: #ff7b72; }
+
+.pill {
+  display: inline-block; padding: 2px 10px; border-radius: 999px;
+  background: #21262d; border: 1px solid var(--border);
+  color: var(--text); font-size: 12px;
+}
+
+/* 滚动条 */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: #2b333f; border-radius: 6px;
+  border: 2px solid transparent; background-clip: content-box;
+}
+::-webkit-scrollbar-thumb:hover { background: #3c4552; background-clip: content-box; }
+
+/* 高亮数字 */
+#vid-count, #cur-date { color: var(--text); font-weight: 600; }
+</style>
+</head>
+<body>
+
+<h1>🏸 羽毛球场预约</h1>
+
+<div class="card row">
+  <label>Token</label>
+  <input id="token" placeholder="粘贴 token">
+  <label>日期</label>
+  <select id="date-offset">
+    <option value="0">今天</option>
+    <option value="1" selected>明天</option>
+    <option value="2">后天</option>
+  </select>
+  <button class="primary" id="btn-save">保存</button>
+  <span class="mini">目标：<b id="cur-date">-</b></span>
+</div>
+
+<div class="card row">
+  <span>VID 缓存：<b id="vid-count">0</b></span>
+  <span class="mini"><span class="dot" id="sse-dot"></span>SSE</span>
+  <button class="primary" id="btn-vid">启动 VID</button>
+  <button class="primary" id="btn-refresh">刷新场地</button>
+  <span class="mini" id="last-solve">最近 solve：-</span>
+</div>
+
+<div class="card row">
+  <label style="font-weight:700;">全自动</label>
+  <label>时段</label>
+  <select id="auto-ss"></select>     <!-- JS 填充：08:00 ~ 21:30 -->
+  <span style="color:#a371f7;">—</span>
+  <select id="auto-se"></select>     <!-- JS 填充：08:30 ~ 22:00 -->
+  <label>触发</label><input id="auto-rt" value="20:00:01" style="width:85px">
+  <label>申请</label><input id="auto-st" value="20:00:04" style="width:85px">
+  <label>最多</label>
+  <input id="auto-mo" type="number" value="3" min="1" max="10" style="width:55px">
+  <button class="auto" id="btn-auto">启动全自动</button>
+</div>
+
+<div class="card" id="auto-status" style="display:none">
+  <span class="pill" id="auto-phase">idle</span>
+  <span class="mini" id="auto-msg" style="margin-left:10px;"></span>
+  <div class="mini" style="margin-top:8px;">候选：<span id="auto-cands">无</span></div>
+  <div class="mini">已申请：<span id="auto-applied">无</span></div>
+</div>
+
+<div class="section">
+  <h2>标准时段</h2>
+  <div id="buckets"></div>
+</div>
+
+<div class="section">
+  <h2>其他时段</h2>
+  <div id="dynamic"></div>
+</div>
+
+<div class="log" id="log"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+
+/* ── 时段下拉：全部 30 分钟粒度 ─────────────────────────────
+   起始：08:00 ~ 21:30   （可选值 28 个）
+   结束：08:30 ~ 22:00   （可选值 28 个）
+   默认选中 20:00 / 22:00
+──────────────────────────────────────────────────────── */
+function fillTimeSelect(sel, fromMin, toMin, defValue) {
+  for (let m = fromMin; m <= toMin; m += 30) {
+    const hh = String(Math.floor(m / 60)).padStart(2, "0");
+    const mm = String(m % 60).padStart(2, "0");
+    const val = `${hh}:${mm}`;
+    const opt = document.createElement("option");
+    opt.value = opt.textContent = val;
+    if (val === defValue) opt.selected = true;
+    sel.appendChild(opt);
+  }
+}
+fillTimeSelect($("auto-ss"), 8 * 60, 21 * 60 + 30, "20:00");
+fillTimeSelect($("auto-se"), 8 * 60 + 30, 22 * 60,   "22:00");
+
+/* ── 时段常量 ─────────────────────────────────────────── */
+const PERM = {
+  "16:00-18:00": ["16:00","16:30","17:00","17:30"],
+  "18:00-20:00": ["18:00","18:30","19:00","19:30"],
+  "20:00-22:00": ["20:00","20:30","21:00","21:30"],
+};
+const DYN = [
+  {t:"08:00-10:00", s:["08:00","08:30","09:00","09:30"], e:"10:00"},
+  {t:"10:00-12:00", s:["10:00","10:30","11:00","11:30"], e:"12:00"},
+  {t:"12:00-14:00", s:["12:00","12:30","13:00","13:30"], e:"14:00"},
+  {t:"14:00-16:00", s:["14:00","14:30","15:00","15:30"], e:"16:00"},
+];
+
+let perm = {}, dyn = {}, lastLog = 0, sse = null;
+let vidRunning = false, autoRunning = false, refreshRunning = false;
+
+function reset() {
+  perm = {}; for (const k in PERM) perm[k] = [];
+  dyn  = {}; for (const g of DYN)  dyn[g.t]  = [];
+  render();
+}
+
+function isFree(avail, t) {
+  if (!avail) return false;
+  if (avail[t] === "1") return true;
+  const p = t.split(":");
+  return avail[p[0].padStart(2,"0") + ":" + p[1]] === "1"
+      || avail[String(+p[0]) + ":" + p[1]] === "1";
+}
+
+function runsOf(g, avail) {
+  const out = []; let s = -1;
+  for (let i = 0; i < g.s.length; i++) {
+    const f = isFree(avail, g.s[i]);
+    if (f && s === -1) s = i;
+    if (!f && s !== -1) { out.push([g.s[s], g.s[i]]); s = -1; }
+  }
+  if (s !== -1) out.push([g.s[s], g.e]);
+  return out;
+}
+
+function onResult(r) {
+  if (!r || !r.ok || !r.avail) return;
+  const a = r.avail, c = r.court;
+  for (const b in PERM) {
+    if (PERM[b].every(s => isFree(a, s)) && !perm[b].some(x => x.court === c)) {
+      const [st, en] = b.split("-");
+      perm[b].push({court: c, start: st, end: en});
+    }
+  }
+  for (const g of DYN) {
+    for (const [s, e] of runsOf(g, a)) {
+      if (!dyn[g.t].some(x => x.court === c && x.start === s)) {
+        dyn[g.t].push({court: c, start: s, end: e});
+      }
+    }
+  }
+  render();
+}
+
+function render() {
+  $("buckets").innerHTML = Object.entries(PERM).map(([b]) => {
+    const items = perm[b] || [];
+    const inner = items.length
+      ? `<div class="grid">${items.map(i =>
+          `<div class="court" data-court="${i.court}" data-start="${i.start}" data-end="${i.end}">${i.court}号场</div>`
+        ).join("")}</div>`
+      : `<div class="hint">暂无空闲</div>`;
+    return `<div class="section"><h2>${b}${items.length ? ` (${items.length})` : ""}</h2>${inner}</div>`;
+  }).join("");
+
+  let total = 0;
+  const html = DYN.map(g => {
+    const items = dyn[g.t] || [];
+    if (!items.length) return "";
+    total += items.length;
+    return `<div class="section"><h2>${g.t} (${items.length})</h2><div class="avail-grid">
+      ${items.map(i => `<button class="avail-btn" data-court="${i.court}" data-start="${i.start}" data-end="${i.end}">${i.court}号场 · ${i.start}-${i.end}</button>`).join("")}
+    </div></div>`;
+  }).join("");
+  $("dynamic").innerHTML = total ? html : `<div class="hint">暂无</div>`;
+}
+
+function addLog(e) {
+  const el = $("log");
+  const div = document.createElement("div");
+  div.className = "l-" + e.level;
+  div.textContent = `[${e.ts}] [${e.level}] ${e.msg}`;
+  el.insertBefore(div, el.firstChild);
+  while (el.childNodes.length > 400) el.removeChild(el.lastChild);
+}
+
+async function pollLogs() {
+  try {
+    const r = await fetch("/api/logs?since=" + lastLog);
+    const d = await r.json();
+    for (const e of d.logs) { lastLog = e.seq; addLog(e); }
+  } catch {}
+}
+
+function connectSSE(since) {
+  if (sse) sse.close();
+  sse = new EventSource("/api/stream?since=" + since);
+  sse.onopen  = () => $("sse-dot").classList.add("on");
+  sse.onerror = () => $("sse-dot").classList.remove("on");
+  sse.addEventListener("refresh.result", ev => onResult(JSON.parse(ev.data).data));
+  sse.addEventListener("refresh.done", () => {
+    refreshRunning = false;
+    const b = $("btn-refresh"); b.disabled = false; b.textContent = "刷新场地";
+  });
+}
+
+$("btn-save").onclick = async () => {
+  const token = $("token").value.trim();
+  if (!token) return alert("请填写 token");
+  const d = new Date(); d.setDate(d.getDate() + +$("date-offset").value);
+  const date = d.getFullYear() + "-"
+    + String(d.getMonth() + 1).padStart(2, "0") + "-"
+    + String(d.getDate()).padStart(2, "0");
+  const r = await fetch("/api/config", {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({token, target_date: date}),
+  });
+  const j = await r.json();
+  $("cur-date").textContent = j.target_date;
+  reset();
+};
+
+$("btn-vid").onclick = () =>
+  fetch(vidRunning ? "/api/vid/stop" : "/api/vid/start", {method: "POST"});
+
+$("btn-refresh").onclick = async () => {
+  if (refreshRunning) return;
+  reset();
+  const d = await (await fetch("/api/refresh", {method: "POST"})).json();
+  if (!d.ok) return alert(d.msg);
+  refreshRunning = true;
+  const b = $("btn-refresh"); b.disabled = true; b.textContent = "刷新中…";
+};
+
+$("btn-auto").onclick = async () => {
+  if (autoRunning) {
+    await fetch("/api/auto/stop", {method: "POST"});
+    return;
+  }
+  const body = {
+    slot_start: $("auto-ss").value, slot_end: $("auto-se").value,
+    refresh_at: $("auto-rt").value.trim(), submit_at: $("auto-st").value.trim(),
+    max_orders: +$("auto-mo").value, 
+  };
+  const d = await (await fetch("/api/auto/start", {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(body),
+  })).json();
+  if (!d.ok) alert(d.msg);
+};
+
+document.addEventListener("click", ev => {
+  const el = ev.target.closest("[data-court]");
+  if (!el) return;
+  fetch("/api/reserve", {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({
+      court_no: +el.dataset.court,
+      start: el.dataset.start, end: el.dataset.end,
+    }),
+  });
+});
+
+setInterval(async () => {
+  try {
+    const d = await (await fetch("/api/vid/state")).json();
+    $("vid-count").textContent = d.count;
+    vidRunning = d.running;
+    $("btn-vid").textContent = vidRunning ? "停止 VID" : "启动 VID";
+    const s = d.stats[d.stats.length - 1];
+    $("last-solve").textContent = s
+      ? `最近 solve：${s.ok ? s.total_ms + "ms" : "失败"}`
+      : "最近 solve：-";
+  } catch {}
+  try {
+    const d = await (await fetch("/api/auto/state")).json();
+    autoRunning = d.running;
+    $("btn-auto").textContent = autoRunning ? "停止全自动" : "启动全自动";
+    if (autoRunning || d.phase === "done") {
+      $("auto-status").style.display = "";
+      $("auto-phase").textContent = d.phase;
+      $("auto-msg").textContent = d.msg;
+      $("auto-cands").textContent = (d.candidates || []).map(c => c.name).join(" / ") || "无";
+      $("auto-applied").textContent =
+        (d.applied || []).map(a => `${a.name}${a.ok ? "✓" : "✗"}`).join(" / ") || "无";
+    }
+  } catch {}
+}, 1000);
+
+window.addEventListener("DOMContentLoaded", async () => {
+  reset();
+  pollLogs(); setInterval(pollLogs, 1000);
+  try {
+    const d = await (await fetch("/api/refresh/seq")).json();
+    connectSSE(d.seq);
+  } catch { connectSSE(0); }
+});
+</script>
+</body>
+</html>
