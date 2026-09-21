@@ -490,57 +490,114 @@ class Bus:
 bus = Bus()
 
 
-# ============================================================
-# 刷新服务
-# ============================================================
 class RefreshService:
+    """探测-扇出刷新：
+       1) 先挑一个场地做低频试探（失败退避 PROBE_BACKOFF 秒，最多 PROBE_MAX_TRIES 次）
+       2) 任意一次成功 → 立刻并发查询其余全部场地
+       3) 全部试探失败 → 放弃本次刷新，发 refresh.done(probe_failed=True)
+    """
+
+    PROBE_BACKOFF: float = 1.0
+    PROBE_MAX_TRIES: int = 15
+
     def __init__(self):
+        self._probe_task: asyncio.Task | None = None
         self._tasks: list[asyncio.Task] = []
 
     @property
     def running(self) -> bool:
+        if self._probe_task and not self._probe_task.done():
+            return True
         return any(not t.done() for t in self._tasks)
 
-    async def start(self, date: str, token: str, courts: list[Court] | None = None) -> int:
+    async def start(self, date: str, token: str,
+                    courts: list[Court] | None = None) -> int:
         await self.stop()
-        courts = list(courts or COURTS)
-        random.shuffle(courts)
-        log.info("启动刷新: %d 个场地", len(courts))
-        self._tasks = [asyncio.create_task(self._one(c, date, token)) for c in courts]
-        asyncio.create_task(self._watch(list(self._tasks)))
-        return len(courts)
+        pool = list(courts or COURTS)
+        random.shuffle(pool)
+        log.info("启动刷新: 探测 %s → 成功后并发剩余 %d 个场地 "
+                 "(退避 %.1fs / 最多 %d 次)",
+                 pool[0].name, len(pool) - 1,
+                 self.PROBE_BACKOFF, self.PROBE_MAX_TRIES)
+        self._probe_task = asyncio.create_task(self._run(date, token, pool))
+        return len(pool)
 
     async def stop(self):
-        for t in self._tasks:
+        tasks = [t for t in ([self._probe_task] + self._tasks) if t is not None]
+        for t in tasks:
             t.cancel()
-        if self._tasks:
-            await asyncio.gather(*self._tasks, return_exceptions=True)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._probe_task = None
         self._tasks = []
 
-    async def _watch(self, tasks):
-        await asyncio.gather(*tasks, return_exceptions=True)
-        await bus.publish("refresh.done", {"ts": datetime.now().strftime("%H:%M:%S")})
+    # ---------- 内部 ----------
 
-    async def _one(self, court: Court, date: str, token: str):
-        for attempt in range(1, 4):
-            t0 = time.monotonic()
-            avail = await query_court(court, date, token)
-            dt = (time.monotonic() - t0) * 1000
-            if avail is not None:
-                log.info("%s OK (第%d次, %.0fms)", court.name, attempt, dt)
-                await bus.publish("refresh.result", {
-                    "court": court.no, "name": court.name, "ok": True, "avail": avail,
-                    "ts": datetime.now().strftime("%H:%M:%S"),
-                })
-                return
-            log.info("%s 失败 (第%d次, %.0fms)", court.name, attempt, dt)
-            if attempt < 3:
-                await asyncio.sleep(2.0)
-        await bus.publish("refresh.result", {
-            "court": court.no, "name": court.name, "ok": False,
-            "error": "多次尝试均失败", "ts": datetime.now().strftime("%H:%M:%S"),
+    async def _run(self, date, token, pool):
+        await self._probe_then_fanout(date, token, pool)
+        await bus.publish("refresh.done", {
+            "ts": datetime.now().strftime("%H:%M:%S"),
         })
 
+    async def _probe_then_fanout(self, date, token, pool):
+        probe = pool[0]
+        for attempt in range(1, self.PROBE_MAX_TRIES + 1):
+            t0 = time.monotonic()
+            avail = await query_court(probe, date, token)
+            dt = (time.monotonic() - t0) * 1000
+
+            if avail is not None:
+                log.info("探测 %s 成功 (%.0fms, 第 %d 次)，开始并发其余 %d 个场地",
+                         probe.name, dt, attempt, len(pool) - 1)
+                await bus.publish("refresh.result", {
+                    "court": probe.no, "name": probe.name, "ok": True,
+                    "avail": avail,
+                    "ts": datetime.now().strftime("%H:%M:%S"),
+                })
+                break
+
+            log.info("探测 %s 失败 (%.0fms, %d/%d)",
+                     probe.name, dt, attempt, self.PROBE_MAX_TRIES)
+
+            if attempt == self.PROBE_MAX_TRIES:
+                log.warning("探测 %s %d 次全部失败，放弃本次刷新",
+                            probe.name, self.PROBE_MAX_TRIES)
+                await bus.publish("refresh.result", {
+                    "court": probe.no, "name": probe.name, "ok": False,
+                    "error": f"探测 {self.PROBE_MAX_TRIES} 次全部失败",
+                    "ts": datetime.now().strftime("%H:%M:%S"),
+                })
+                await bus.publish("refresh.done", {
+                    "ts": datetime.now().strftime("%H:%M:%S"),
+                    "probe_failed": True,
+                })
+                return
+
+            await asyncio.sleep(self.PROBE_BACKOFF)
+
+        # 探测成功 → 并发其余
+        self._tasks = [asyncio.create_task(self._one(c, date, token))
+                       for c in pool[1:]]
+        await asyncio.gather(*self._tasks, return_exceptions=True)
+
+    async def _one(self, court: Court, date: str, token: str):
+        t0 = time.monotonic()
+        avail = await query_court(court, date, token)
+        dt = (time.monotonic() - t0) * 1000
+        if avail is not None:
+            log.info("%s OK (%.0fms)", court.name, dt)
+            await bus.publish("refresh.result", {
+                "court": court.no, "name": court.name, "ok": True,
+                "avail": avail,
+                "ts": datetime.now().strftime("%H:%M:%S"),
+            })
+        else:
+            log.info("%s 失败 (%.0fms)", court.name, dt)
+            await bus.publish("refresh.result", {
+                "court": court.no, "name": court.name, "ok": False,
+                "error": "查询失败",
+                "ts": datetime.now().strftime("%H:%M:%S"),
+            })
 
 refresh_service = RefreshService()
 
