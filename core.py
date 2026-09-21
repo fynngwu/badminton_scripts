@@ -34,6 +34,9 @@ CUSTOMER_TEL  = "13651486427"
 GYM_ID        = "1297443858304540673"
 GYM_NAME      = "润杨羽毛球馆"
 
+VID_TIMEOUT   = 3.5     # 验证码 generate / check 的 HTTP 超时
+VID_MAX_AGE   = 8.0     # 队列里 vid 的最长有效存活时间（秒）
+
 HEADERS = {
     "Accept": "application/json, text/plain, */*",
     "Content-Type": "application/json;charset=UTF-8",
@@ -135,7 +138,7 @@ class CaptchaSolver:
     W, H, TRAVEL = 242, 180, 242
     BG_W, BG_H   = 48, 36
 
-    def __init__(self, timeout: float = 4.0):
+    def __init__(self, timeout: float = VID_TIMEOUT):
         self.timeout = timeout
         self.timing: dict = {}
 
@@ -279,13 +282,15 @@ class CaptchaSolver:
 
 
 # ============================================================
-# VID 池
+# VID 池（队列元素带时间戳，取用时过滤过期 vid）
 # ============================================================
 class VidPool:
-    def __init__(self, size: int = 3, period: float = 8.2, qmax: int = 3):
+    def __init__(self, size: int = 3, period: float = 8.2, qmax: int = 3,
+                 max_age: float = VID_MAX_AGE):
         self.size = size
         self.period = period
-        self.queue: asyncio.Queue[str] = asyncio.Queue(maxsize=qmax)
+        self.max_age = max_age
+        self.queue: asyncio.Queue[tuple[float, str]] = asyncio.Queue(maxsize=qmax)
         self._tasks: list[asyncio.Task] = []
         self.stats: deque = deque(maxlen=30)
 
@@ -306,7 +311,8 @@ class VidPool:
             asyncio.create_task(self._worker(i + 1, i * stagger))
             for i in range(self.size)
         ]
-        log.info("VID 池启动: %d workers / 周期 %.1fs", self.size, self.period)
+        log.info("VID 池启动: %d workers / 周期 %.1fs / 有效期 %.1fs",
+                 self.size, self.period, self.max_age)
         return True
 
     async def stop(self):
@@ -317,11 +323,23 @@ class VidPool:
         self._tasks = []
         log.info("VID 池已停止")
 
-    async def take(self, timeout: float = 5.0) -> str | None:
-        try:
-            return await asyncio.wait_for(self.queue.get(), timeout=timeout)
-        except asyncio.TimeoutError:
-            return None
+    async def take(self, timeout: float = 5.0,
+                   max_age: float | None = None) -> str | None:
+        """取一个未过期的 vid。过期的会被丢弃并继续尝试，直到总 timeout 耗尽。"""
+        limit = self.max_age if max_age is None else max_age
+        deadline = time.monotonic() + timeout
+        while True:
+            remain = deadline - time.monotonic()
+            if remain <= 0:
+                return None
+            try:
+                ts, vid = await asyncio.wait_for(self.queue.get(), timeout=remain)
+            except asyncio.TimeoutError:
+                return None
+            age = time.monotonic() - ts
+            if age <= limit:
+                return vid
+            log.warning("VID 过期丢弃 (存活 %.1fs > %.1fs)", age, limit)
 
     async def _worker(self, tid: int, delay: float):
         if delay > 0:
@@ -329,7 +347,7 @@ class VidPool:
         while True:
             t0 = time.monotonic()
             try:
-                solver = CaptchaSolver(timeout=4.0)
+                solver = CaptchaSolver(timeout=VID_TIMEOUT)
                 vid = await solver.solve()
                 self.stats.append({"ok": True, "ts": datetime.now().strftime("%H:%M:%S"),
                                    **solver.timing})
@@ -337,12 +355,13 @@ class VidPool:
                          tid, solver.timing["total_ms"], solver.timing["gen_ms"],
                          solver.timing["rec_ms"], solver.timing["trk_ms"],
                          solver.timing["chk_ms"])
+                item = (time.monotonic(), vid)
                 try:
-                    self.queue.put_nowait(vid)
+                    self.queue.put_nowait(item)
                 except asyncio.QueueFull:
                     try: self.queue.get_nowait()
                     except asyncio.QueueEmpty: pass
-                    try: self.queue.put_nowait(vid)
+                    try: self.queue.put_nowait(item)
                     except asyncio.QueueFull: pass
             except asyncio.CancelledError:
                 raise
@@ -516,7 +535,7 @@ class RefreshService:
                 return
             log.info("%s 失败 (第%d次, %.0fms)", court.name, attempt, dt)
             if attempt < 3:
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(2.0)
         await bus.publish("refresh.result", {
             "court": court.no, "name": court.name, "ok": False,
             "error": "多次尝试均失败", "ts": datetime.now().strftime("%H:%M:%S"),
@@ -637,11 +656,12 @@ async def _run_auto(date, token, slot_start, slot_end,
             if any(a["court"] == c.no for a in applied):
                 continue
 
+            # take 内部会丢弃过期 vid，最多等 2s
             vid = await vid_pool.take(timeout=2.0)
             if not vid:
-                log.info("自动模式: 队列无 vid，同步兜底求解")
+                log.info("自动模式: 队列无有效 vid，同步兜底求解")
                 try:
-                    vid = await CaptchaSolver(timeout=6.0).solve()
+                    vid = await CaptchaSolver(timeout=VID_TIMEOUT).solve()
                 except Exception as e:
                     log.warning("兜底求解失败: %s", e)
                     continue
@@ -739,7 +759,7 @@ async def _run_auto(date, token, slot_start, slot_end,
             bus.unsubscribe(q)
         await refresh_service.stop()
 
-        # ── 申请成功 → 无论 VID 由谁启动，一律停止 ────────────
+        # ── 申请成功 → 停止 VID 池 ───────────────────────────
         if has_success() and vid_pool.running:
             log.info("自动模式: 申请成功，停止 VID 池")
             await vid_pool.stop()
