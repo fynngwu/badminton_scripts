@@ -5,3 +5,4 @@ requests
 numpy
 pillow
 opencv-python
+httpx

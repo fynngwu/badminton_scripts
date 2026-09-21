@@ -285,7 +285,7 @@ class CaptchaSolver:
 # VID 池（队列元素带时间戳，取用时过滤过期 vid）
 # ============================================================
 class VidPool:
-    def __init__(self, size: int = 3, period: float = 8.2, qmax: int = 3,
+    def __init__(self, size: int = 3, period: float = 8., qmax: int = 3,
                  max_age: float = VID_MAX_AGE):
         self.size = size
         self.period = period
@@ -345,7 +345,6 @@ class VidPool:
         if delay > 0:
             await asyncio.sleep(delay)
         while True:
-            t0 = time.monotonic()
             try:
                 solver = CaptchaSolver(timeout=VID_TIMEOUT)
                 vid = await solver.solve()
@@ -369,9 +368,7 @@ class VidPool:
                 self.stats.append({"ok": False, "error": str(e),
                                    "ts": datetime.now().strftime("%H:%M:%S")})
                 log.warning("VID-ERR [T%d] %s", tid, e)
-            wait = self.period - (time.monotonic() - t0)
-            if wait > 0:
-                await asyncio.sleep(wait)
+            await asyncio.sleep(self.period)
 
 
 vid_pool = VidPool()
