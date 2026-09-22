@@ -377,8 +377,17 @@ vid_pool = VidPool()
 # ============================================================
 # 场地查询 / 下单
 # ============================================================
+def _norm_hm(t: str) -> str:
+    """'8:00' -> '08:00'（已是两位的原样返回）"""
+    if not t or ":" not in t:
+        return t
+    h, m = t.split(":", 1)
+    return f"{h.zfill(2)}:{m}" if h.isdigit() else t
+
+
 async def query_court(court: Court, date: str, token: str,
-                      timeout: float = 4.0) -> dict[str, str] | None:
+                      timeout: float = 4.0) -> dict | None:
+    """返回 {"avail": {time: status}, "blocks": [完整 block ...]}；失败返回 None"""
     try:
         r = await client().get(URL_QUERY, params={
             "groundId": court.id, "startDate": date, "endDate": date,
@@ -394,18 +403,26 @@ async def query_court(court: Court, date: str, token: str,
         log.warning("查询 %s success=false: %s", court.name, j.get("msg"))
         return None
 
-    out: dict[str, str] = {}
+    avail: dict[str, str] = {}
+    blocks: list[dict] = []
     for cfg in j.get("data", {}).get("configList", []):
         if cfg.get("date") != date:
             continue
         for blk in cfg.get("timeBlockList", []):
-            t = blk.get("time", "")
-            if ":" in t:
-                h, m = t.split(":", 1)
-                if h.isdigit():
-                    t = f"{h.zfill(2)}:{m}"
-            out[t] = blk.get("status")
-    return out
+            t = _norm_hm(blk.get("time", ""))
+            e = _norm_hm(blk.get("endTime", ""))
+            avail[t] = blk.get("status")
+            blocks.append({
+                "time": t,
+                "endTime": e,
+                "status": blk.get("status"),
+                "customerName": blk.get("customerName"),
+                "customerCode": blk.get("customerCode"),
+                "customerTel":  blk.get("customerTel"),
+                "type":         blk.get("type"),
+            })
+    blocks.sort(key=lambda b: b["time"])
+    return {"avail": avail, "blocks": blocks}
 
 
 def slot_covers(avail: dict, start: str, end: str) -> bool:
@@ -540,15 +557,16 @@ class RefreshService:
         probe = pool[0]
         for attempt in range(1, self.PROBE_MAX_TRIES + 1):
             t0 = time.monotonic()
-            avail = await query_court(probe, date, token)
+            res = await query_court(probe, date, token)
             dt = (time.monotonic() - t0) * 1000
 
-            if avail is not None:
+            if res is not None:
                 log.info("探测 %s 成功 (%.0fms, 第 %d 次)，开始并发其余 %d 个场地",
                          probe.name, dt, attempt, len(pool) - 1)
                 await bus.publish("refresh.result", {
                     "court": probe.no, "name": probe.name, "ok": True,
-                    "avail": avail,
+                    "avail":  res["avail"],
+                    "blocks": res["blocks"],
                     "ts": datetime.now().strftime("%H:%M:%S"),
                 })
                 break
@@ -579,13 +597,14 @@ class RefreshService:
 
     async def _one(self, court: Court, date: str, token: str):
         t0 = time.monotonic()
-        avail = await query_court(court, date, token)
+        res = await query_court(court, date, token)
         dt = (time.monotonic() - t0) * 1000
-        if avail is not None:
+        if res is not None:
             log.info("%s OK (%.0fms)", court.name, dt)
             await bus.publish("refresh.result", {
                 "court": court.no, "name": court.name, "ok": True,
-                "avail": avail,
+                "avail":  res["avail"],
+                "blocks": res["blocks"],
                 "ts": datetime.now().strftime("%H:%M:%S"),
             })
         else:

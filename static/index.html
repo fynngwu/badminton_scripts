@@ -20,6 +20,7 @@
   --success:#2ea043;
   --success-hover:#3fb950;
   --purple:#a371f7;
+  --orange:#f0883e;
 }
 
 * { box-sizing: border-box; }
@@ -156,6 +157,91 @@ button:disabled {
   color: var(--text); font-size: 12px;
 }
 
+/* ── 已被占用面板：基础样式 ───────────────────────────── */
+.occ-group {
+  border-left: 3px solid #2c3440;
+  padding: 6px 0 8px 10px;
+  margin-bottom: 10px;
+}
+.occ-head {
+  display: flex; align-items: center; gap: 8px;
+  margin-bottom: 6px; flex-wrap: wrap;
+}
+.occ-name { font-size: 13px; font-weight: 600; color: #c9d1d9; }
+.occ-tag {
+  font-size: 11px; padding: 1px 7px; border-radius: 999px;
+  border: 1px solid; white-space: nowrap;
+}
+.occ-tag.person { color: #79c0ff; border-color: #1f4b7a; background: #0d2338; }
+.occ-tag.course { color: #d2a8ff; border-color: #4a3670; background: #1d1630; }
+.occ-items { display: flex; flex-wrap: wrap; gap: 6px; }
+.occ-item {
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 11.5px; padding: 3px 8px; border-radius: 5px;
+  background: #161d27; border: 1px solid #262d38; color: #8b949e;
+}
+
+/* ── 已被占用面板：分类结构 ───────────────────────────── */
+.occ-category { margin-bottom: 20px; }
+.occ-cat-title {
+  font-size: 13px; color: #c3cbd6;
+  margin: 0 0 10px 0; padding-bottom: 6px;
+  border-bottom: 1px dashed #262d38;
+  font-weight: 600;
+}
+.occ-cat-title .mini { font-weight: normal; color: #6b7280; }
+
+/* 课程行 */
+.occ-courses { display: flex; flex-direction: column; gap: 6px; }
+.course-row { display: flex; align-items: center; gap: 12px; font-size: 12px; }
+.course-time {
+  font-family: "SFMono-Regular", Consolas, monospace;
+  color: #d2a8ff; background: #1d1630;
+  padding: 2px 8px; border-radius: 4px;
+  border: 1px solid #4a3670;
+  min-width: 120px; text-align: center;
+}
+.course-courts {
+  color: #8b949e;
+  font-family: "SFMono-Regular", Consolas, monospace;
+}
+
+/* 折叠框 */
+.occ-fold {
+  margin-top: 16px;
+  border-top: 1px solid #262d38;
+  padding-top: 12px;
+}
+.occ-fold summary {
+  cursor: pointer;
+  font-size: 12px;
+  color: #6b7280;
+  user-select: none;
+  outline: none;
+}
+.occ-fold summary:hover { color: #8b949e; }
+
+/* 起始时间标签（通用） */
+.start-time {
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 12px;
+  padding: 1px 8px;
+  border-radius: 4px;
+  letter-spacing: .3px;
+}
+/* 空闲用绿色 */
+.start-time.free {
+  color: #7ee787;
+  background: #0d2818;
+  border: 1px solid #1f5a2e;
+}
+/* 散客用蓝色 */
+.start-time.day {
+  color: #79c0ff;
+  background: #0d2338;
+  border: 1px solid #1f4b7a;
+}
+
 /* 滚动条 */
 ::-webkit-scrollbar { width: 10px; height: 10px; }
 ::-webkit-scrollbar-track { background: transparent; }
@@ -197,9 +283,9 @@ button:disabled {
 <div class="card row">
   <label style="font-weight:700;">全自动</label>
   <label>时段</label>
-  <select id="auto-ss"></select>     <!-- JS 填充：08:00 ~ 21:30 -->
+  <select id="auto-ss"></select>
   <span style="color:#a371f7;">—</span>
-  <select id="auto-se"></select>     <!-- JS 填充：08:30 ~ 22:00 -->
+  <select id="auto-se"></select>
   <label>触发</label><input id="auto-rt" value="20:00:01" style="width:85px">
   <label>申请</label><input id="auto-st" value="20:00:04" style="width:85px">
   <label>最多</label>
@@ -215,13 +301,14 @@ button:disabled {
 </div>
 
 <div class="section">
-  <h2>标准时段</h2>
-  <div id="buckets"></div>
+  <h2>可抢场地 <span class="mini" style="font-weight:normal;color:#6b7280;">
+    (按起始时间倒序 · 每段最多合并 2 小时)</span></h2>
+  <div id="free"></div>
 </div>
 
 <div class="section">
-  <h2>其他时段</h2>
-  <div id="dynamic"></div>
+  <h2>已被占用</h2>
+  <div id="occupied"></div>
 </div>
 
 <div class="log" id="log"></div>
@@ -230,8 +317,8 @@ button:disabled {
 const $ = id => document.getElementById(id);
 
 /* ── 时段下拉：全部 30 分钟粒度 ─────────────────────────────
-   起始：08:00 ~ 21:30   （可选值 28 个）
-   结束：08:30 ~ 22:00   （可选值 28 个）
+   起始：08:00 ~ 21:30
+   结束：08:30 ~ 22:00
    默认选中 20:00 / 22:00
 ──────────────────────────────────────────────────────── */
 function fillTimeSelect(sel, fromMin, toMin, defValue) {
@@ -248,89 +335,304 @@ function fillTimeSelect(sel, fromMin, toMin, defValue) {
 fillTimeSelect($("auto-ss"), 8 * 60, 21 * 60 + 30, "20:00");
 fillTimeSelect($("auto-se"), 8 * 60 + 30, 22 * 60,   "22:00");
 
-/* ── 时段常量 ─────────────────────────────────────────── */
-const PERM = {
-  "16:00-18:00": ["16:00","16:30","17:00","17:30"],
-  "18:00-20:00": ["18:00","18:30","19:00","19:30"],
-  "20:00-22:00": ["20:00","20:30","21:00","21:30"],
-};
-const DYN = [
-  {t:"08:00-10:00", s:["08:00","08:30","09:00","09:30"], e:"10:00"},
-  {t:"10:00-12:00", s:["10:00","10:30","11:00","11:30"], e:"12:00"},
-  {t:"12:00-14:00", s:["12:00","12:30","13:00","13:30"], e:"14:00"},
-  {t:"14:00-16:00", s:["14:00","14:30","15:00","15:30"], e:"16:00"},
-];
+/* ── 全局状态 ─────────────────────────────────────────── */
+const SCAN_START = 8 * 60;      // 08:00
+const SCAN_END   = 22 * 60;     // 22:00
+const MAX_SLOTS  = 4;           // 每个块最多 4 × 30min = 2h
 
-let perm = {}, dyn = {}, lastLog = 0, sse = null;
+let lastLog = 0, sse = null;
 let vidRunning = false, autoRunning = false, refreshRunning = false;
+let freeByStart = {};   // "20:00" -> [{court, start, end}]
+let occByCourt  = {};   // 场地号 -> [ {start,end,status,name,code,tel,type} ]
 
-function reset() {
-  perm = {}; for (const k in PERM) perm[k] = [];
-  dyn  = {}; for (const g of DYN)  dyn[g.t]  = [];
-  render();
+const escHtml = s => String(s).replace(/[&<>"']/g, c =>
+  ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" }[c]));
+
+const fmtMin = m =>
+  String(Math.floor(m / 60)).padStart(2, "0") + ":" +
+  String(m % 60).padStart(2, "0");
+
+/* ── 活动关键词 ── */
+const ACTIVITY_KEYWORDS = [
+  "工会", "比赛", "活动", "大会", "赛", "训练",
+  "校队", "俱乐部", "考试", "赛事", "选拔",
+];
+function isActivity(name) {
+  if (!name) return false;
+  return ACTIVITY_KEYWORDS.some(kw => name.includes(kw));
 }
 
+function isEvening(start) {
+  return start >= "18:00" && start <= "21:30";
+}
+
+/* ── 判断某个时间片是否空闲（兼容 "8:00" / "08:00"） ── */
 function isFree(avail, t) {
   if (!avail) return false;
   if (avail[t] === "1") return true;
   const p = t.split(":");
-  return avail[p[0].padStart(2,"0") + ":" + p[1]] === "1"
+  return avail[p[0].padStart(2, "0") + ":" + p[1]] === "1"
       || avail[String(+p[0]) + ":" + p[1]] === "1";
 }
 
-function runsOf(g, avail) {
-  const out = []; let s = -1;
-  for (let i = 0; i < g.s.length; i++) {
-    const f = isFree(avail, g.s[i]);
-    if (f && s === -1) s = i;
-    if (!f && s !== -1) { out.push([g.s[s], g.s[i]]); s = -1; }
+/* ── 计算单个场地的所有空闲块 ──
+   从 SCAN_START 扫到 SCAN_END：
+     1) 找连续空闲段 [i, j)
+     2) 从 i 起，每 MAX_SLOTS 个 30min slot 切一块
+*/
+function computeRuns(avail) {
+  const runs = [];
+  let i = SCAN_START;
+  while (i < SCAN_END) {
+    if (!isFree(avail, fmtMin(i))) { i += 30; continue; }
+    let j = i;
+    while (j < SCAN_END && isFree(avail, fmtMin(j))) j += 30;
+
+    let s = i;
+    while (s < j) {
+      const e = Math.min(s + MAX_SLOTS * 30, j);
+      runs.push({ start: fmtMin(s), end: fmtMin(e) });
+      s += MAX_SLOTS * 30;
+    }
+    i = j;
   }
-  if (s !== -1) out.push([g.s[s], g.e]);
+  return runs;
+}
+
+/* ── 把同一场地里「同一个人 + 时间连续」的 block 合并成一个区间 ── */
+function mergeBlocks(blocks) {
+  const busy = blocks.filter(b => b && b.status != null && b.status !== "1");
+  const out = [];
+  for (const b of busy) {
+    const key = b.customerName || `__s${b.status}__`;
+    const last = out[out.length - 1];
+    if (last && last._k === key && last.end === b.time) {
+      last.end = b.endTime;
+      continue;
+    }
+    out.push({
+      _k: key,
+      start: b.time, end: b.endTime,
+      status: b.status,
+      name:   b.customerName,
+      code:   b.customerCode,
+      tel:    b.customerTel,
+      type:   b.type,
+    });
+  }
   return out;
 }
 
-function onResult(r) {
-  if (!r || !r.ok || !r.avail) return;
-  const a = r.avail, c = r.court;
-  for (const b in PERM) {
-    if (PERM[b].every(s => isFree(a, s)) && !perm[b].some(x => x.court === c)) {
-      const [st, en] = b.split("-");
-      perm[b].push({court: c, start: st, end: en});
+/* ── 按人名聚合 ── */
+function groupByName(spans) {
+  const map = new Map();
+  for (const sp of spans) {
+    const key = sp.name || "未知";
+    if (!map.has(key)) {
+      map.set(key, {
+        name: key, code: sp.code, tel: sp.tel,
+        type: sp.type, status: sp.status, spans: [],
+      });
+    }
+    map.get(key).spans.push(sp);
+  }
+  return [...map.values()].sort((a, b) =>
+    a.name.localeCompare(b.name, "zh-Hans-CN"));
+}
+
+/* ══════════════════════════════════════════════════════
+   渲染：可抢场地（动态 · 按起始时间倒序分桶）
+══════════════════════════════════════════════════════ */
+function renderFree() {
+  const box = $("free");
+  const starts = Object.keys(freeByStart).sort().reverse();  // 越晚越前
+  if (!starts.length) {
+    box.innerHTML = `<div class="hint">暂无空闲场地</div>`;
+    return;
+  }
+
+  box.innerHTML = starts.map(st => {
+    const items = [...freeByStart[st]]
+      .sort((a, b) => a.court - b.court || a.end.localeCompare(b.end));
+    const rows = items.map(i =>
+      `<button class="avail-btn"
+        data-court="${i.court}" data-start="${i.start}" data-end="${i.end}">
+        ${i.court}号场 · ${i.start}-${i.end}
+      </button>`).join("");
+    return `<div class="occ-group" style="border-left-color:#2ea043;">
+      <div class="occ-head">
+        <span class="start-time free">${escHtml(st)} 起</span>
+        <span class="mini">${items.length} 个场地</span>
+      </div>
+      <div class="avail-grid">${rows}</div>
+    </div>`;
+  }).join("");
+}
+
+/* ══════════════════════════════════════════════════════
+   渲染：已被占用（分类 · 分层）
+══════════════════════════════════════════════════════ */
+function renderOccupied() {
+  const allSpans = [];
+  for (const cno in occByCourt) {
+    for (const sp of occByCourt[cno]) {
+      allSpans.push({ ...sp, court: +cno });
     }
   }
-  for (const g of DYN) {
-    for (const [s, e] of runsOf(g, a)) {
-      if (!dyn[g.t].some(x => x.court === c && x.start === s)) {
-        dyn[g.t].push({court: c, start: s, end: e});
-      }
+
+  const box = $("occupied");
+  if (!allSpans.length) {
+    box.innerHTML = `<div class="hint">暂无占用信息</div>`;
+    return;
+  }
+
+  const courses = [], activities = [], evening = [], day = [];
+  for (const sp of allSpans) {
+    if (sp.status === "0")               courses.push(sp);
+    else if (isActivity(sp.name))        activities.push(sp);
+    else if (isEvening(sp.start))        evening.push(sp);
+    else                                 day.push(sp);
+  }
+
+  let html = "";
+
+  // ── 课程时间 ──
+  if (courses.length) {
+    courses.sort((a, b) => a.start.localeCompare(b.start) || a.court - b.court);
+    const timeGroups = new Map();
+    for (const c of courses) {
+      const k = `${c.start}-${c.end}`;
+      if (!timeGroups.has(k)) timeGroups.set(k, []);
+      if (!timeGroups.get(k).includes(c.court)) timeGroups.get(k).push(c.court);
+    }
+    html += `<div class="occ-category">
+      <h3 class="occ-cat-title">📚 课程时间 <span class="mini">(固定占用)</span></h3>
+      <div class="occ-courses">`;
+    for (const time of [...timeGroups.keys()].sort()) {
+      const courts = timeGroups.get(time).sort((a, b) => a - b);
+      html += `<div class="course-row">
+        <span class="course-time">${escHtml(time)}</span>
+        <span class="course-courts">${courts.map(c => c + "号场").join(" / ")}</span>
+      </div>`;
+    }
+    html += `</div></div>`;
+  }
+
+  // ── 活动/团体征用 ──
+  if (activities.length) {
+    html += `<div class="occ-category">
+      <h3 class="occ-cat-title">🏆 活动 / 团体征用</h3>`;
+    for (const g of groupByName(activities)) {
+      const items = g.spans
+        .sort((a, b) => a.start.localeCompare(b.start) || a.court - b.court)
+        .map(s => `<span class="occ-item">${s.court}号场 ${escHtml(s.start)}-${escHtml(s.end)}</span>`)
+        .join("");
+      html += `<div class="occ-group" style="border-left-color:#a371f7;">
+        <div class="occ-head">
+          <span class="occ-name">${escHtml(g.name)}</span>
+          <span class="occ-tag course">征用 / 活动</span>
+          <span class="mini">共 ${g.spans.length} 段${g.type ? " · " + escHtml(g.type) : ""}</span>
+        </div>
+        <div class="occ-items">${items}</div>
+      </div>`;
+    }
+    html += `</div>`;
+  }
+
+  // ── 晚间热门 18:00-22:00 个人 ──
+  if (evening.length) {
+    html += `<div class="occ-category">
+      <h3 class="occ-cat-title">🔥 晚间热门时段抢场者 <span class="mini">(18:00-22:00)</span></h3>`;
+    for (const g of groupByName(evening)) {
+      const items = g.spans
+        .sort((a, b) => a.start.localeCompare(b.start) || a.court - b.court)
+        .map(s => `<span class="occ-item" style="background:#2a1f3d;border-color:#4a3670;color:#d2a8ff;">${s.court}号场 ${escHtml(s.start)}-${escHtml(s.end)}</span>`)
+        .join("");
+      const meta = [g.code, g.tel, g.type].filter(Boolean).join(" · ");
+      html += `<div class="occ-group" style="border-left-color:#f0883e;">
+        <div class="occ-head">
+          <span class="occ-name" style="color:#f0883e;">${escHtml(g.name)}</span>
+          <span class="occ-tag person">个人 · status ${escHtml(g.status)}</span>
+          <span class="mini">共 ${g.spans.length} 段${meta ? " · " + escHtml(meta) : ""}</span>
+        </div>
+        <div class="occ-items">${items}</div>
+      </div>`;
+    }
+    html += `</div>`;
+  }
+
+  // ── 其他时段散客（按起始时间分桶，折叠）──
+  if (day.length) {
+    const byStart = new Map();
+    for (const sp of day) {
+      if (!byStart.has(sp.start)) byStart.set(sp.start, []);
+      byStart.get(sp.start).push(sp);
+    }
+    const starts = [...byStart.keys()].sort();
+    const peopleSet = new Set(day.map(s => s.name));
+
+    html += `<details class="occ-fold">
+      <summary>👥 其他时段散客 (白天 08:00-18:00) —— 共 ${peopleSet.size} 人 / ${day.length} 段，点击展开</summary>
+      <div style="margin-top:12px;">`;
+
+    for (const st of starts) {
+      const items = byStart.get(st).sort((a, b) =>
+        a.court - b.court || a.end.localeCompare(b.end));
+      const rows = items.map(s =>
+        `<span class="occ-item">${s.court}号场 · <b style="color:#c9d1d9;">${escHtml(s.name)}</b> · ${escHtml(s.start)}-${escHtml(s.end)}</span>`
+      ).join("");
+      html += `<div class="occ-group" style="border-left-color:#2c3440;">
+        <div class="occ-head">
+          <span class="start-time day">${escHtml(st)} 起</span>
+          <span class="mini">${items.length} 段</span>
+        </div>
+        <div class="occ-items">${rows}</div>
+      </div>`;
+    }
+    html += `</div></details>`;
+  }
+
+  box.innerHTML = html || `<div class="hint">暂无占用信息</div>`;
+}
+
+/* ── 总渲染 ── */
+function render() {
+  renderFree();
+  renderOccupied();
+}
+
+function reset() {
+  freeByStart = {};
+  occByCourt  = {};
+  render();
+}
+
+/* ── SSE 数据入口 ── */
+function onResult(r) {
+  if (!r || !r.ok) return;
+  const c = r.court;
+
+  // 清掉该场地的旧空闲记录
+  for (const st in freeByStart) {
+    freeByStart[st] = freeByStart[st].filter(x => x.court !== c);
+    if (!freeByStart[st].length) delete freeByStart[st];
+  }
+
+  if (Array.isArray(r.blocks)) {
+    occByCourt[c] = mergeBlocks(r.blocks);
+  }
+
+  const a = r.avail;
+  if (a) {
+    for (const run of computeRuns(a)) {
+      if (!freeByStart[run.start]) freeByStart[run.start] = [];
+      freeByStart[run.start].push({ court: c, start: run.start, end: run.end });
     }
   }
   render();
 }
 
-function render() {
-  $("buckets").innerHTML = Object.entries(PERM).map(([b]) => {
-    const items = perm[b] || [];
-    const inner = items.length
-      ? `<div class="grid">${items.map(i =>
-          `<div class="court" data-court="${i.court}" data-start="${i.start}" data-end="${i.end}">${i.court}号场</div>`
-        ).join("")}</div>`
-      : `<div class="hint">暂无空闲</div>`;
-    return `<div class="section"><h2>${b}${items.length ? ` (${items.length})` : ""}</h2>${inner}</div>`;
-  }).join("");
-
-  let total = 0;
-  const html = DYN.map(g => {
-    const items = dyn[g.t] || [];
-    if (!items.length) return "";
-    total += items.length;
-    return `<div class="section"><h2>${g.t} (${items.length})</h2><div class="avail-grid">
-      ${items.map(i => `<button class="avail-btn" data-court="${i.court}" data-start="${i.start}" data-end="${i.end}">${i.court}号场 · ${i.start}-${i.end}</button>`).join("")}
-    </div></div>`;
-  }).join("");
-  $("dynamic").innerHTML = total ? html : `<div class="hint">暂无</div>`;
-}
-
+/* ── 日志 ── */
 function addLog(e) {
   const el = $("log");
   const div = document.createElement("div");
@@ -360,6 +662,7 @@ function connectSSE(since) {
   });
 }
 
+/* ── 按钮 ── */
 $("btn-save").onclick = async () => {
   const token = $("token").value.trim();
   if (!token) return alert("请填写 token");
@@ -396,7 +699,7 @@ $("btn-auto").onclick = async () => {
   const body = {
     slot_start: $("auto-ss").value, slot_end: $("auto-se").value,
     refresh_at: $("auto-rt").value.trim(), submit_at: $("auto-st").value.trim(),
-    max_orders: +$("auto-mo").value, 
+    max_orders: +$("auto-mo").value,
   };
   const d = await (await fetch("/api/auto/start", {
     method: "POST", headers: {"Content-Type": "application/json"},
