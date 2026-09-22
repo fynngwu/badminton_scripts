@@ -229,13 +229,11 @@ button:disabled {
   border-radius: 4px;
   letter-spacing: .3px;
 }
-/* 空闲用绿色 */
 .start-time.free {
   color: #7ee787;
   background: #0d2818;
   border: 1px solid #1f5a2e;
 }
-/* 散客用蓝色 */
 .start-time.day {
   color: #79c0ff;
   background: #0d2338;
@@ -302,12 +300,13 @@ button:disabled {
 
 <div class="section">
   <h2>可抢场地 <span class="mini" style="font-weight:normal;color:#6b7280;">
-    (按起始时间倒序 · 每段最多合并 2 小时)</span></h2>
+    (按起始时间倒序 · 每段最多合并 2 小时 · 至 22:00)</span></h2>
   <div id="free"></div>
 </div>
 
 <div class="section">
-  <h2>已被占用</h2>
+  <h2>已被占用 <span class="mini" style="font-weight:normal;color:#6b7280;">
+    (仅 08:00-22:00)</span></h2>
   <div id="occupied"></div>
 </div>
 
@@ -337,7 +336,7 @@ fillTimeSelect($("auto-se"), 8 * 60 + 30, 22 * 60,   "22:00");
 
 /* ── 全局状态 ─────────────────────────────────────────── */
 const SCAN_START = 8 * 60;      // 08:00
-const SCAN_END   = 22 * 60;     // 22:00
+const SCAN_END   = 22 * 60;     // 22:00 —— 之后不看
 const MAX_SLOTS  = 4;           // 每个块最多 4 × 30min = 2h
 
 let lastLog = 0, sse = null;
@@ -375,11 +374,7 @@ function isFree(avail, t) {
       || avail[String(+p[0]) + ":" + p[1]] === "1";
 }
 
-/* ── 计算单个场地的所有空闲块 ──
-   从 SCAN_START 扫到 SCAN_END：
-     1) 找连续空闲段 [i, j)
-     2) 从 i 起，每 MAX_SLOTS 个 30min slot 切一块
-*/
+/* ── 计算单个场地的所有空闲块 ── */
 function computeRuns(avail) {
   const runs = [];
   let i = SCAN_START;
@@ -619,7 +614,9 @@ function onResult(r) {
   }
 
   if (Array.isArray(r.blocks)) {
-    occByCourt[c] = mergeBlocks(r.blocks);
+    // ★ 关键：只保留 22:00 之前的 block，之后的直接丢弃
+    const trimmed = r.blocks.filter(b => b && b.time && b.time < "22:00");
+    occByCourt[c] = mergeBlocks(trimmed);
   }
 
   const a = r.avail;
