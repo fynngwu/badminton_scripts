@@ -11,7 +11,11 @@
                              只收 reservation.sustech.edu.cn
 
     mitmdump 在服务启动时【常驻】拉起（无窗口），程序退出时自动回收。
-    “自动获取 Token”按钮只做两件事：刷新预约窗口 + 等 config.toml 里 token 变化。
+    "自动获取 Token"按钮只做两件事：刷新预约窗口 + 等 config.toml 里 token 变化。
+
+    ★ 全自动模式：会在「触发时间前 2 分钟」自动调用一次 fetch_token_now()
+      刷新预约窗口并等待 mitm 抓取新 token，然后用最新的 session.token 去下单。
+      提前量 = TOKEN_REFRESH_LEAD（默认 120s，在 _run_auto 顶部常量）。
 
 环境变量：
     MITM_UPSTREAM   可选。例如 "http://127.0.0.1:7897"。设置后 mitmdump 走
@@ -162,7 +166,7 @@ class ConfigStore:
             "user": self.user,
             "gym":  self.gym,
             "order": {
-                "offset_days": int(self.order.get("offset_days", 1) or 1),
+                "offset_days": max(0, min(2, int(self.order.get("offset_days", 1)))),
                 "token_set": bool(tok),
                 "token_preview": (tok[:8] + "...") if tok else "",
                 "target_date": session.target_date,
@@ -884,7 +888,7 @@ async def watch_config(poll: float = 1.0):
 # ══════════════════════════════════════════════════════
 class RefreshService:
     PROBE_BACKOFF: float = 1.0
-    PROBE_MAX_TRIES: int = 15
+    PROBE_MAX_TRIES: int = 6
 
     def __init__(self):
         self._probe_task: asyncio.Task | None = None
@@ -987,8 +991,83 @@ refresh_service = RefreshService()
 
 
 # ══════════════════════════════════════════════════════
+# Token 抓取（可复用）：刷新预约窗口 + 等 config.toml 变化
+# ══════════════════════════════════════════════════════
+async def fetch_token_now(timeout: float = 20.0) -> dict:
+    """刷新企业微信预约窗口（Ctrl+R），并等待 mitmproxy 把新 token
+    写入 config.toml。抓取到后立刻 _reload_config() 更新 session.token。
+
+    返回 {'ok': bool, 'token_preview': str} 或 {'ok': False, 'msg': str}。
+    该函数可被 /api/token/fetch 接口和全自动流程共用。
+    """
+    old_token = session.token
+    log.info("🔑 开始获取 Token")
+
+    # 1) 确保 mitmdump 常驻在跑（如果之前崩了会自动重启）
+    ok = await _ensure_mitmdump(verbose_if_reuse=True)
+    if not ok:
+        log.error("❌ mitmdump 未就绪，无法抓取 token")
+        return {"ok": False,
+                "msg": "mitmdump 未就绪；请检查 pip install mitmproxy、"
+                       "8080 端口是否被占用，或看日志 [mitm] 行"}
+
+    # 2) 记录 config.toml 当前 mtime
+    try:
+        old_mtime = config_store.path.stat().st_mtime
+    except FileNotFoundError:
+        old_mtime = 0.0
+
+    # 3) 触发预约窗口 Ctrl+R
+    log.info("🪟 正在触发预约窗口刷新（Ctrl+R）…")
+    ok = await asyncio.to_thread(refresh_reservation_window)
+    if not ok:
+        log.warning("❌ 未找到预约窗口（企业微信是否已打开 reservation？）")
+        return {"ok": False,
+                "msg": "未找到预约窗口（企业微信是否已打开 reservation？）"}
+    log.info("✓ 已发送 Ctrl+R，等待 mitmproxy 捕获新 token…")
+
+    # 4) 轮询 config.toml 变更
+    deadline = time.monotonic() + max(3.0, float(timeout))
+    while time.monotonic() < deadline:
+        await asyncio.sleep(0.3)
+        try:
+            mtime = config_store.path.stat().st_mtime
+        except FileNotFoundError:
+            continue
+        if mtime == old_mtime:
+            continue
+
+        config_store.load(force=True)
+        _reload_config()
+        old_mtime = mtime
+
+        if not session.token:
+            log.warning("config.toml 已更新但 token 仍为空，继续等待…")
+            continue
+
+        await bus.publish("config.updated", config_store.public_view())
+        preview = session.token[:8] + "..."
+        if session.token != old_token:
+            log.info("✅ Token 获取成功：%s（已更新）", preview)
+        else:
+            log.info("✅ Token 获取成功：%s（与之前相同）", preview)
+        return {"ok": True, "token_preview": preview}
+
+    log.warning("❌ 超时：%.0fs 内未捕获到新 token", timeout)
+    return {"ok": False,
+            "msg": f"{timeout:.0f}s 内未捕获到新 token；"
+                   f"请确认企业微信已打开 reservation 页面、mitm 证书已信任、"
+                   f"Clash 已把 reservation 送到 {MITM_HOST}:{MITM_PORT}"}
+
+
+# ══════════════════════════════════════════════════════
 # 自动模式
 # ══════════════════════════════════════════════════════
+# ★ 全自动模式下：在触发时间前多少秒自动刷新 Token
+#   180 = 3 分钟，120 = 2 分钟（默认），60 = 1 分钟
+TOKEN_REFRESH_LEAD_SEC: int = 120
+
+
 @dataclass
 class AutoState:
     running: bool = False
@@ -1088,6 +1167,8 @@ async def _run_auto(date, token, slot_start, slot_end,
         return True
 
     async def apply_pending():
+        # 注意：闭包读取的是 _run_auto 作用域里的 token / date，
+        #       Token 刷新后会重新赋值，这里自然拿到最新值。
         for c in list(candidates):
             if has_success():
                 return
@@ -1120,6 +1201,44 @@ async def _run_auto(date, token, slot_start, slot_end,
         refresh_dt = _parse_hms(refresh_at)
         submit_dt  = _parse_hms(submit_at)
 
+        # ─────────────────────────────────────────────
+        # ① 触发前 N 秒，自动刷新 Token
+        # ─────────────────────────────────────────────
+        if datetime.now() < refresh_dt:
+            token_refresh_dt = refresh_dt - timedelta(seconds=TOKEN_REFRESH_LEAD_SEC)
+            if datetime.now() < token_refresh_dt:
+                auto_state.phase = "waiting_token"
+                auto_state.msg = (f"等待自动刷新 Token"
+                                  f"（{token_refresh_dt.strftime('%H:%M:%S')}）")
+                log.info("自动模式: Token 将在 %s 自动刷新",
+                         token_refresh_dt.strftime('%H:%M:%S'))
+                await _sleep_until(token_refresh_dt)
+
+            auto_state.phase = "fetching_token"
+            auto_state.msg = "自动获取 Token 中…"
+            log.info("自动模式: 触发前 %ds，开始自动获取 Token",
+                     TOKEN_REFRESH_LEAD_SEC)
+            try:
+                r = await fetch_token_now(timeout=30.0)
+                if r.get("ok"):
+                    log.info("自动模式: ✅ Token 刷新成功 (%s)", r.get("token_preview"))
+                    auto_state.msg = f"Token OK ({r.get('token_preview')})"
+                else:
+                    log.warning("自动模式: ⚠ Token 刷新失败: %s", r.get("msg"))
+                    auto_state.msg = f"Token 刷新失败: {r.get('msg')}"
+            except Exception as e:
+                log.warning("自动模式: Token 刷新异常: %s", e)
+                auto_state.msg = f"Token 刷新异常: {e}"
+
+            # ★ 用最新 token / date 继续（若 config 更新则同步）
+            token = session.token
+            date = session.target_date
+        else:
+            log.info("自动模式: 已过触发时间，跳过自动刷新 Token")
+
+        # ─────────────────────────────────────────────
+        # ② VID 池启动（默认在触发前 8 秒）
+        # ─────────────────────────────────────────────
         if not vid_pool.running:
             vid_start_dt = refresh_dt - timedelta(seconds=8)
             if datetime.now() < vid_start_dt:
@@ -1131,6 +1250,9 @@ async def _run_auto(date, token, slot_start, slot_end,
         else:
             log.info("自动模式: VID 池已在运行，跳过启动")
 
+        # ─────────────────────────────────────────────
+        # ③ 等到触发时间 → 刷新场地
+        # ─────────────────────────────────────────────
         auto_state.phase = "waiting"
         auto_state.msg = f"等待 {refresh_at}"
         log.info("自动模式: 等待触发 %s", refresh_at)
@@ -1143,6 +1265,9 @@ async def _run_auto(date, token, slot_start, slot_end,
         await refresh_service.start(date, token)
         q, hist = bus.subscribe(since)
 
+        # ─────────────────────────────────────────────
+        # ④ 收集空场直到 submit_at
+        # ─────────────────────────────────────────────
         auto_state.phase = "collecting"
         auto_state.msg = f"收集空场直到 {submit_at}"
         for e in hist:
@@ -1155,6 +1280,9 @@ async def _run_auto(date, token, slot_start, slot_end,
         while not q.empty():
             harvest(q.get_nowait())
 
+        # ─────────────────────────────────────────────
+        # ⑤ 提交申请
+        # ─────────────────────────────────────────────
         auto_state.phase = "applying"
         auto_state.msg = f"申请中（候选 {len(candidates)}，上限 {max_orders}）"
         log.info("自动模式: 到达申请时间，候选 %d，最多尝试 %d",
@@ -1278,70 +1406,9 @@ async def token_fetch(d: TokenFetchIn):
         return {"ok": False, "msg": "已有一次抓取正在进行，请稍候"}
     _token_fetch_busy = True
     try:
-        return await _token_fetch_impl(d)
+        return await fetch_token_now(timeout=d.timeout)
     finally:
         _token_fetch_busy = False
-
-
-async def _token_fetch_impl(d: TokenFetchIn):
-    old_token = session.token
-    log.info("🔑 开始获取 Token")
-
-    # 1) 确保 mitmdump 常驻在跑（如果之前崩了会自动重启）
-    ok = await _ensure_mitmdump(verbose_if_reuse=True)
-    if not ok:
-        log.error("❌ mitmdump 未就绪，无法抓取 token")
-        return {"ok": False,
-                "msg": "mitmdump 未就绪；请检查 pip install mitmproxy、"
-                       "8080 端口是否被占用，或看日志 [mitm] 行"}
-
-    # 2) 记录 config.toml 当前 mtime
-    try:
-        old_mtime = config_store.path.stat().st_mtime
-    except FileNotFoundError:
-        old_mtime = 0.0
-
-    # 3) 触发预约窗口 Ctrl+R
-    log.info("🪟 正在触发预约窗口刷新（Ctrl+R）…")
-    ok = await asyncio.to_thread(refresh_reservation_window)
-    if not ok:
-        log.warning("❌ 未找到预约窗口（企业微信是否已打开 reservation？）")
-        return {"ok": False,
-                "msg": "未找到预约窗口（企业微信是否已打开 reservation？）"}
-    log.info("✓ 已发送 Ctrl+R，等待 mitmproxy 捕获新 token…")
-
-    # 4) 轮询 config.toml 变更
-    deadline = time.monotonic() + max(3.0, float(d.timeout))
-    while time.monotonic() < deadline:
-        await asyncio.sleep(0.3)
-        try:
-            mtime = config_store.path.stat().st_mtime
-        except FileNotFoundError:
-            continue
-        if mtime == old_mtime:
-            continue
-
-        config_store.load(force=True)
-        _reload_config()
-        old_mtime = mtime
-
-        if not session.token:
-            log.warning("config.toml 已更新但 token 仍为空，继续等待…")
-            continue
-
-        await bus.publish("config.updated", config_store.public_view())
-        preview = session.token[:8] + "..."
-        if session.token != old_token:
-            log.info("✅ Token 获取成功：%s（已更新）", preview)
-        else:
-            log.info("✅ Token 获取成功：%s（与之前相同）", preview)
-        return {"ok": True, "token_preview": preview}
-
-    log.warning("❌ 超时：%.0fs 内未捕获到新 token", d.timeout)
-    return {"ok": False,
-            "msg": f"{d.timeout:.0f}s 内未捕获到新 token；"
-                   f"请确认企业微信已打开 reservation 页面、mitm 证书已信任、"
-                   f"Clash 已把 reservation 送到 {MITM_HOST}:{MITM_PORT}"}
 
 
 @app.get("/api/mitm/state")
@@ -1425,8 +1492,9 @@ async def reserve_ep(d: ReserveIn):
 
 
 class AutoIn(BaseModel):
-    slot_start: str = "20:00"
-    slot_end:   str = "22:00"
+    # ★ 默认全自动时段改为 19:30 - 21:30
+    slot_start: str = "19:30"
+    slot_end:   str = "21:30"
     refresh_at: str = "20:00:01"
     submit_at:  str = "20:00:04"
     max_orders: int = 3

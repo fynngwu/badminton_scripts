@@ -265,8 +265,9 @@ function fillTimeSelect(sel, fromMin, toMin, defValue) {
     sel.appendChild(opt);
   }
 }
-fillTimeSelect($("auto-ss"), 8 * 60, 21 * 60 + 30, "20:00");
-fillTimeSelect($("auto-se"), 8 * 60 + 30, 22 * 60,   "22:00");
+// ★ 默认时段 19:30 - 21:30
+fillTimeSelect($("auto-ss"), 8 * 60, 21 * 60 + 30, "19:30");
+fillTimeSelect($("auto-se"), 8 * 60 + 30, 22 * 60,   "21:30");
 
 const SCAN_START = 8 * 60;
 const SCAN_END   = 22 * 60;
@@ -600,7 +601,7 @@ $("btn-fetch-token").onclick = async () => {
   try {
     const d = await (await fetch("/api/token/fetch", {
       method: "POST", headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({timeout: 20}),        // ★ 20s 等 token
+      body: JSON.stringify({timeout: 20}),
     })).json();
 
     if (d.ok) {
