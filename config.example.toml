@@ -1,0 +1,37 @@
+# 羽毛球预约配置示例
+# 使用时复制为 config.toml：
+#   copy config.example.toml config.toml
+#
+# Linux/macOS:
+#   cp config.example.toml config.toml
+
+[user]
+id = "YOUR_USER_ID"
+customer_id = "YOUR_CUSTOMER_ID"
+name = "YOUR_NAME"
+tel = "YOUR_PHONE"
+
+[gym]
+id   = "1297443858304540673"
+name = "润杨羽毛球馆"
+
+[order]
+# 0 = 今天
+# 1 = 明天
+# 2 = 后天
+offset_days = 1
+
+# 一般保持为空，由 mitm_addon.py 自动捕获并写入
+token = ""
+
+[courts]
+1  = "1298272433186332673"
+2  = "1298272520994086913"
+3  = "1298272615009411073"
+4  = "1298272709167341570"
+5  = "1298272791098875905"
+6  = "1298273087183183874"
+7  = "1298273175146127362"
+8  = "1298273265650819073"
+9  = "1298273399927267330"
+10 = "1298273500317933570"

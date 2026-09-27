@@ -7,32 +7,20 @@
 <title>羽毛球场预约</title>
 <style>
 :root{
-  --bg:#0d1117;
-  --bg-elev:#161b22;
-  --bg-input:#0b0f16;
-  --border:#262d38;
-  --border-strong:#39414d;
-  --text:#e6edf3;
-  --text-dim:#8b949e;
-  --text-mute:#6b7280;
-  --primary:#2f81f7;
-  --primary-hover:#4b95f9;
-  --success:#2ea043;
-  --success-hover:#3fb950;
-  --purple:#a371f7;
-  --orange:#f0883e;
+  --bg:#0d1117; --bg-elev:#161b22; --bg-input:#0b0f16;
+  --border:#262d38; --border-strong:#39414d;
+  --text:#e6edf3; --text-dim:#8b949e; --text-mute:#6b7280;
+  --primary:#2f81f7; --primary-hover:#4b95f9;
+  --success:#2ea043; --success-hover:#3fb950;
+  --purple:#a371f7; --orange:#f0883e;
 }
-
 * { box-sizing: border-box; }
-
 html { color-scheme: dark; }
-
 body {
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI",
        "PingFang SC", "Microsoft YaHei", sans-serif;
   max-width: 1080px; margin: 24px auto; padding: 0 20px;
-  min-height: 100vh;
-  color: var(--text);
+  min-height: 100vh; color: var(--text);
   background:
     radial-gradient(1100px 560px at 15% -12%, rgba(47,129,247,.13), transparent 62%),
     radial-gradient(900px 520px at 100% 0%, rgba(163,113,247,.10), transparent 58%),
@@ -40,20 +28,15 @@ body {
   background-attachment: fixed;
   -webkit-font-smoothing: antialiased;
 }
-
 h1 { font-size: 22px; margin: 0 0 18px; font-weight: 700; letter-spacing: .3px; }
-
 .card {
-  background: var(--bg-elev);
-  border: 1px solid var(--border);
+  background: var(--bg-elev); border: 1px solid var(--border);
   padding: 12px 16px; border-radius: 10px;
   box-shadow: 0 1px 2px rgba(0,0,0,.5), 0 12px 28px -20px rgba(0,0,0,.9);
   margin-bottom: 12px;
 }
-
 .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
 .row label { font-size: 13px; color: var(--text-dim); }
-
 input, select {
   padding: 7px 10px; border: 1px solid var(--border);
   border-radius: 6px; font-size: 13px;
@@ -68,9 +51,7 @@ input:focus, select:focus {
   box-shadow: 0 0 0 3px rgba(47,129,247,.18);
 }
 select option { background: var(--bg-elev); color: var(--text); }
-
 #token { flex: 1; min-width: 260px; }
-
 button {
   padding: 7px 16px; border: 1px solid transparent; border-radius: 6px;
   cursor: pointer; font-size: 13px; font-weight: 500;
@@ -81,33 +62,22 @@ button:disabled {
   background: #21262d !important; color: #55606e !important;
   border-color: var(--border) !important; cursor: not-allowed;
 }
-
 .primary { background: var(--primary); color: #fff; }
 .primary:hover:enabled { background: var(--primary-hover); }
-
 .auto { background: linear-gradient(180deg, #3b8ef8, #1f6feb); color: #fff; }
 .auto:hover:enabled { filter: brightness(1.12); }
-
 .dot {
   display: inline-block; width: 8px; height: 8px; border-radius: 50%;
   background: #3a4351; transition: background .2s, box-shadow .2s;
 }
 .dot.on { background: var(--success-hover); box-shadow: 0 0 0 3px rgba(63,185,80,.16); }
-
-.mini {
-  font-family: "SFMono-Regular", Consolas, monospace;
-  font-size: 12px; color: var(--text-dim);
-}
-
+.mini { font-family: "SFMono-Regular", Consolas, monospace; font-size: 12px; color: var(--text-dim); }
 .section { margin-top: 18px; }
 .section h2 {
   font-size: 14px; color: #c3cbd6; margin: 0 0 8px;
-  padding-left: 8px; border-left: 3px solid var(--primary);
-  font-weight: 600;
+  padding-left: 8px; border-left: 3px solid var(--primary); font-weight: 600;
 }
-
 .grid, .avail-grid { display: flex; flex-wrap: wrap; gap: 8px; }
-
 .court {
   padding: 10px 18px; border-radius: 8px; font-size: 13px;
   background: linear-gradient(180deg, #3588f8, #1f6feb);
@@ -117,12 +87,8 @@ button:disabled {
   box-shadow: 0 1px 2px rgba(0,0,0,.45);
   transition: filter .15s, box-shadow .15s, transform .06s;
 }
-.court:hover {
-  filter: brightness(1.12);
-  box-shadow: 0 6px 18px -6px rgba(47,129,247,.75);
-}
+.court:hover { filter: brightness(1.12); box-shadow: 0 6px 18px -6px rgba(47,129,247,.75); }
 .court:active { transform: translateY(1px); }
-
 .avail-btn {
   padding: 9px 16px; border-radius: 8px; font-size: 13px;
   background: linear-gradient(180deg, #2ea043, #217a33);
@@ -130,17 +96,11 @@ button:disabled {
   box-shadow: 0 1px 2px rgba(0,0,0,.45);
   transition: filter .15s, box-shadow .15s, transform .06s;
 }
-.avail-btn:hover {
-  filter: brightness(1.14);
-  box-shadow: 0 6px 18px -6px rgba(63,185,80,.7);
-}
+.avail-btn:hover { filter: brightness(1.14); box-shadow: 0 6px 18px -6px rgba(63,185,80,.7); }
 .avail-btn:active { transform: translateY(1px); }
-
 .hint { color: var(--text-mute); font-size: 12px; padding: 6px 0; }
-
 .log {
-  background: #080b10; color: #c9d1d9;
-  border: 1px solid var(--border);
+  background: #080b10; color: #c9d1d9; border: 1px solid var(--border);
   padding: 10px 14px; border-radius: 8px;
   font-family: "SFMono-Regular", Consolas, monospace;
   font-size: 12px; max-height: 320px; overflow-y: auto;
@@ -150,28 +110,15 @@ button:disabled {
 .log .l-INFO { color: #7ee787; }
 .log .l-WARNING { color: #ffa657; }
 .log .l-ERROR { color: #ff7b72; }
-
 .pill {
   display: inline-block; padding: 2px 10px; border-radius: 999px;
   background: #21262d; border: 1px solid var(--border);
   color: var(--text); font-size: 12px;
 }
-
-/* ── 已被占用面板：基础样式 ───────────────────────────── */
-.occ-group {
-  border-left: 3px solid #2c3440;
-  padding: 6px 0 8px 10px;
-  margin-bottom: 10px;
-}
-.occ-head {
-  display: flex; align-items: center; gap: 8px;
-  margin-bottom: 6px; flex-wrap: wrap;
-}
+.occ-group { border-left: 3px solid #2c3440; padding: 6px 0 8px 10px; margin-bottom: 10px; }
+.occ-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; flex-wrap: wrap; }
 .occ-name { font-size: 13px; font-weight: 600; color: #c9d1d9; }
-.occ-tag {
-  font-size: 11px; padding: 1px 7px; border-radius: 999px;
-  border: 1px solid; white-space: nowrap;
-}
+.occ-tag { font-size: 11px; padding: 1px 7px; border-radius: 999px; border: 1px solid; white-space: nowrap; }
 .occ-tag.person { color: #79c0ff; border-color: #1f4b7a; background: #0d2338; }
 .occ-tag.course { color: #d2a8ff; border-color: #4a3670; background: #1d1630; }
 .occ-items { display: flex; flex-wrap: wrap; gap: 6px; }
@@ -180,67 +127,33 @@ button:disabled {
   font-size: 11.5px; padding: 3px 8px; border-radius: 5px;
   background: #161d27; border: 1px solid #262d38; color: #8b949e;
 }
-
-/* ── 已被占用面板：分类结构 ───────────────────────────── */
 .occ-category { margin-bottom: 20px; }
 .occ-cat-title {
-  font-size: 13px; color: #c3cbd6;
-  margin: 0 0 10px 0; padding-bottom: 6px;
-  border-bottom: 1px dashed #262d38;
-  font-weight: 600;
+  font-size: 13px; color: #c3cbd6; margin: 0 0 10px 0;
+  padding-bottom: 6px; border-bottom: 1px dashed #262d38; font-weight: 600;
 }
 .occ-cat-title .mini { font-weight: normal; color: #6b7280; }
-
-/* 课程行 */
 .occ-courses { display: flex; flex-direction: column; gap: 6px; }
 .course-row { display: flex; align-items: center; gap: 12px; font-size: 12px; }
 .course-time {
   font-family: "SFMono-Regular", Consolas, monospace;
   color: #d2a8ff; background: #1d1630;
   padding: 2px 8px; border-radius: 4px;
-  border: 1px solid #4a3670;
-  min-width: 120px; text-align: center;
+  border: 1px solid #4a3670; min-width: 120px; text-align: center;
 }
-.course-courts {
-  color: #8b949e;
-  font-family: "SFMono-Regular", Consolas, monospace;
-}
-
-/* 折叠框 */
-.occ-fold {
-  margin-top: 16px;
-  border-top: 1px solid #262d38;
-  padding-top: 12px;
-}
+.course-courts { color: #8b949e; font-family: "SFMono-Regular", Consolas, monospace; }
+.occ-fold { margin-top: 16px; border-top: 1px solid #262d38; padding-top: 12px; }
 .occ-fold summary {
-  cursor: pointer;
-  font-size: 12px;
-  color: #6b7280;
-  user-select: none;
-  outline: none;
+  cursor: pointer; font-size: 12px; color: #6b7280;
+  user-select: none; outline: none;
 }
 .occ-fold summary:hover { color: #8b949e; }
-
-/* 起始时间标签（通用） */
 .start-time {
   font-family: "SFMono-Regular", Consolas, monospace;
-  font-size: 12px;
-  padding: 1px 8px;
-  border-radius: 4px;
-  letter-spacing: .3px;
+  font-size: 12px; padding: 1px 8px; border-radius: 4px; letter-spacing: .3px;
 }
-.start-time.free {
-  color: #7ee787;
-  background: #0d2818;
-  border: 1px solid #1f5a2e;
-}
-.start-time.day {
-  color: #79c0ff;
-  background: #0d2338;
-  border: 1px solid #1f4b7a;
-}
-
-/* 滚动条 */
+.start-time.free { color: #7ee787; background: #0d2818; border: 1px solid #1f5a2e; }
+.start-time.day  { color: #79c0ff; background: #0d2338; border: 1px solid #1f4b7a; }
 ::-webkit-scrollbar { width: 10px; height: 10px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb {
@@ -248,9 +161,23 @@ button:disabled {
   border: 2px solid transparent; background-clip: content-box;
 }
 ::-webkit-scrollbar-thumb:hover { background: #3c4552; background-clip: content-box; }
-
-/* 高亮数字 */
 #vid-count, #cur-date { color: var(--text); font-weight: 600; }
+
+/* toast */
+#toast{
+  position: fixed; top: 18px; right: 18px; z-index: 999;
+  display: flex; flex-direction: column; gap: 8px; pointer-events: none;
+}
+.toast-item{
+  padding: 8px 14px; border-radius: 8px; font-size: 13px;
+  background: #161b22; border: 1px solid var(--border-strong);
+  box-shadow: 0 8px 24px -8px rgba(0,0,0,.8);
+  animation: slideIn .25s ease-out;
+  max-width: 320px;
+}
+.toast-item.ok   { border-color: #1f5a2e; color: #7ee787; }
+.toast-item.err  { border-color: #6b2e2e; color: #ffa6a6; }
+@keyframes slideIn { from { opacity:0; transform: translateX(20px); } to { opacity:1; transform: none; } }
 </style>
 </head>
 <body>
@@ -267,6 +194,7 @@ button:disabled {
     <option value="2">后天</option>
   </select>
   <button class="primary" id="btn-save">保存</button>
+  <button class="auto" id="btn-fetch-token">🔑 自动获取 Token</button>
   <span class="mini">目标：<b id="cur-date">-</b></span>
 </div>
 
@@ -311,15 +239,21 @@ button:disabled {
 </div>
 
 <div class="log" id="log"></div>
+<div id="toast"></div>
 
 <script>
 const $ = id => document.getElementById(id);
 
-/* ── 时段下拉：全部 30 分钟粒度 ─────────────────────────────
-   起始：08:00 ~ 21:30
-   结束：08:30 ~ 22:00
-   默认选中 20:00 / 22:00
-──────────────────────────────────────────────────────── */
+/* ══════════════ Toast ══════════════ */
+function toast(msg, kind="ok", ms=3200) {
+  const box = $("toast");
+  const el = document.createElement("div");
+  el.className = "toast-item " + kind;
+  el.textContent = msg;
+  box.appendChild(el);
+  setTimeout(() => { el.style.opacity = "0"; setTimeout(() => el.remove(), 250); }, ms);
+}
+
 function fillTimeSelect(sel, fromMin, toMin, defValue) {
   for (let m = fromMin; m <= toMin; m += 30) {
     const hh = String(Math.floor(m / 60)).padStart(2, "0");
@@ -334,24 +268,21 @@ function fillTimeSelect(sel, fromMin, toMin, defValue) {
 fillTimeSelect($("auto-ss"), 8 * 60, 21 * 60 + 30, "20:00");
 fillTimeSelect($("auto-se"), 8 * 60 + 30, 22 * 60,   "22:00");
 
-/* ── 全局状态 ─────────────────────────────────────────── */
-const SCAN_START = 8 * 60;      // 08:00
-const SCAN_END   = 22 * 60;     // 22:00 —— 之后不看
-const MAX_SLOTS  = 4;           // 每个块最多 4 × 30min = 2h
+const SCAN_START = 8 * 60;
+const SCAN_END   = 22 * 60;
+const MAX_SLOTS  = 4;
 
 let lastLog = 0, sse = null;
 let vidRunning = false, autoRunning = false, refreshRunning = false;
-let freeByStart = {};   // "20:00" -> [{court, start, end}]
-let occByCourt  = {};   // 场地号 -> [ {start,end,status,name,code,tel,type} ]
+let freeByStart = {};
+let occByCourt  = {};
 
 const escHtml = s => String(s).replace(/[&<>"']/g, c =>
   ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" }[c]));
-
 const fmtMin = m =>
   String(Math.floor(m / 60)).padStart(2, "0") + ":" +
   String(m % 60).padStart(2, "0");
 
-/* ── 活动关键词 ── */
 const ACTIVITY_KEYWORDS = [
   "工会", "比赛", "活动", "大会", "赛", "训练",
   "校队", "俱乐部", "考试", "赛事", "选拔",
@@ -360,12 +291,8 @@ function isActivity(name) {
   if (!name) return false;
   return ACTIVITY_KEYWORDS.some(kw => name.includes(kw));
 }
+function isEvening(start) { return start >= "18:00" && start <= "21:30"; }
 
-function isEvening(start) {
-  return start >= "18:00" && start <= "21:30";
-}
-
-/* ── 判断某个时间片是否空闲（兼容 "8:00" / "08:00"） ── */
 function isFree(avail, t) {
   if (!avail) return false;
   if (avail[t] === "1") return true;
@@ -374,7 +301,6 @@ function isFree(avail, t) {
       || avail[String(+p[0]) + ":" + p[1]] === "1";
 }
 
-/* ── 计算单个场地的所有空闲块 ── */
 function computeRuns(avail) {
   const runs = [];
   let i = SCAN_START;
@@ -382,7 +308,6 @@ function computeRuns(avail) {
     if (!isFree(avail, fmtMin(i))) { i += 30; continue; }
     let j = i;
     while (j < SCAN_END && isFree(avail, fmtMin(j))) j += 30;
-
     let s = i;
     while (s < j) {
       const e = Math.min(s + MAX_SLOTS * 30, j);
@@ -394,7 +319,6 @@ function computeRuns(avail) {
   return runs;
 }
 
-/* ── 把同一场地里「同一个人 + 时间连续」的 block 合并成一个区间 ── */
 function mergeBlocks(blocks) {
   const busy = blocks.filter(b => b && b.status != null && b.status !== "1");
   const out = [];
@@ -406,19 +330,14 @@ function mergeBlocks(blocks) {
       continue;
     }
     out.push({
-      _k: key,
-      start: b.time, end: b.endTime,
-      status: b.status,
-      name:   b.customerName,
-      code:   b.customerCode,
-      tel:    b.customerTel,
-      type:   b.type,
+      _k: key, start: b.time, end: b.endTime,
+      status: b.status, name: b.customerName,
+      code: b.customerCode, tel: b.customerTel, type: b.type,
     });
   }
   return out;
 }
 
-/* ── 按人名聚合 ── */
 function groupByName(spans) {
   const map = new Map();
   for (const sp of spans) {
@@ -435,16 +354,11 @@ function groupByName(spans) {
     a.name.localeCompare(b.name, "zh-Hans-CN"));
 }
 
-/* ══════════════════════════════════════════════════════
-   渲染：可抢场地（动态 · 按起始时间倒序分桶）
-══════════════════════════════════════════════════════ */
+/* ══════════════ 渲染：可抢场地 ══════════════ */
 function renderFree() {
   const box = $("free");
-  const starts = Object.keys(freeByStart).sort().reverse();  // 越晚越前
-  if (!starts.length) {
-    box.innerHTML = `<div class="hint">暂无空闲场地</div>`;
-    return;
-  }
+  const starts = Object.keys(freeByStart).sort().reverse();
+  if (!starts.length) { box.innerHTML = `<div class="hint">暂无空闲场地</div>`; return; }
 
   box.innerHTML = starts.map(st => {
     const items = [...freeByStart[st]]
@@ -464,22 +378,15 @@ function renderFree() {
   }).join("");
 }
 
-/* ══════════════════════════════════════════════════════
-   渲染：已被占用（分类 · 分层）
-══════════════════════════════════════════════════════ */
+/* ══════════════ 渲染：已被占用 ══════════════ */
 function renderOccupied() {
   const allSpans = [];
   for (const cno in occByCourt) {
-    for (const sp of occByCourt[cno]) {
-      allSpans.push({ ...sp, court: +cno });
-    }
+    for (const sp of occByCourt[cno]) allSpans.push({ ...sp, court: +cno });
   }
 
   const box = $("occupied");
-  if (!allSpans.length) {
-    box.innerHTML = `<div class="hint">暂无占用信息</div>`;
-    return;
-  }
+  if (!allSpans.length) { box.innerHTML = `<div class="hint">暂无占用信息</div>`; return; }
 
   const courses = [], activities = [], evening = [], day = [];
   for (const sp of allSpans) {
@@ -491,7 +398,6 @@ function renderOccupied() {
 
   let html = "";
 
-  // ── 课程时间 ──
   if (courses.length) {
     courses.sort((a, b) => a.start.localeCompare(b.start) || a.court - b.court);
     const timeGroups = new Map();
@@ -513,7 +419,6 @@ function renderOccupied() {
     html += `</div></div>`;
   }
 
-  // ── 活动/团体征用 ──
   if (activities.length) {
     html += `<div class="occ-category">
       <h3 class="occ-cat-title">🏆 活动 / 团体征用</h3>`;
@@ -534,7 +439,6 @@ function renderOccupied() {
     html += `</div>`;
   }
 
-  // ── 晚间热门 18:00-22:00 个人 ──
   if (evening.length) {
     html += `<div class="occ-category">
       <h3 class="occ-cat-title">🔥 晚间热门时段抢场者 <span class="mini">(18:00-22:00)</span></h3>`;
@@ -556,7 +460,6 @@ function renderOccupied() {
     html += `</div>`;
   }
 
-  // ── 其他时段散客（按起始时间分桶，折叠）──
   if (day.length) {
     const byStart = new Map();
     for (const sp of day) {
@@ -590,31 +493,19 @@ function renderOccupied() {
   box.innerHTML = html || `<div class="hint">暂无占用信息</div>`;
 }
 
-/* ── 总渲染 ── */
-function render() {
-  renderFree();
-  renderOccupied();
-}
+function render() { renderFree(); renderOccupied(); }
+function reset() { freeByStart = {}; occByCourt = {}; render(); }
 
-function reset() {
-  freeByStart = {};
-  occByCourt  = {};
-  render();
-}
-
-/* ── SSE 数据入口 ── */
 function onResult(r) {
   if (!r || !r.ok) return;
   const c = r.court;
 
-  // 清掉该场地的旧空闲记录
   for (const st in freeByStart) {
     freeByStart[st] = freeByStart[st].filter(x => x.court !== c);
     if (!freeByStart[st].length) delete freeByStart[st];
   }
 
   if (Array.isArray(r.blocks)) {
-    // ★ 关键：只保留 22:00 之前的 block，之后的直接丢弃
     const trimmed = r.blocks.filter(b => b && b.time && b.time < "22:00");
     occByCourt[c] = mergeBlocks(trimmed);
   }
@@ -629,7 +520,6 @@ function onResult(r) {
   render();
 }
 
-/* ── 日志 ── */
 function addLog(e) {
   const el = $("log");
   const div = document.createElement("div");
@@ -647,6 +537,27 @@ async function pollLogs() {
   } catch {}
 }
 
+/* ───── 配置同步 ───── */
+function applyConfig(cfg) {
+  const o = cfg.order || {};
+  const sel = $("date-offset");
+  if (typeof o.offset_days === "number") {
+    if (sel.value !== String(o.offset_days)) sel.value = String(o.offset_days);
+  }
+  if (o.target_date) $("cur-date").textContent = o.target_date;
+  const tok = $("token");
+  tok.placeholder = o.token_set
+    ? `已配置 ${o.token_preview}（粘贴新 token 覆盖）`
+    : "粘贴 token";
+}
+
+async function loadConfig() {
+  try {
+    const d = await (await fetch("/api/config")).json();
+    applyConfig(d);
+  } catch {}
+}
+
 function connectSSE(since) {
   if (sse) sse.close();
   sse = new EventSource("/api/stream?since=" + since);
@@ -657,23 +568,54 @@ function connectSSE(since) {
     refreshRunning = false;
     const b = $("btn-refresh"); b.disabled = false; b.textContent = "刷新场地";
   });
+  sse.addEventListener("config.updated", ev => {
+    const d = JSON.parse(ev.data).data;
+    const old = $("cur-date").textContent;
+    applyConfig(d);
+    if (old && old !== "-" && d.order && d.order.target_date !== old) reset();
+  });
 }
 
-/* ── 按钮 ── */
+/* ───── 按钮 ───── */
 $("btn-save").onclick = async () => {
-  const token = $("token").value.trim();
-  if (!token) return alert("请填写 token");
-  const d = new Date(); d.setDate(d.getDate() + +$("date-offset").value);
-  const date = d.getFullYear() + "-"
-    + String(d.getMonth() + 1).padStart(2, "0") + "-"
-    + String(d.getDate()).padStart(2, "0");
+  const tok = $("token").value.trim();
+  const body = { offset_days: +$("date-offset").value };
+  if (tok) body.token = tok;
   const r = await fetch("/api/config", {
     method: "POST", headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({token, target_date: date}),
+    body: JSON.stringify(body),
   });
   const j = await r.json();
-  $("cur-date").textContent = j.target_date;
-  reset();
+  if (!j.ok) { toast(j.msg || "保存失败", "err"); return; }
+  $("token").value = "";
+  toast("已保存", "ok");
+};
+
+$("btn-fetch-token").onclick = async () => {
+  const b = $("btn-fetch-token");
+  b.disabled = true;
+  const old = b.textContent;
+  b.textContent = "🔑 抓取中…";
+  toast("正在启动 mitmproxy + 刷新预约窗口，请稍等…", "ok", 2600);
+  try {
+    const d = await (await fetch("/api/token/fetch", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({timeout: 20}),        // ★ 20s 等 token
+    })).json();
+
+    if (d.ok) {
+      b.textContent = `✅ ${d.token_preview}`;
+      toast(`Token 获取成功：${d.token_preview}`, "ok", 3600);
+    } else {
+      toast(d.msg || "获取失败", "err", 5000);
+      b.textContent = old;
+    }
+  } catch (e) {
+    toast("请求失败：" + e, "err", 5000);
+    b.textContent = old;
+  } finally {
+    setTimeout(() => { b.disabled = false; b.textContent = old; }, 1800);
+  }
 };
 
 $("btn-vid").onclick = () =>
@@ -683,7 +625,7 @@ $("btn-refresh").onclick = async () => {
   if (refreshRunning) return;
   reset();
   const d = await (await fetch("/api/refresh", {method: "POST"})).json();
-  if (!d.ok) return alert(d.msg);
+  if (!d.ok) { toast(d.msg, "err"); return; }
   refreshRunning = true;
   const b = $("btn-refresh"); b.disabled = true; b.textContent = "刷新中…";
 };
@@ -702,7 +644,8 @@ $("btn-auto").onclick = async () => {
     method: "POST", headers: {"Content-Type": "application/json"},
     body: JSON.stringify(body),
   })).json();
-  if (!d.ok) alert(d.msg);
+  if (!d.ok) { toast(d.msg, "err"); return; }
+  toast("全自动已启动", "ok");
 };
 
 document.addEventListener("click", ev => {
@@ -745,6 +688,7 @@ setInterval(async () => {
 
 window.addEventListener("DOMContentLoaded", async () => {
   reset();
+  await loadConfig();
   pollLogs(); setInterval(pollLogs, 1000);
   try {
     const d = await (await fetch("/api/refresh/seq")).json();
