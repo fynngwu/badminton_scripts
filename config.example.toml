@@ -35,3 +35,32 @@ token = ""
 8  = "1298273265650819073"
 9  = "1298273399927267330"
 10 = "1298273500317933570"
+
+# ═══════════════════════════════════════════════════════════════
+# 可调参数（全部集中在这里）
+# 改完保存，1s 内自动重载生效，无需重启进程
+# ═══════════════════════════════════════════════════════════════
+[tuning]
+
+# ── 抓 Token ──
+token_wait_timeout        = 1.5     # 等 token 的秒数（单次，无重试）
+refresh_pre_click_delay   = 0.05    # 点击窗口前的等待（秒）
+refresh_post_click_delay  = 0.05    # 点击后到按 Ctrl+R 之间的等待（秒）
+
+# ── 刷新场地 ──
+probe_backoff             = 1.0     # 探测场地失败后的退避（秒）
+probe_max_tries           = 6      # 探测场地最多重试次数
+auth_refresh_timeout      = 1.5     # 遇到「鉴权失败」时自动抓 token 的超时
+
+# ── 自动模式 ──
+token_refresh_lead_sec    = 120     # 触发前多少秒自动刷新 token
+
+# ── VID 池 ──
+vid_timeout               = 3.5     # 单次验证码求解超时
+vid_max_age               = 8.0     # VID 有效时长（秒）
+vid_pool_size             = 3       # 并发 worker 数
+vid_pool_period           = 8.0     # 每个 worker 之间的周期（秒）
+
+# ── mitmdump ──
+mitm_startup_timeout      = 12.0    # 等端口就绪的上限
+mitm_shutdown_grace       = 3.0     # terminate 后等退出的宽限

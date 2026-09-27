@@ -163,7 +163,6 @@ button:disabled {
 ::-webkit-scrollbar-thumb:hover { background: #3c4552; background-clip: content-box; }
 #vid-count, #cur-date { color: var(--text); font-weight: 600; }
 
-/* toast */
 #toast{
   position: fixed; top: 18px; right: 18px; z-index: 999;
   display: flex; flex-direction: column; gap: 8px; pointer-events: none;
@@ -244,7 +243,6 @@ button:disabled {
 <script>
 const $ = id => document.getElementById(id);
 
-/* ══════════════ Toast ══════════════ */
 function toast(msg, kind="ok", ms=3200) {
   const box = $("toast");
   const el = document.createElement("div");
@@ -265,7 +263,6 @@ function fillTimeSelect(sel, fromMin, toMin, defValue) {
     sel.appendChild(opt);
   }
 }
-// ★ 默认时段 19:30 - 21:30
 fillTimeSelect($("auto-ss"), 8 * 60, 21 * 60 + 30, "19:30");
 fillTimeSelect($("auto-se"), 8 * 60 + 30, 22 * 60,   "21:30");
 
@@ -355,7 +352,6 @@ function groupByName(spans) {
     a.name.localeCompare(b.name, "zh-Hans-CN"));
 }
 
-/* ══════════════ 渲染：可抢场地 ══════════════ */
 function renderFree() {
   const box = $("free");
   const starts = Object.keys(freeByStart).sort().reverse();
@@ -379,7 +375,6 @@ function renderFree() {
   }).join("");
 }
 
-/* ══════════════ 渲染：已被占用 ══════════════ */
 function renderOccupied() {
   const allSpans = [];
   for (const cno in occByCourt) {
@@ -538,7 +533,6 @@ async function pollLogs() {
   } catch {}
 }
 
-/* ───── 配置同步 ───── */
 function applyConfig(cfg) {
   const o = cfg.order || {};
   const sel = $("date-offset");
@@ -577,7 +571,6 @@ function connectSSE(since) {
   });
 }
 
-/* ───── 按钮 ───── */
 $("btn-save").onclick = async () => {
   const tok = $("token").value.trim();
   const body = { offset_days: +$("date-offset").value };
@@ -597,25 +590,25 @@ $("btn-fetch-token").onclick = async () => {
   b.disabled = true;
   const old = b.textContent;
   b.textContent = "🔑 抓取中…";
-  toast("正在启动 mitmproxy + 刷新预约窗口，请稍等…", "ok", 2600);
+  toast("正在刷新预约窗口，请稍等…", "ok", 1600);
   try {
     const d = await (await fetch("/api/token/fetch", {
       method: "POST", headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({timeout: 20}),
+      body: JSON.stringify({}),
     })).json();
 
     if (d.ok) {
       b.textContent = `✅ ${d.token_preview}`;
       toast(`Token 获取成功：${d.token_preview}`, "ok", 3600);
     } else {
-      toast(d.msg || "获取失败", "err", 5000);
+      toast(d.msg || "获取失败", "err", 3000);
       b.textContent = old;
     }
   } catch (e) {
-    toast("请求失败：" + e, "err", 5000);
+    toast("请求失败：" + e, "err", 3000);
     b.textContent = old;
   } finally {
-    setTimeout(() => { b.disabled = false; b.textContent = old; }, 1800);
+    setTimeout(() => { b.disabled = false; b.textContent = old; }, 1200);
   }
 };
 

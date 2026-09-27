@@ -5,23 +5,7 @@
     # 或
     uvicorn app:app --host 0.0.0.0 --port 8000
 
-架构：
-    企业微信 → Clash（单域名规则） → mitmdump:8080 → reservation 服务器
-                                   ↑
-                             只收 reservation.sustech.edu.cn
-
-    mitmdump 在服务启动时【常驻】拉起（无窗口），程序退出时自动回收。
-    "自动获取 Token"按钮只做两件事：刷新预约窗口 + 等 config.toml 里 token 变化。
-
-    ★ 全自动模式：会在「触发时间前 2 分钟」自动调用一次 fetch_token_now()
-      刷新预约窗口并等待 mitm 抓取新 token，然后用最新的 session.token 去下单。
-      提前量 = TOKEN_REFRESH_LEAD（默认 120s，在 _run_auto 顶部常量）。
-
-环境变量：
-    MITM_UPSTREAM   可选。例如 "http://127.0.0.1:7897"。设置后 mitmdump 走
-                    --mode upstream:<URL>，由这个上游再出去（注意：上游不能再把
-                    reservation 路由回 8080，否则会形成环路）。
-                    不设置 = mitmdump 直连服务器。
+所有可调参数集中在 config.toml 的 [tuning] 段，改完 1s 内热重载生效。
 """
 from __future__ import annotations
 
@@ -62,13 +46,13 @@ from pydantic import BaseModel
 try:
     from mitm_addon import refresh_reservation_window
 except Exception:
-    def refresh_reservation_window() -> bool:  # type: ignore
+    def refresh_reservation_window(**kwargs) -> bool:  # type: ignore
         log.warning("mitm_addon 未就绪，无法刷新窗口")
         return False
 
 
 # ══════════════════════════════════════════════════════
-# 路径 / 常量
+# 路径 / 固定常量
 # ══════════════════════════════════════════════════════
 ROOT        = Path(__file__).parent
 CONFIG_PATH = ROOT / "config.toml"
@@ -80,15 +64,9 @@ URL_CHK   = BASE_URL + "/api/blade-base/captcha/check/d"
 URL_SAVE  = BASE_URL + "/api/blade-app/qywx/saveOrder"
 URL_QUERY = BASE_URL + "/api/blade-app/qywx/getOrderTimeConfigList"
 
-VID_TIMEOUT = 3.5
-VID_MAX_AGE = 8.0
-
-# ── mitmdump 常驻参数 ──
 MITM_HOST = "127.0.0.1"
 MITM_PORT = 8080
-MITM_STARTUP_TIMEOUT = 12.0   # 等 mitmdump 监听就绪的上限（首次会生成证书，稍慢）
-MITM_SHUTDOWN_GRACE  = 3.0    # terminate 后等它自己退出的宽限
-MITM_UPSTREAM        = os.environ.get("MITM_UPSTREAM", "").strip()
+MITM_UPSTREAM = os.environ.get("MITM_UPSTREAM", "").strip()
 
 HEADERS = {
     "Accept": "application/json, text/plain, */*",
@@ -108,7 +86,55 @@ class Court:
 
 
 # ══════════════════════════════════════════════════════
-# 配置：config.toml 加载 / 监听 / 原地写入
+# 可调参数：全部从 config.toml [tuning] 读
+# ══════════════════════════════════════════════════════
+@dataclass
+class Tuning:
+    # 抓 Token
+    token_wait_timeout:       float = 1.5
+    refresh_pre_click_delay:  float = 0.05
+    refresh_post_click_delay: float = 0.05
+
+    # 刷新场地
+    probe_backoff:            float = 1.0
+    probe_max_tries:          int   = 15
+    auth_refresh_timeout:     float = 1.5
+
+    # 自动模式
+    token_refresh_lead_sec:   int   = 120
+
+    # VID 池
+    vid_timeout:              float = 3.5
+    vid_max_age:              float = 8.0
+    vid_pool_size:            int   = 3
+    vid_pool_period:          float = 8.0
+
+    # mitmdump
+    mitm_startup_timeout:     float = 12.0
+    mitm_shutdown_grace:      float = 3.0
+
+
+tuning = Tuning()
+
+
+def _load_tuning() -> None:
+    """从 config_store.data['tuning'] 读入所有可调参数。"""
+    global tuning
+    tuning = Tuning()
+    raw = config_store.data.get("tuning", {}) or {}
+    for k, v in raw.items():
+        if not hasattr(tuning, k):
+            log.warning("config.toml [tuning] 未知字段: %s", k)
+            continue
+        cur = getattr(tuning, k)
+        try:
+            setattr(tuning, k, type(cur)(v))
+        except (TypeError, ValueError) as e:
+            log.warning("config.toml [tuning].%s 值无效: %r (%s)", k, v, e)
+
+
+# ══════════════════════════════════════════════════════
+# 配置存储
 # ══════════════════════════════════════════════════════
 class ConfigStore:
     def __init__(self, path: Path = CONFIG_PATH):
@@ -128,10 +154,6 @@ class ConfigStore:
             self.data = tomllib.load(f)
         self._mtime = mtime
         return True
-
-    @property
-    def mtime(self) -> float:
-        return self._mtime
 
     @property
     def user(self)  -> dict: return self.data.get("user", {})
@@ -225,6 +247,8 @@ def _reload_config():
         session.offset_days = 1
     session.offset_days = max(0, min(2, session.offset_days))
 
+    _load_tuning()
+
 
 _reload_config()
 
@@ -259,7 +283,7 @@ def get_logs(since: int = 0):
 
 
 # ══════════════════════════════════════════════════════
-# 业务 HTTP 客户端（直连，忽略系统代理）
+# 业务 HTTP 客户端
 # ══════════════════════════════════════════════════════
 _client: httpx.AsyncClient | None = None
 
@@ -267,11 +291,7 @@ _client: httpx.AsyncClient | None = None
 def client() -> httpx.AsyncClient:
     global _client
     if _client is None:
-        _client = httpx.AsyncClient(
-            headers=HEADERS,
-            timeout=6.0,
-            trust_env=False,   # ★ 忽略 HTTP(S)_PROXY / NO_PROXY
-        )
+        _client = httpx.AsyncClient(headers=HEADERS, timeout=6.0, trust_env=False)
     return _client
 
 
@@ -287,7 +307,7 @@ def _port_listening(host: str, port: int, timeout: float = 0.4) -> bool:
 # mitmdump 常驻管理
 # ══════════════════════════════════════════════════════
 _mitm_proc: subprocess.Popen | None = None
-_mitm_owned: bool = False          # 是否由本进程启动（决定退出时要不要 kill）
+_mitm_owned: bool = False
 _mitm_lock: asyncio.Lock | None = None
 
 
@@ -298,7 +318,6 @@ def _mitm_lock_get() -> asyncio.Lock:
     return _mitm_lock
 
 
-# mitmdump 会刷很多请求流水，只把这些行转发到前端
 _KEEP_RE = re.compile(
     r"\[TOKEN\]"
     r"|listening at|Proxy server"
@@ -310,7 +329,6 @@ _KEEP_RE = re.compile(
 
 
 def _mitm_reader(pipe) -> None:
-    """后台线程：逐行读 mitmdump 输出，只转发关键行到日志面板。"""
     try:
         for raw in iter(pipe.readline, b""):
             if not raw:
@@ -331,11 +349,6 @@ def _mitm_reader(pipe) -> None:
 
 
 def _build_mitm_cmd() -> list[str] | None:
-    """构造 mitmdump 命令。
-
-    ★ 优先用与当前 Python 解释器【同环境】的 mitmdump，
-      避免 PATH 里捞到全局 Python 装的另一只 mitmdump（证书/依赖可能不同）。
-    """
     script = str(ROOT / "mitm_addon.py")
     args: list[str] = [
         "--listen-host", MITM_HOST,
@@ -347,17 +360,14 @@ def _build_mitm_cmd() -> list[str] | None:
 
     exe_name = "mitmdump.exe" if sys.platform == "win32" else "mitmdump"
 
-    # 1) venv / 当前解释器同目录
     local = Path(sys.executable).with_name(exe_name)
     if local.exists():
         return [str(local)] + args
 
-    # 2) PATH
     exe = shutil.which("mitmdump")
     if exe:
         return [exe] + args
 
-    # 3) python -m 回退
     try:
         import mitmproxy  # noqa: F401
     except Exception:
@@ -380,13 +390,10 @@ def _spawn_mitmdump() -> subprocess.Popen | None:
 
     try:
         proc = subprocess.Popen(
-            cmd,
-            cwd=str(ROOT),
+            cmd, cwd=str(ROOT),
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            creationflags=creationflags,
-            bufsize=0,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            creationflags=creationflags, bufsize=0,
         )
     except FileNotFoundError as e:
         log.error("[mitm] 可执行文件不存在: %s", e)
@@ -395,69 +402,50 @@ def _spawn_mitmdump() -> subprocess.Popen | None:
         log.error("[mitm] 启动失败: %s", e)
         return None
 
-    threading.Thread(
-        target=_mitm_reader, args=(proc.stdout,), daemon=True,
-    ).start()
+    threading.Thread(target=_mitm_reader, args=(proc.stdout,), daemon=True).start()
     return proc
 
 
 async def _ensure_mitmdump(verbose_if_reuse: bool = False) -> bool:
-    """确保 8080 有 mitmdump 在跑。返回 True = 已就绪。
-
-    逻辑：
-      - 端口已被监听 且 我们没启动过 → 复用外部 mitm（不动它）
-      - 我们自己启动过但进程死了 → 重启
-      - 端口空闲 → 启动
-    """
     global _mitm_proc, _mitm_owned
 
     async with _mitm_lock_get():
-        # 之前启的 mitmdump 挂了？
         if _mitm_proc is not None and _mitm_proc.poll() is not None:
-            log.warning("[mitm] 之前的 mitmdump 已退出 (code=%s)",
-                        _mitm_proc.returncode)
+            log.warning("[mitm] 之前的 mitmdump 已退出 (code=%s)", _mitm_proc.returncode)
             _mitm_proc = None
             _mitm_owned = False
 
-        # 端口有人在监听 → 复用
         if _port_listening(MITM_HOST, MITM_PORT):
             if _mitm_proc is None and verbose_if_reuse:
                 log.info("[mitm] 检测到 %s:%d 已被监听，直接复用（外部启动）",
                          MITM_HOST, MITM_PORT)
             return True
 
-        # 需要一个新进程
         if _mitm_proc is None or _mitm_proc.poll() is not None:
-            log.info("[mitm] 正在拉起 mitmdump（%s:%d，无窗口）…",
-                     MITM_HOST, MITM_PORT)
+            log.info("[mitm] 正在拉起 mitmdump（%s:%d，无窗口）…", MITM_HOST, MITM_PORT)
             proc = await asyncio.to_thread(_spawn_mitmdump)
             if proc is None:
                 return False
             _mitm_proc = proc
             _mitm_owned = True
 
-        # 等端口就绪
-        deadline = time.monotonic() + MITM_STARTUP_TIMEOUT
+        deadline = time.monotonic() + tuning.mitm_startup_timeout
         while time.monotonic() < deadline:
             if _mitm_proc.poll() is not None:
-                log.error("[mitm] mitmdump 提前退出 (code=%s)，"
-                          "可能端口被占用或证书异常", _mitm_proc.returncode)
+                log.error("[mitm] mitmdump 提前退出 (code=%s)", _mitm_proc.returncode)
                 _mitm_proc = None
                 _mitm_owned = False
                 return False
             if _port_listening(MITM_HOST, MITM_PORT):
-                log.info("[mitm] ✅ mitmproxy 已就绪：%s:%d",
-                         MITM_HOST, MITM_PORT)
+                log.info("[mitm] ✅ mitmproxy 已就绪：%s:%d", MITM_HOST, MITM_PORT)
                 return True
             await asyncio.sleep(0.2)
 
-        log.error("[mitm] %.0fs 内未监听 %d，放弃",
-                  MITM_STARTUP_TIMEOUT, MITM_PORT)
+        log.error("[mitm] %.0fs 内未监听 %d，放弃", tuning.mitm_startup_timeout, MITM_PORT)
         return False
 
 
 def _kill_mitmdump() -> None:
-    """只在“本进程启动过”的情况下关闭 mitmdump。"""
     global _mitm_proc, _mitm_owned
     if not _mitm_owned or _mitm_proc is None:
         return
@@ -472,7 +460,7 @@ def _kill_mitmdump() -> None:
     try:
         proc.terminate()
         try:
-            proc.wait(timeout=MITM_SHUTDOWN_GRACE)
+            proc.wait(timeout=tuning.mitm_shutdown_grace)
         except subprocess.TimeoutExpired:
             proc.kill()
             try:
@@ -487,8 +475,7 @@ async def _boot_mitm() -> None:
     try:
         ok = await _ensure_mitmdump(verbose_if_reuse=True)
         if not ok:
-            log.warning("⚠ mitmdump 启动失败；"
-                        "点击“自动获取 Token”时会重试，或检查 8080 端口占用")
+            log.warning("⚠ mitmdump 启动失败；点击“自动获取 Token”时会重试，或检查 8080 端口占用")
     except Exception as e:
         log.warning("mitmdump 预启动异常: %s", e)
 
@@ -508,8 +495,8 @@ class CaptchaSolver:
     W, H, TRAVEL = 242, 180, 242
     BG_W, BG_H   = 48, 36
 
-    def __init__(self, timeout: float = VID_TIMEOUT):
-        self.timeout = timeout
+    def __init__(self, timeout: float | None = None):
+        self.timeout = tuning.vid_timeout if timeout is None else timeout
         self.timing: dict = {}
 
     async def solve(self) -> str:
@@ -652,12 +639,11 @@ class CaptchaSolver:
 # VID 池
 # ══════════════════════════════════════════════════════
 class VidPool:
-    def __init__(self, size: int = 3, period: float = 8., qmax: int = 3,
-                 max_age: float = VID_MAX_AGE):
-        self.size = size
-        self.period = period
-        self.max_age = max_age
-        self.queue: asyncio.Queue[tuple[float, str]] = asyncio.Queue(maxsize=qmax)
+    def __init__(self):
+        self.size = 3
+        self.period = 8.0
+        self.max_age = 8.0
+        self.queue: asyncio.Queue[tuple[float, str]] = asyncio.Queue(maxsize=3)
         self._tasks: list[asyncio.Task] = []
         self.stats: deque = deque(maxlen=30)
 
@@ -671,6 +657,9 @@ class VidPool:
     async def start(self):
         if self.running:
             return False
+        self.size = max(1, int(tuning.vid_pool_size))
+        self.period = max(1.0, float(tuning.vid_pool_period))
+        self.max_age = max(1.0, float(tuning.vid_max_age))
         while not self.queue.empty():
             self.queue.get_nowait()
         stagger = self.period / self.size
@@ -710,7 +699,7 @@ class VidPool:
             await asyncio.sleep(delay)
         while True:
             try:
-                solver = CaptchaSolver(timeout=VID_TIMEOUT)
+                solver = CaptchaSolver()
                 vid = await solver.solve()
                 self.stats.append({"ok": True, "ts": datetime.now().strftime("%H:%M:%S"),
                                    **solver.timing})
@@ -748,22 +737,45 @@ def _norm_hm(t: str) -> str:
     return f"{h.zfill(2)}:{m}" if h.isdigit() else t
 
 
+def _is_auth_fail(j: dict) -> bool:
+    msg = str(j.get("msg", "") or "")
+    if "鉴权失败" in msg:
+        return True
+    low = msg.lower()
+    if "token" in low and ("失效" in msg or "无效" in msg or "过期" in msg):
+        return True
+    if j.get("code") in (401, 403):
+        return True
+    return False
+
+
 async def query_court(court: Court, date: str, token: str,
-                      timeout: float = 4.0) -> dict | None:
+                      timeout: float = 4.0) -> dict:
     try:
         r = await client().get(URL_QUERY, params={
             "groundId": court.id, "startDate": date, "endDate": date,
             "userid": USER_ID, "token": token,
         }, timeout=timeout)
-        r.raise_for_status()
-        j = r.json()
     except Exception as e:
         log.warning("查询 %s 异常: %s", court.name, e)
-        return None
+        return {"ok": False, "auth_fail": False, "error": f"网络异常: {e}"}
+
+    if r.status_code != 200:
+        log.warning("查询 %s HTTP %d: %s", court.name, r.status_code, r.text[:120])
+        return {"ok": False, "auth_fail": False, "error": f"HTTP {r.status_code}"}
+
+    try:
+        j = r.json()
+    except Exception:
+        return {"ok": False, "auth_fail": False, "error": "non-json"}
 
     if not j.get("success"):
-        log.warning("查询 %s success=false: %s", court.name, j.get("msg"))
-        return None
+        msg = str(j.get("msg", "") or "")
+        auth = _is_auth_fail(j)
+        log.warning("查询 %s %s: %s",
+                    court.name, "鉴权失败" if auth else "success=false", msg)
+        return {"ok": False, "auth_fail": auth,
+                "error": msg or f"success=false (code={j.get('code')})"}
 
     avail: dict[str, str] = {}
     blocks: list[dict] = []
@@ -783,7 +795,7 @@ async def query_court(court: Court, date: str, token: str,
                 "type":         blk.get("type"),
             })
     blocks.sort(key=lambda b: b["time"])
-    return {"avail": avail, "blocks": blocks}
+    return {"ok": True, "auth_fail": False, "avail": avail, "blocks": blocks}
 
 
 def slot_covers(avail: dict, start: str, end: str) -> bool:
@@ -816,16 +828,25 @@ async def submit_order(vid: str, court: Court, date: str,
         "tmpEndTime": et, "tmpOrderDate": order_time, "tmpStartTime": st,
         "userNum": "1",
     }
+
+    send_hms = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    t0 = time.monotonic()
+    log.info("→ 下单 %s 发送 @ %s (vid=%s…)", court.name, send_hms, vid[:8])
+
     try:
         r = await client().post(URL_SAVE, params={"userid": USER_ID, "token": token},
                                 json=payload, timeout=6.0)
-        log.info("下单 %s: HTTP %d | %s", court.name, r.status_code, r.text[:180])
+        dt_ms = (time.monotonic() - t0) * 1000
+        recv_hms = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        log.info("← 下单 %s 返回 @ %s (+%.0fms): HTTP %d | %s",
+                 court.name, recv_hms, dt_ms, r.status_code, r.text[:180])
         try:
             return r.json()
         except Exception:
             return {"success": False, "msg": "non-json"}
     except Exception as e:
-        log.warning("下单 %s 异常: %s", court.name, e)
+        dt_ms = (time.monotonic() - t0) * 1000
+        log.warning("✗ 下单 %s 异常 (+%.0fms): %s", court.name, dt_ms, e)
         return {"success": False, "msg": str(e)}
 
 
@@ -884,126 +905,21 @@ async def watch_config(poll: float = 1.0):
 
 
 # ══════════════════════════════════════════════════════
-# 刷新服务
+# Token 抓取（单次，无重试）
 # ══════════════════════════════════════════════════════
-class RefreshService:
-    PROBE_BACKOFF: float = 1.0
-    PROBE_MAX_TRIES: int = 6
+async def fetch_token_now(timeout: float | None = None) -> dict:
+    """刷新预约窗口（Ctrl+R），等待 mitmproxy 把新 token 写入 config.toml。
 
-    def __init__(self):
-        self._probe_task: asyncio.Task | None = None
-        self._tasks: list[asyncio.Task] = []
-
-    @property
-    def running(self) -> bool:
-        if self._probe_task and not self._probe_task.done():
-            return True
-        return any(not t.done() for t in self._tasks)
-
-    async def start(self, date: str, token: str,
-                    courts: list[Court] | None = None) -> int:
-        await self.stop()
-        pool = list(courts or COURTS)
-        random.shuffle(pool)
-        log.info("启动刷新: 探测 %s → 成功后并发剩余 %d 个场地 "
-                 "(退避 %.1fs / 最多 %d 次)",
-                 pool[0].name, len(pool) - 1,
-                 self.PROBE_BACKOFF, self.PROBE_MAX_TRIES)
-        self._probe_task = asyncio.create_task(self._run(date, token, pool))
-        return len(pool)
-
-    async def stop(self):
-        tasks = [t for t in ([self._probe_task] + self._tasks) if t is not None]
-        for t in tasks:
-            t.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-        self._probe_task = None
-        self._tasks = []
-
-    async def _run(self, date, token, pool):
-        await self._probe_then_fanout(date, token, pool)
-        await bus.publish("refresh.done", {
-            "ts": datetime.now().strftime("%H:%M:%S"),
-        })
-
-    async def _probe_then_fanout(self, date, token, pool):
-        probe = pool[0]
-        for attempt in range(1, self.PROBE_MAX_TRIES + 1):
-            t0 = time.monotonic()
-            res = await query_court(probe, date, token)
-            dt = (time.monotonic() - t0) * 1000
-
-            if res is not None:
-                log.info("探测 %s 成功 (%.0fms, 第 %d 次)，开始并发其余 %d 个场地",
-                         probe.name, dt, attempt, len(pool) - 1)
-                await bus.publish("refresh.result", {
-                    "court": probe.no, "name": probe.name, "ok": True,
-                    "avail":  res["avail"], "blocks": res["blocks"],
-                    "ts": datetime.now().strftime("%H:%M:%S"),
-                })
-                break
-
-            log.info("探测 %s 失败 (%.0fms, %d/%d)",
-                     probe.name, dt, attempt, self.PROBE_MAX_TRIES)
-
-            if attempt == self.PROBE_MAX_TRIES:
-                log.warning("探测 %s %d 次全部失败，放弃本次刷新",
-                            probe.name, self.PROBE_MAX_TRIES)
-                await bus.publish("refresh.result", {
-                    "court": probe.no, "name": probe.name, "ok": False,
-                    "error": f"探测 {self.PROBE_MAX_TRIES} 次全部失败",
-                    "ts": datetime.now().strftime("%H:%M:%S"),
-                })
-                await bus.publish("refresh.done", {
-                    "ts": datetime.now().strftime("%H:%M:%S"),
-                    "probe_failed": True,
-                })
-                return
-
-            await asyncio.sleep(self.PROBE_BACKOFF)
-
-        self._tasks = [asyncio.create_task(self._one(c, date, token))
-                       for c in pool[1:]]
-        await asyncio.gather(*self._tasks, return_exceptions=True)
-
-    async def _one(self, court: Court, date: str, token: str):
-        t0 = time.monotonic()
-        res = await query_court(court, date, token)
-        dt = (time.monotonic() - t0) * 1000
-        if res is not None:
-            log.info("%s OK (%.0fms)", court.name, dt)
-            await bus.publish("refresh.result", {
-                "court": court.no, "name": court.name, "ok": True,
-                "avail":  res["avail"], "blocks": res["blocks"],
-                "ts": datetime.now().strftime("%H:%M:%S"),
-            })
-        else:
-            log.info("%s 失败 (%.0fms)", court.name, dt)
-            await bus.publish("refresh.result", {
-                "court": court.no, "name": court.name, "ok": False,
-                "error": "查询失败",
-                "ts": datetime.now().strftime("%H:%M:%S"),
-            })
-
-
-refresh_service = RefreshService()
-
-
-# ══════════════════════════════════════════════════════
-# Token 抓取（可复用）：刷新预约窗口 + 等 config.toml 变化
-# ══════════════════════════════════════════════════════
-async def fetch_token_now(timeout: float = 20.0) -> dict:
-    """刷新企业微信预约窗口（Ctrl+R），并等待 mitmproxy 把新 token
-    写入 config.toml。抓取到后立刻 _reload_config() 更新 session.token。
-
-    返回 {'ok': bool, 'token_preview': str} 或 {'ok': False, 'msg': str}。
-    该函数可被 /api/token/fetch 接口和全自动流程共用。
+    ★ 单次尝试，无重试：
+      - 找不到窗口 → 立即返回失败
+      - 发了 Ctrl+R 但 timeout 秒内没抓到 → 立即返回失败
+      用户想重试就再点一次按钮。
     """
-    old_token = session.token
-    log.info("🔑 开始获取 Token")
+    if timeout is None:
+        timeout = tuning.token_wait_timeout
 
-    # 1) 确保 mitmdump 常驻在跑（如果之前崩了会自动重启）
+    log.info("🔑 开始获取 Token（等待上限 %.1fs，无重试）", timeout)
+
     ok = await _ensure_mitmdump(verbose_if_reuse=True)
     if not ok:
         log.error("❌ mitmdump 未就绪，无法抓取 token")
@@ -1011,25 +927,28 @@ async def fetch_token_now(timeout: float = 20.0) -> dict:
                 "msg": "mitmdump 未就绪；请检查 pip install mitmproxy、"
                        "8080 端口是否被占用，或看日志 [mitm] 行"}
 
-    # 2) 记录 config.toml 当前 mtime
     try:
         old_mtime = config_store.path.stat().st_mtime
     except FileNotFoundError:
         old_mtime = 0.0
 
-    # 3) 触发预约窗口 Ctrl+R
-    log.info("🪟 正在触发预约窗口刷新（Ctrl+R）…")
-    ok = await asyncio.to_thread(refresh_reservation_window)
+    old_token = session.token
+
+    log.info("🪟 触发预约窗口刷新（Ctrl+R）…")
+    ok = await asyncio.to_thread(
+        refresh_reservation_window,
+        pre_click_delay=tuning.refresh_pre_click_delay,
+        post_click_delay=tuning.refresh_post_click_delay,
+    )
     if not ok:
-        log.warning("❌ 未找到预约窗口（企业微信是否已打开 reservation？）")
-        return {"ok": False,
-                "msg": "未找到预约窗口（企业微信是否已打开 reservation？）"}
+        msg = "未找到预约窗口（企业微信是否已打开 reservation？）"
+        log.warning("❌ %s", msg)
+        return {"ok": False, "msg": msg}
     log.info("✓ 已发送 Ctrl+R，等待 mitmproxy 捕获新 token…")
 
-    # 4) 轮询 config.toml 变更
-    deadline = time.monotonic() + max(3.0, float(timeout))
+    deadline = time.monotonic() + max(0.5, float(timeout))
     while time.monotonic() < deadline:
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(0.1)
         try:
             mtime = config_store.path.stat().st_mtime
         except FileNotFoundError:
@@ -1053,21 +972,151 @@ async def fetch_token_now(timeout: float = 20.0) -> dict:
             log.info("✅ Token 获取成功：%s（与之前相同）", preview)
         return {"ok": True, "token_preview": preview}
 
-    log.warning("❌ 超时：%.0fs 内未捕获到新 token", timeout)
-    return {"ok": False,
-            "msg": f"{timeout:.0f}s 内未捕获到新 token；"
-                   f"请确认企业微信已打开 reservation 页面、mitm 证书已信任、"
-                   f"Clash 已把 reservation 送到 {MITM_HOST}:{MITM_PORT}"}
+    msg = f"{timeout:.1f}s 内未捕获到新 token（窗口可能没刷成，再点一次即可）"
+    log.warning("❌ %s", msg)
+    return {"ok": False, "msg": msg}
+
+
+# ══════════════════════════════════════════════════════
+# 刷新服务
+# ══════════════════════════════════════════════════════
+class RefreshService:
+    def __init__(self):
+        self._probe_task: asyncio.Task | None = None
+        self._tasks: list[asyncio.Task] = []
+
+    @property
+    def running(self) -> bool:
+        if self._probe_task and not self._probe_task.done():
+            return True
+        return any(not t.done() for t in self._tasks)
+
+    async def start(self, date: str, token: str,
+                    courts: list[Court] | None = None) -> int:
+        await self.stop()
+        pool = list(courts or COURTS)
+        random.shuffle(pool)
+        log.info("启动刷新: 探测 %s → 成功后并发剩余 %d 个场地 (退避 %.1fs / 最多 %d 次)",
+                 pool[0].name, len(pool) - 1,
+                 tuning.probe_backoff, tuning.probe_max_tries)
+        self._probe_task = asyncio.create_task(self._run(date, token, pool))
+        return len(pool)
+
+    async def stop(self):
+        tasks = [t for t in ([self._probe_task] + self._tasks) if t is not None]
+        for t in tasks:
+            t.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._probe_task = None
+        self._tasks = []
+
+    async def _run(self, date, token, pool):
+        await self._probe_then_fanout(date, token, pool)
+        await bus.publish("refresh.done", {"ts": datetime.now().strftime("%H:%M:%S")})
+
+    async def _probe_then_fanout(self, date, token, pool):
+        probe = pool[0]
+        attempt = 0
+        token_refreshed = False
+        probe_ok = False
+        last_error = ""
+
+        max_tries = max(1, int(tuning.probe_max_tries))
+        backoff = max(0.0, float(tuning.probe_backoff))
+
+        while attempt < max_tries:
+            attempt += 1
+            t0 = time.monotonic()
+            res = await query_court(probe, date, token)
+            dt = (time.monotonic() - t0) * 1000
+
+            if res.get("ok"):
+                log.info("探测 %s 成功 (%.0fms, 第 %d 次)，开始并发其余 %d 个场地",
+                         probe.name, dt, attempt, len(pool) - 1)
+                await bus.publish("refresh.result", {
+                    "court": probe.no, "name": probe.name, "ok": True,
+                    "avail":  res["avail"], "blocks": res["blocks"],
+                    "ts": datetime.now().strftime("%H:%M:%S"),
+                })
+                probe_ok = True
+                break
+
+            last_error = res.get("error", "查询失败")
+
+            if res.get("auth_fail"):
+                log.warning("探测 %s 鉴权失败 (%.0fms, %d/%d): %s",
+                            probe.name, dt, attempt, max_tries, last_error)
+                if not token_refreshed:
+                    log.info("→ 检测到鉴权失败，自动获取 Token…")
+                    try:
+                        r = await fetch_token_now(timeout=tuning.auth_refresh_timeout)
+                    except Exception as e:
+                        log.warning("自动获取 Token 异常: %s", e)
+                        r = {"ok": False, "msg": str(e)}
+                    if r.get("ok"):
+                        token_refreshed = True
+                        token = session.token
+                        log.info("✅ Token 已更新 (%s)，继续探测", r.get("token_preview", ""))
+                        attempt -= 1
+                        continue
+                    else:
+                        log.warning("自动获取 Token 失败: %s，按普通失败继续重试", r.get("msg"))
+                else:
+                    log.info("本轮已自动刷新过 Token，不再重复刷新")
+            else:
+                log.info("探测 %s 失败 (%.0fms, %d/%d)",
+                         probe.name, dt, attempt, max_tries)
+
+            if backoff > 0:
+                await asyncio.sleep(backoff)
+
+        if not probe_ok:
+            log.warning("探测 %s %d 次全部失败，放弃本次刷新", probe.name, max_tries)
+            await bus.publish("refresh.result", {
+                "court": probe.no, "name": probe.name, "ok": False,
+                "error": f"探测 {max_tries} 次全部失败: {last_error}",
+                "ts": datetime.now().strftime("%H:%M:%S"),
+            })
+            await bus.publish("refresh.done", {
+                "ts": datetime.now().strftime("%H:%M:%S"),
+                "probe_failed": True,
+            })
+            return
+
+        self._tasks = [asyncio.create_task(self._one(c, date, token))
+                       for c in pool[1:]]
+        await asyncio.gather(*self._tasks, return_exceptions=True)
+
+    async def _one(self, court: Court, date: str, token: str):
+        t0 = time.monotonic()
+        res = await query_court(court, date, token)
+        dt = (time.monotonic() - t0) * 1000
+
+        if res.get("ok"):
+            log.info("%s OK (%.0fms)", court.name, dt)
+            await bus.publish("refresh.result", {
+                "court": court.no, "name": court.name, "ok": True,
+                "avail":  res["avail"], "blocks": res["blocks"],
+                "ts": datetime.now().strftime("%H:%M:%S"),
+            })
+        else:
+            err = res.get("error", "查询失败")
+            tag = "鉴权失败" if res.get("auth_fail") else "失败"
+            log.info("%s %s (%.0fms): %s", court.name, tag, dt, err)
+            await bus.publish("refresh.result", {
+                "court": court.no, "name": court.name, "ok": False,
+                "error": err,
+                "ts": datetime.now().strftime("%H:%M:%S"),
+            })
+
+
+refresh_service = RefreshService()
 
 
 # ══════════════════════════════════════════════════════
 # 自动模式
 # ══════════════════════════════════════════════════════
-# ★ 全自动模式下：在触发时间前多少秒自动刷新 Token
-#   180 = 3 分钟，120 = 2 分钟（默认），60 = 1 分钟
-TOKEN_REFRESH_LEAD_SEC: int = 120
-
-
 @dataclass
 class AutoState:
     running: bool = False
@@ -1167,8 +1216,6 @@ async def _run_auto(date, token, slot_start, slot_end,
         return True
 
     async def apply_pending():
-        # 注意：闭包读取的是 _run_auto 作用域里的 token / date，
-        #       Token 刷新后会重新赋值，这里自然拿到最新值。
         for c in list(candidates):
             if has_success():
                 return
@@ -1181,7 +1228,7 @@ async def _run_auto(date, token, slot_start, slot_end,
             if not vid:
                 log.info("自动模式: 队列无有效 vid，同步兜底求解")
                 try:
-                    vid = await CaptchaSolver(timeout=VID_TIMEOUT).solve()
+                    vid = await CaptchaSolver().solve()
                 except Exception as e:
                     log.warning("兜底求解失败: %s", e)
                     continue
@@ -1201,25 +1248,22 @@ async def _run_auto(date, token, slot_start, slot_end,
         refresh_dt = _parse_hms(refresh_at)
         submit_dt  = _parse_hms(submit_at)
 
-        # ─────────────────────────────────────────────
-        # ① 触发前 N 秒，自动刷新 Token
-        # ─────────────────────────────────────────────
+        # ① 触发前 N 秒自动刷 Token
         if datetime.now() < refresh_dt:
-            token_refresh_dt = refresh_dt - timedelta(seconds=TOKEN_REFRESH_LEAD_SEC)
+            lead = max(0, int(tuning.token_refresh_lead_sec))
+            token_refresh_dt = refresh_dt - timedelta(seconds=lead)
             if datetime.now() < token_refresh_dt:
                 auto_state.phase = "waiting_token"
-                auto_state.msg = (f"等待自动刷新 Token"
-                                  f"（{token_refresh_dt.strftime('%H:%M:%S')}）")
+                auto_state.msg = f"等待自动刷新 Token（{token_refresh_dt.strftime('%H:%M:%S')}）"
                 log.info("自动模式: Token 将在 %s 自动刷新",
                          token_refresh_dt.strftime('%H:%M:%S'))
                 await _sleep_until(token_refresh_dt)
 
             auto_state.phase = "fetching_token"
             auto_state.msg = "自动获取 Token 中…"
-            log.info("自动模式: 触发前 %ds，开始自动获取 Token",
-                     TOKEN_REFRESH_LEAD_SEC)
+            log.info("自动模式: 触发前 %ds，开始自动获取 Token", lead)
             try:
-                r = await fetch_token_now(timeout=30.0)
+                r = await fetch_token_now()
                 if r.get("ok"):
                     log.info("自动模式: ✅ Token 刷新成功 (%s)", r.get("token_preview"))
                     auto_state.msg = f"Token OK ({r.get('token_preview')})"
@@ -1230,15 +1274,12 @@ async def _run_auto(date, token, slot_start, slot_end,
                 log.warning("自动模式: Token 刷新异常: %s", e)
                 auto_state.msg = f"Token 刷新异常: {e}"
 
-            # ★ 用最新 token / date 继续（若 config 更新则同步）
             token = session.token
             date = session.target_date
         else:
             log.info("自动模式: 已过触发时间，跳过自动刷新 Token")
 
-        # ─────────────────────────────────────────────
-        # ② VID 池启动（默认在触发前 8 秒）
-        # ─────────────────────────────────────────────
+        # ② VID 池启动
         if not vid_pool.running:
             vid_start_dt = refresh_dt - timedelta(seconds=8)
             if datetime.now() < vid_start_dt:
@@ -1250,9 +1291,7 @@ async def _run_auto(date, token, slot_start, slot_end,
         else:
             log.info("自动模式: VID 池已在运行，跳过启动")
 
-        # ─────────────────────────────────────────────
-        # ③ 等到触发时间 → 刷新场地
-        # ─────────────────────────────────────────────
+        # ③ 等到触发时间
         auto_state.phase = "waiting"
         auto_state.msg = f"等待 {refresh_at}"
         log.info("自动模式: 等待触发 %s", refresh_at)
@@ -1265,9 +1304,7 @@ async def _run_auto(date, token, slot_start, slot_end,
         await refresh_service.start(date, token)
         q, hist = bus.subscribe(since)
 
-        # ─────────────────────────────────────────────
-        # ④ 收集空场直到 submit_at
-        # ─────────────────────────────────────────────
+        # ④ 收集空场
         auto_state.phase = "collecting"
         auto_state.msg = f"收集空场直到 {submit_at}"
         for e in hist:
@@ -1280,13 +1317,10 @@ async def _run_auto(date, token, slot_start, slot_end,
         while not q.empty():
             harvest(q.get_nowait())
 
-        # ─────────────────────────────────────────────
         # ⑤ 提交申请
-        # ─────────────────────────────────────────────
         auto_state.phase = "applying"
         auto_state.msg = f"申请中（候选 {len(candidates)}，上限 {max_orders}）"
-        log.info("自动模式: 到达申请时间，候选 %d，最多尝试 %d",
-                 len(candidates), max_orders)
+        log.info("自动模式: 到达申请时间，候选 %d，最多尝试 %d", len(candidates), max_orders)
         await apply_pending()
 
         if not has_success() and len(applied) < max_orders:
@@ -1306,8 +1340,7 @@ async def _run_auto(date, token, slot_start, slot_end,
                         break
 
         log.info("自动模式: 结束 | 候选 %d | 已尝试 %d | 成功 %s",
-                 len(candidates), len(applied),
-                 "是" if has_success() else "否")
+                 len(candidates), len(applied), "是" if has_success() else "否")
 
     except asyncio.CancelledError:
         log.info("自动模式: 被取消")
@@ -1336,7 +1369,6 @@ async def _run_auto(date, token, slot_start, slot_end,
 @asynccontextmanager
 async def lifespan(app):
     log.info("服务已启动")
-    # ★ 启动时后台常驻拉起 mitmdump（不阻塞 web 服务）
     boot_task = asyncio.create_task(_boot_mitm())
     watch_task = asyncio.create_task(watch_config())
     try:
@@ -1389,11 +1421,8 @@ async def set_config(d: ConfigIn):
     return {"ok": True, "target_date": session.target_date}
 
 
-# ──────────────────────────────────────────────────────
-# 一键抓 token：确保 mitm 就绪 → 刷新窗口 → 等 token 变化
-# ──────────────────────────────────────────────────────
 class TokenFetchIn(BaseModel):
-    timeout: float = 20.0
+    timeout: float | None = None
 
 
 _token_fetch_busy = False
@@ -1426,7 +1455,6 @@ def mitm_state_ep():
 
 @app.post("/api/mitm/restart")
 async def mitm_restart_ep():
-    """手动重启 mitmdump（仅会 kill 自己启的那个；外部监听的不会被碰）。"""
     _kill_mitmdump()
     await asyncio.sleep(0.3)
     ok = await _ensure_mitmdump(verbose_if_reuse=True)
@@ -1492,7 +1520,6 @@ async def reserve_ep(d: ReserveIn):
 
 
 class AutoIn(BaseModel):
-    # ★ 默认全自动时段改为 19:30 - 21:30
     slot_start: str = "19:30"
     slot_end:   str = "21:30"
     refresh_at: str = "20:00:01"
