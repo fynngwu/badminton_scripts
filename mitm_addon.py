@@ -34,10 +34,11 @@ _cached_hwnd: int = 0
 # addon：抓 token
 # ══════════════════════════════════════════════════════════
 def request(flow) -> None:  # type: ignore[no-untyped-def]
-    """每当 reservation 域名的请求带 token 查询参数时，写入 config.toml。
+    """每当 reservation 域名的请求带 token 查询参数时：
 
-    不论 token 内容是否与上次相同都重写（刷新 mtime），
-    让 app.py 的 mtime 监听立刻醒来。
+       - token 与 config.toml 当前值不同 → 写入，打印 [TOKEN] NEW old -> new
+       - token 与 config.toml 当前值相同 → 只打印 [TOKEN] SAME，不碰文件
+         （避免制造假 mtime，让 app.py 的 mtime 监听误以为配置变化）
     """
     if http is None:
         return
@@ -53,13 +54,35 @@ def request(flow) -> None:  # type: ignore[no-untyped-def]
 
     try:
         text = CONFIG.read_text(encoding="utf-8")
+
+        m = re.search(r'(?m)^\s*token\s*=\s*"([^"]*)"', text)
+        current = m.group(1) if m else ""
+
+        path = flow.request.path.split("?", 1)[0]
+        method = flow.request.method
+        ts = time.strftime("%H:%M:%S")
+
+        # 相同 token 只记录，不再修改 config.toml
+        if token == current:
+            print(
+                f"[{ts}] [TOKEN] SAME "
+                f"{token[:8]}... {method} {path}"
+            )
+            return
+
         new, n = re.subn(
             r'(?m)^(\s*token\s*=\s*)"[^"]*"',
             rf'\1"{token}"', text, count=1,
         )
+
         if n:
             CONFIG.write_text(new, encoding="utf-8")
-            print(f"[{time.strftime('%H:%M:%S')}] [TOKEN] captured: {token[:8]}...")
+            old_preview = (current[:8] + "...") if current else "空"
+            print(
+                f"[{ts}] [TOKEN] NEW "
+                f"{old_preview} -> {token[:8]}... "
+                f"{method} {path}"
+            )
         else:
             print("[TOKEN] config.toml 中未找到 token 字段，无法写入")
     except Exception as e:
@@ -99,41 +122,109 @@ def _valid(hwnd: int) -> bool:
         return False
 
 
-def _force_foreground(hwnd: int) -> None:
-    """把窗口拉到前台。直接 SetForegroundWindow 被系统拒绝时，
-    用 AttachThreadInput 绕过前台锁。"""
+def _ensure_foreground(hwnd: int, timeout: float = 0.6) -> bool:
+    """轮询直到 hwnd 真正成为前台窗口，或超时。
+
+    先用温和的 SetForegroundWindow；被系统拒绝时用 AttachThreadInput
+    绕过前台锁；每轮都真正检查 GetForegroundWindow()，而不是盲等。
+    """
     import win32gui
     import win32process
     import win32api
 
-    try:
-        win32gui.SetForegroundWindow(hwnd)
-        if win32gui.GetForegroundWindow() == hwnd:
-            return
-    except Exception:
-        pass
-
-    try:
-        fg = win32gui.GetForegroundWindow()
-        fg_tid = win32process.GetWindowThreadProcessId(fg)[0]
-        my_tid = win32api.GetCurrentThreadId()
-        win32process.AttachThreadInput(fg_tid, my_tid, True)
+    deadline = time.monotonic() + max(0.0, timeout)
+    while True:
         try:
-            win32gui.BringWindowToTop(hwnd)
+            if win32gui.GetForegroundWindow() == hwnd:
+                return True
+        except Exception:
+            pass
+
+        # 温和路径
+        try:
             win32gui.SetForegroundWindow(hwnd)
-        finally:
-            win32process.AttachThreadInput(fg_tid, my_tid, False)
-    except Exception:
-        pass
+        except Exception:
+            pass
+        try:
+            if win32gui.GetForegroundWindow() == hwnd:
+                return True
+        except Exception:
+            pass
+
+        # 强攻路径
+        try:
+            fg = win32gui.GetForegroundWindow()
+            if fg and fg != hwnd:
+                fg_tid = win32process.GetWindowThreadProcessId(fg)[0]
+                my_tid = win32api.GetCurrentThreadId()
+                if fg_tid != my_tid:
+                    win32process.AttachThreadInput(fg_tid, my_tid, True)
+                    try:
+                        win32gui.BringWindowToTop(hwnd)
+                        win32gui.SetForegroundWindow(hwnd)
+                    finally:
+                        win32process.AttachThreadInput(fg_tid, my_tid, False)
+        except Exception:
+            pass
+
+        try:
+            if win32gui.GetForegroundWindow() == hwnd:
+                return True
+        except Exception:
+            pass
+
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.03)
+
+
+def _mouse_click(x: int, y: int) -> None:
+    """在屏幕坐标 (x, y) 处按下+抬起左键。
+
+    移动 → 停 30ms 让系统把光标位置同步给目标 → 按下 → 停 30ms → 抬起。
+    一次点击里的这些微间隔能让 WebView / Chromium 稳定收到 mouse 事件。
+    """
+    import win32api
+    import win32con
+
+    win32api.SetCursorPos((x, y))
+    time.sleep(0.03)
+    win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+    time.sleep(0.03)
+    win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+
+
+def _send_ctrl_r() -> None:
+    """发一次 Ctrl+R。每个按键之间留 20ms，避免 WebView 丢键。"""
+    import win32api
+    import win32con
+
+    VK_R = 0x52
+    win32api.keybd_event(win32con.VK_CONTROL, 0, 0, 0)
+    time.sleep(0.02)
+    win32api.keybd_event(VK_R, 0, 0, 0)
+    time.sleep(0.02)
+    win32api.keybd_event(VK_R, 0, win32con.KEYEVENTF_KEYUP, 0)
+    time.sleep(0.02)
+    win32api.keybd_event(win32con.VK_CONTROL, 0, win32con.KEYEVENTF_KEYUP, 0)
 
 
 def refresh_reservation_window(
-    pre_click_delay: float = 0.05,
-    post_click_delay: float = 0.05,
+    pre_click_delay: float = 0.10,
+    post_click_delay: float = 0.10,
+    fg_timeout: float = 0.6,
+    double_click: bool = True,
 ) -> bool:
-    """找到 reservation 窗口 → 点一下内部 → 发 Ctrl+R。
+    """找到 reservation 窗口 → 让它真正上前台 → 点击 → Ctrl+R。
 
-    时序参数由 app.py 从 config.toml [tuning] 传入。
+    时序参数由 app.py 从 config.toml [tuning] 传入；fg_timeout / double_click
+    保留默认值即可，一般不需要暴露到 config。
+
+    关键修复：
+      * 用 _ensure_foreground() 轮询确认窗口真的上前台（而非设一次就赌）
+      * Windows 首次点击常被吞掉（只用于激活窗口），因此默认点两次
+      * Ctrl+R 之前再确认一次前台；掉前台就补一次激活+点击
+      * 鼠标移动/按下/抬起之间、以及 Ctrl+R 各键之间留小间隔
     """
     global _cached_hwnd
 
@@ -165,44 +256,58 @@ def refresh_reservation_window(
     try:
         print(f"[refresh] 找到预约窗口: {win32gui.GetWindowText(hwnd)}")
 
-        # 最小化 → 恢复
+        # 最小化 → 恢复，并给系统一点时间完成状态切换
         try:
             if win32gui.GetWindowPlacement(hwnd)[1] == win32con.SW_SHOWMINIMIZED:
                 win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+                time.sleep(0.15)
         except Exception:
             pass
 
-        _force_foreground(hwnd)
-
-        # 把键盘焦点交给窗口，避免按键落到别处
-        try:
-            win32gui.SetFocus(hwnd)
-        except Exception:
-            pass
+        # ① 轮询等窗口真的到前台
+        if not _ensure_foreground(hwnd, timeout=fg_timeout):
+            print("[refresh] ⚠ 未能在前台锁定窗口，仍然尝试点击…")
 
         if pre_click_delay > 0:
             time.sleep(pre_click_delay)
 
-        # 点击窗口内部，让 WebView 拿到键盘
+        # ② 计算点击点：水平居中、垂直取窗口顶部往下 20%（避开标题栏/工具栏）
+        cx = cy = None
         try:
             rect = win32gui.GetWindowRect(hwnd)
-            cx = (rect[0] + rect[2]) // 2
-            cy = rect[1] + max(80, (rect[3] - rect[1]) // 8)
-            win32api.SetCursorPos((cx, cy))
-            win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
-            win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+            w = rect[2] - rect[0]
+            h = rect[3] - rect[1]
+            cx = rect[0] + w // 2
+            cy = rect[1] + max(100, int(h * 0.20))
         except Exception as e:
-            print(f"[refresh] click 失败（忽略）: {e}")
+            print(f"[refresh] 计算点击坐标失败（忽略）: {e}")
+
+        # ③ 点击：默认两次，第一次激活 WebView，第二次真正落到页面上
+        if cx is not None and cy is not None:
+            try:
+                _mouse_click(cx, cy)
+                if double_click:
+                    time.sleep(0.08)
+                    _mouse_click(cx, cy)
+            except Exception as e:
+                print(f"[refresh] click 失败（忽略）: {e}")
 
         if post_click_delay > 0:
             time.sleep(post_click_delay)
 
-        # Ctrl+R
-        VK_R = 0x52
-        win32api.keybd_event(win32con.VK_CONTROL, 0, 0, 0)
-        win32api.keybd_event(VK_R, 0, 0, 0)
-        win32api.keybd_event(VK_R, 0, win32con.KEYEVENTF_KEYUP, 0)
-        win32api.keybd_event(win32con.VK_CONTROL, 0, win32con.KEYEVENTF_KEYUP, 0)
+        # ④ Ctrl+R 之前再确认一次前台；掉前台就补一枪
+        if not _ensure_foreground(hwnd, timeout=0.4):
+            print("[refresh] ⚠ 发送 Ctrl+R 前窗口不在前台，仍尝试发送…")
+            # 补一次：激活 + 单击
+            if cx is not None and cy is not None:
+                try:
+                    _mouse_click(cx, cy)
+                    time.sleep(0.08)
+                except Exception:
+                    pass
+
+        # ⑤ 发 Ctrl+R
+        _send_ctrl_r()
         ok = True
     except Exception as e:
         print(f"[refresh] error: {e}")
@@ -218,7 +323,6 @@ def refresh_reservation_window(
     if ok:
         print("[refresh] 已发送 Ctrl+R")
     return ok
-
 
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "refresh":

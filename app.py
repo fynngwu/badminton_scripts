@@ -91,14 +91,14 @@ class Court:
 @dataclass
 class Tuning:
     # 抓 Token
-    token_wait_timeout:       float = 1.5
+    token_wait_timeout:       float = 4.0
     refresh_pre_click_delay:  float = 0.05
     refresh_post_click_delay: float = 0.05
 
     # 刷新场地
     probe_backoff:            float = 1.0
     probe_max_tries:          int   = 15
-    auth_refresh_timeout:     float = 1.5
+    auth_refresh_timeout:     float = 4.0
 
     # 自动模式
     token_refresh_lead_sec:   int   = 120
@@ -912,7 +912,8 @@ async def fetch_token_now(timeout: float | None = None) -> dict:
 
     ★ 单次尝试，无重试：
       - 找不到窗口 → 立即返回失败
-      - 发了 Ctrl+R 但 timeout 秒内没抓到 → 立即返回失败
+      - 发了 Ctrl+R 但 timeout 秒内没抓到“新”token → 立即返回失败
+      - 若先捕获到与刷新前相同的旧 token，不视为成功，继续等待真正的新 token
       用户想重试就再点一次按钮。
     """
     if timeout is None:
@@ -964,12 +965,19 @@ async def fetch_token_now(timeout: float | None = None) -> dict:
             log.warning("config.toml 已更新但 token 仍为空，继续等待…")
             continue
 
-        await bus.publish("config.updated", config_store.public_view())
         preview = session.token[:8] + "..."
-        if session.token != old_token:
-            log.info("✅ Token 获取成功：%s（已更新）", preview)
-        else:
-            log.info("✅ Token 获取成功：%s（与之前相同）", preview)
+
+        # Ctrl+R 后旧页面的在途请求可能仍携带旧 token。
+        # config.toml 被改写 != 真正拿到新 token。
+        if session.token == old_token:
+            log.info(
+                "↪ 捕获到旧 Token：%s（与刷新前相同），继续等待真正的新 Token…",
+                preview,
+            )
+            continue
+
+        await bus.publish("config.updated", config_store.public_view())
+        log.info("✅ Token 获取成功：%s（已更新）", preview)
         return {"ok": True, "token_preview": preview}
 
     msg = f"{timeout:.1f}s 内未捕获到新 token（窗口可能没刷成，再点一次即可）"
@@ -1027,6 +1035,25 @@ class RefreshService:
 
         while attempt < max_tries:
             attempt += 1
+
+            # 真正的新 token 可能在 fetch_token_now 超时之后才到达。
+            # config watcher 会更新 session.token，所以每轮探测前重新同步。
+            if session.token and session.token != token:
+                log.info(
+                    "🔄 探测切换到最新 Token：%s → %s",
+                    (token[:8] + "...") if token else "空",
+                    session.token[:8] + "...",
+                )
+                token = session.token
+
+            log.info(
+                "[AUTHDBG] 探测 %s 第 %d 次 token=%s session=%s",
+                probe.name,
+                attempt,
+                (token[:8] + "...") if token else "空",
+                (session.token[:8] + "...") if session.token else "空",
+            )
+
             t0 = time.monotonic()
             res = await query_court(probe, date, token)
             dt = (time.monotonic() - t0) * 1000

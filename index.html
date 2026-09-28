@@ -192,7 +192,7 @@ button:disabled {
     <option value="1" selected>明天</option>
     <option value="2">后天</option>
   </select>
-  <button class="primary" id="btn-save">保存</button>
+  <button class="primary" id="btn-save">保存 Token</button>
   <button class="auto" id="btn-fetch-token">🔑 自动获取 Token</button>
   <span class="mini">目标：<b id="cur-date">-</b></span>
 </div>
@@ -571,18 +571,45 @@ function connectSSE(since) {
   });
 }
 
+// ── 日期切换：自动保存 ────────────────────────────────
+$("date-offset").onchange = async () => {
+  const sel = $("date-offset");
+  const label = sel.selectedOptions[0].textContent;
+  const body = { offset_days: +sel.value };
+  sel.disabled = true;
+  try {
+    const r = await fetch("/api/config", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(body),
+    });
+    const j = await r.json();
+    if (!j.ok) {
+      toast(j.msg || "日期保存失败", "err");
+      // 回滚到服务端当前值（下次 config.updated 也会纠正）
+      await loadConfig();
+      return;
+    }
+    toast(`日期已切换到「${label}」→ ${j.target_date || ""}`, "ok", 2000);
+  } catch (e) {
+    toast("请求失败：" + e, "err", 3000);
+    await loadConfig();
+  } finally {
+    sel.disabled = false;
+  }
+};
+
+// ── 保存按钮：只负责保存 token ────────────────────────
 $("btn-save").onclick = async () => {
   const tok = $("token").value.trim();
-  const body = { offset_days: +$("date-offset").value };
-  if (tok) body.token = tok;
+  if (!tok) { toast("Token 为空，无需保存", "err"); return; }
   const r = await fetch("/api/config", {
     method: "POST", headers: {"Content-Type": "application/json"},
-    body: JSON.stringify(body),
+    body: JSON.stringify({ token: tok }),
   });
   const j = await r.json();
   if (!j.ok) { toast(j.msg || "保存失败", "err"); return; }
   $("token").value = "";
-  toast("已保存", "ok");
+  toast("Token 已保存", "ok");
 };
 
 $("btn-fetch-token").onclick = async () => {
