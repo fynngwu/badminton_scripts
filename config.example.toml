@@ -1,9 +1,6 @@
-# 羽毛球预约配置示例
-# 使用时复制为 config.toml：
-#   copy config.example.toml config.toml
-#
-# Linux/macOS:
-#   cp config.example.toml config.toml
+# 羽毛球预约 —— 唯一权威配置
+# 修改保存后，后端 1s 内自动重载并广播到所有客户端。
+# token 字段由 mitm_addon.py 自动写入，也可以手工粘贴。
 
 [user]
 id = "YOUR_USER_ID"
@@ -16,13 +13,15 @@ id   = "1297443858304540673"
 name = "润杨羽毛球馆"
 
 [order]
-# 0 = 今天
-# 1 = 明天
-# 2 = 后天
+# 0=今天  1=明天  2=后天
 offset_days = 1
+token = "612fb16f-8692-4a1d-a22b-a262ccc405a2"
 
-# 一般保持为空，由 mitm_addon.py 自动捕获并写入
-token = ""
+[auto]
+# 全自动抢场参数（前端修改后写回本段，多设备共享）
+slot_start = "16:00"
+slot_end   = "18:00"
+refresh_at = "20:00:06"
 
 [courts]
 1  = "1298272433186332673"
@@ -36,6 +35,7 @@ token = ""
 9  = "1298273399927267330"
 10 = "1298273500317933570"
 
+
 # ═══════════════════════════════════════════════════════════════
 # 可调参数（全部集中在这里）
 # 改完保存，1s 内自动重载生效，无需重启进程
@@ -43,14 +43,13 @@ token = ""
 [tuning]
 
 # ── 抓 Token ──
-token_wait_timeout        = 1.5     # 等 token 的秒数（单次，无重试）
 refresh_pre_click_delay   = 0.05    # 点击窗口前的等待（秒）
 refresh_post_click_delay  = 0.05    # 点击后到按 Ctrl+R 之间的等待（秒）
 
 # ── 刷新场地 ──
 probe_backoff             = 1.0     # 探测场地失败后的退避（秒）
-probe_max_tries           = 6      # 探测场地最多重试次数
-auth_refresh_timeout      = 1.5     # 遇到「鉴权失败」时自动抓 token 的超时
+probe_max_tries           = 6       # 探测场地最多重试次数
+auth_refresh_timeout      = 4.0     # 遇到「鉴权失败」时自动抓 token 的超时
 
 # ── 自动模式 ──
 token_refresh_lead_sec    = 120     # 触发前多少秒自动刷新 token
