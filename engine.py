@@ -589,9 +589,7 @@ class Engine:
         log.info("启动刷新: 探测 %s → 成功后并发剩余 %d 个场地 (退避 %.1fs / 最多 %d 次)",
                  pool[0].name, len(pool) - 1,
                  self.tuning.probe_backoff, self.tuning.probe_max_tries)
-        self._refresh_probe_task = asyncio.create_task(
-            self._refresh_run(self.target_date, self.token, pool)
-        )
+        self._refresh_probe_task = asyncio.create_task(self._refresh_run(pool))
         return {"ok": True, "total": len(pool)}
 
     async def stop_refresh(self):
@@ -604,119 +602,89 @@ class Engine:
         self._refresh_probe_task = None
         self._refresh_tasks = []
 
-    async def _refresh_run(self, date: str, token: str, pool: list[Court]):
+    async def _refresh_run(self, pool: list[Court]):
         try:
-            await self._refresh_probe_then_fanout(date, token, pool)
+            await self._refresh_probe_then_fanout(pool)
         finally:
             await self.bus.publish("refresh.done",
                                    {"ts": datetime.now().strftime("%H:%M:%S")})
 
-    async def _refresh_probe_then_fanout(self, date, token, pool):
-        probe = pool[0]
-        attempt = 0
-        token_refreshed = False
-        probe_ok = False
-        last_error = ""
-
+    async def _refresh_probe_then_fanout(self, pool: list[Court]):
+        probe, rest = pool[0], pool[1:]
         max_tries = max(1, int(self.tuning.probe_max_tries))
-        backoff = max(0.0, float(self.tuning.probe_backoff))
+        backoff   = max(0.0, float(self.tuning.probe_backoff))
 
-        while attempt < max_tries:
-            attempt += 1
-
-            if self.token and self.token != token:
-                log.info("🔄 探测切换到最新 Token：%s → %s",
-                         (token[:8] + "...") if token else "空",
-                         self.token[:8] + "...")
-                token = self.token
-
+        ok = False
+        for attempt in range(1, max_tries + 1):
             t0 = time.monotonic()
-            res = await get_order_once(probe, date, token, self.user_id)
+            res = await get_order_once(probe, self.target_date,
+                                       self.token, self.user_id)
             dt = (time.monotonic() - t0) * 1000
 
             if res.get("ok"):
-                log.info("探测 %s 成功 (%.0fms, 第 %d 次)，开始并发其余 %d 个场地",
-                         probe.name, dt, attempt, len(pool) - 1)
-                await self.bus.publish("refresh.result", {
-                    "court": probe.no, "name": probe.name, "ok": True,
-                    "avail":  res["avail"], "blocks": res["blocks"],
-                    "ts": datetime.now().strftime("%H:%M:%S"),
-                })
-                probe_ok = True
+                log.info("探测 %s 成功 (%.0fms, 第 %d 次)，并发剩余 %d 个场地",
+                         probe.name, dt, attempt, len(rest))
+                await self._publish_refresh(probe, res)
+                ok = True
                 break
 
-            last_error = res.get("error", "查询失败")
-
             if res.get("auth_fail"):
-                log.warning("探测 %s 鉴权失败 (%.0fms, %d/%d): %s",
-                            probe.name, dt, attempt, max_tries, last_error)
-                if not token_refreshed:
-                    log.info("→ 检测到鉴权失败，自动获取 Token…")
-                    try:
-                        r = await self.fetch_token(
-                            timeout=self.tuning.auth_refresh_timeout)
-                    except Exception as e:
-                        log.warning("自动获取 Token 异常: %s", e)
-                        r = {"ok": False, "msg": str(e)}
-                    if r.get("ok"):
-                        token_refreshed = True
-                        token = self.token
-                        log.info("✅ Token 已更新 (%s)，继续探测",
-                                 r.get("token_preview", ""))
-                        attempt -= 1
-                        continue
-                    else:
-                        log.warning("自动获取 Token 失败: %s，按普通失败继续重试",
-                                    r.get("msg"))
-                else:
-                    log.info("本轮已自动刷新过 Token，不再重复刷新")
+                log.warning("探测 %s 鉴权失败 (%.0fms, %d/%d): %s，自动获取 Token…",
+                            probe.name, dt, attempt, max_tries,
+                            res.get("error", ""))
+                try:
+                    await self.fetch_token()
+                except Exception as e:
+                    log.warning("自动获取 Token 异常: %s", e)
             else:
-                log.info("探测 %s 失败 (%.0fms, %d/%d)",
-                         probe.name, dt, attempt, max_tries)
+                log.info("探测 %s 失败 (%.0fms, %d/%d): %s",
+                         probe.name, dt, attempt, max_tries,
+                         res.get("error", ""))
 
             if backoff > 0:
                 await asyncio.sleep(backoff)
 
-        if not probe_ok:
+        if not ok:
             log.warning("探测 %s %d 次全部失败，放弃本次刷新", probe.name, max_tries)
-            await self.bus.publish("refresh.result", {
-                "court": probe.no, "name": probe.name, "ok": False,
-                "error": f"探测 {max_tries} 次全部失败: {last_error}",
-                "ts": datetime.now().strftime("%H:%M:%S"),
-            })
-            await self.bus.publish("refresh.done", {
-                "ts": datetime.now().strftime("%H:%M:%S"),
-                "probe_failed": True,
+            await self._publish_refresh(probe, {
+                "ok": False,
+                "error": f"探测 {max_tries} 次全部失败",
             })
             return
 
         self._refresh_tasks = [
-            asyncio.create_task(self._refresh_one(c, date, token))
-            for c in pool[1:]
+            asyncio.create_task(self._refresh_one(c)) for c in rest
         ]
         await asyncio.gather(*self._refresh_tasks, return_exceptions=True)
 
-    async def _refresh_one(self, court: Court, date: str, token: str):
+    async def _refresh_one(self, court: Court):
         t0 = time.monotonic()
-        res = await get_order_once(court, date, token, self.user_id)
+        res = await get_order_once(court, self.target_date,
+                                   self.token, self.user_id)
         dt = (time.monotonic() - t0) * 1000
 
         if res.get("ok"):
             log.info("%s OK (%.0fms)", court.name, dt)
-            await self.bus.publish("refresh.result", {
-                "court": court.no, "name": court.name, "ok": True,
-                "avail":  res["avail"], "blocks": res["blocks"],
-                "ts": datetime.now().strftime("%H:%M:%S"),
-            })
         else:
-            err = res.get("error", "查询失败")
             tag = "鉴权失败" if res.get("auth_fail") else "失败"
-            log.info("%s %s (%.0fms): %s", court.name, tag, dt, err)
-            await self.bus.publish("refresh.result", {
-                "court": court.no, "name": court.name, "ok": False,
-                "error": err,
-                "ts": datetime.now().strftime("%H:%M:%S"),
-            })
+            log.info("%s %s (%.0fms): %s",
+                     court.name, tag, dt, res.get("error", ""))
+
+        await self._publish_refresh(court, res)
+
+    async def _publish_refresh(self, court: Court, res: dict):
+        evt = {
+            "court": court.no,
+            "name":  court.name,
+            "ok":    bool(res.get("ok")),
+            "ts":    datetime.now().strftime("%H:%M:%S"),
+        }
+        if res.get("ok"):
+            evt["avail"]  = res["avail"]
+            evt["blocks"] = res["blocks"]
+        else:
+            evt["error"] = res.get("error", "查询失败")
+        await self.bus.publish("refresh.result", evt)
 
     # ══════════════════════════════════════════════════
     # 手动下单（不拉起 VID 池）
@@ -950,8 +918,7 @@ class Engine:
                 if not res.get("ok") and res.get("auth_fail"):
                     log.warning("自动模式: %s 鉴权失败，自动刷新 Token 后重试",
                                 court.name)
-                    r = await self.fetch_token(
-                        timeout=self.tuning.auth_refresh_timeout)
+                    r = await self.fetch_token()
                     if r.get("ok"):
                         res = await get_order_once(court, self.target_date,
                                                    self.token, self.user_id)
