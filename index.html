@@ -172,9 +172,10 @@ button:disabled {
   background: #161b22; border: 1px solid var(--border-strong);
   box-shadow: 0 8px 24px -8px rgba(0,0,0,.8);
   animation: slideIn .25s ease-out;
-  max-width: 320px;
+  max-width: 380px; word-break: break-word;
 }
 .toast-item.ok   { border-color: #1f5a2e; color: #7ee787; }
+.toast-item.warn { border-color: #6b3e0e; color: #ffa657; }
 .toast-item.err  { border-color: #6b2e2e; color: #ffa6a6; }
 @keyframes slideIn { from { opacity:0; transform: translateX(20px); } to { opacity:1; transform: none; } }
 </style>
@@ -211,23 +212,19 @@ button:disabled {
   <select id="auto-ss"></select>
   <span style="color:#a371f7;">—</span>
   <select id="auto-se"></select>
-  <label>触发</label><input id="auto-rt" value="20:00:01" style="width:85px">
-  <label>申请</label><input id="auto-st" value="20:00:04" style="width:85px">
-  <label>最多</label>
-  <input id="auto-mo" type="number" value="3" min="1" max="10" style="width:55px">
+  <label>触发</label><input id="auto-rt" style="width:85px">
   <button class="auto" id="btn-auto">启动全自动</button>
 </div>
 
 <div class="card" id="auto-status" style="display:none">
   <span class="pill" id="auto-phase">idle</span>
   <span class="mini" id="auto-msg" style="margin-left:10px;"></span>
-  <div class="mini" style="margin-top:8px;">候选：<span id="auto-cands">无</span></div>
-  <div class="mini">已申请：<span id="auto-applied">无</span></div>
+  <div class="mini" style="margin-top:8px;">已申请：<span id="auto-applied">无</span></div>
 </div>
 
 <div class="section">
   <h2>可抢场地 <span class="mini" style="font-weight:normal;color:#6b7280;">
-    (按起始时间倒序 · 每段最多合并 2 小时 · 至 22:00)</span></h2>
+    (时长优先 · 同长按起始时间倒序 · 每段最多合并 2 小时 · 至 22:00)</span></h2>
   <div id="free"></div>
 </div>
 
@@ -252,19 +249,18 @@ function toast(msg, kind="ok", ms=3200) {
   setTimeout(() => { el.style.opacity = "0"; setTimeout(() => el.remove(), 250); }, ms);
 }
 
-function fillTimeSelect(sel, fromMin, toMin, defValue) {
+function fillTimeSelect(sel, fromMin, toMin) {
   for (let m = fromMin; m <= toMin; m += 30) {
     const hh = String(Math.floor(m / 60)).padStart(2, "0");
     const mm = String(m % 60).padStart(2, "0");
     const val = `${hh}:${mm}`;
     const opt = document.createElement("option");
     opt.value = opt.textContent = val;
-    if (val === defValue) opt.selected = true;
     sel.appendChild(opt);
   }
 }
-fillTimeSelect($("auto-ss"), 8 * 60, 21 * 60 + 30, "19:30");
-fillTimeSelect($("auto-se"), 8 * 60 + 30, 22 * 60,   "21:30");
+fillTimeSelect($("auto-ss"), 8 * 60, 21 * 60 + 30);
+fillTimeSelect($("auto-se"), 8 * 60 + 30, 22 * 60);
 
 const SCAN_START = 8 * 60;
 const SCAN_END   = 22 * 60;
@@ -280,6 +276,10 @@ const escHtml = s => String(s).replace(/[&<>"']/g, c =>
 const fmtMin = m =>
   String(Math.floor(m / 60)).padStart(2, "0") + ":" +
   String(m % 60).padStart(2, "0");
+const hm2min = t => {
+  const [h, m] = t.split(":").map(Number);
+  return h * 60 + m;
+};
 
 const ACTIVITY_KEYWORDS = [
   "工会", "比赛", "活动", "大会", "赛", "训练",
@@ -352,14 +352,25 @@ function groupByName(spans) {
     a.name.localeCompare(b.name, "zh-Hans-CN"));
 }
 
+// 可抢场地：时长优先 → 同长按起始时间倒序 → 场地号升序
 function renderFree() {
   const box = $("free");
-  const starts = Object.keys(freeByStart).sort().reverse();
+  const starts = Object.keys(freeByStart);
   if (!starts.length) { box.innerHTML = `<div class="hint">暂无空闲场地</div>`; return; }
 
-  box.innerHTML = starts.map(st => {
+  const groups = starts.map(st => {
     const items = [...freeByStart[st]]
-      .sort((a, b) => a.court - b.court || a.end.localeCompare(b.end));
+      .map(i => ({ ...i, dur: hm2min(i.end) - hm2min(i.start) }))
+      .sort((a, b) => b.dur - a.dur || a.court - b.court);
+    return { st, items, maxDur: items[0].dur };
+  });
+
+  groups.sort((a, b) =>
+    b.maxDur - a.maxDur
+    || hm2min(b.st) - hm2min(a.st)
+  );
+
+  box.innerHTML = groups.map(({ st, items }) => {
     const rows = items.map(i =>
       `<button class="avail-btn"
         data-court="${i.court}" data-start="${i.start}" data-end="${i.end}">
@@ -533,6 +544,7 @@ async function pollLogs() {
   } catch {}
 }
 
+// 从 config.toml 派生的配置同步到 UI（auto 段必填，缺失即报错）
 function applyConfig(cfg) {
   const o = cfg.order || {};
   const sel = $("date-offset");
@@ -544,6 +556,11 @@ function applyConfig(cfg) {
   tok.placeholder = o.token_set
     ? `已配置 ${o.token_preview}（粘贴新 token 覆盖）`
     : "粘贴 token";
+
+  const a = cfg.auto;
+  $("auto-ss").value = a.slot_start;
+  $("auto-se").value = a.slot_end;
+  $("auto-rt").value = a.refresh_at;
 }
 
 async function loadConfig() {
@@ -553,11 +570,15 @@ async function loadConfig() {
   } catch {}
 }
 
+// ══════════════════════════════════════════════════════
+// SSE
+// ══════════════════════════════════════════════════════
 function connectSSE(since) {
   if (sse) sse.close();
   sse = new EventSource("/api/stream?since=" + since);
   sse.onopen  = () => $("sse-dot").classList.add("on");
   sse.onerror = () => $("sse-dot").classList.remove("on");
+
   sse.addEventListener("refresh.result", ev => onResult(JSON.parse(ev.data).data));
   sse.addEventListener("refresh.done", () => {
     refreshRunning = false;
@@ -569,23 +590,49 @@ function connectSSE(since) {
     applyConfig(d);
     if (old && old !== "-" && d.order && d.order.target_date !== old) reset();
   });
+
+  sse.addEventListener("order.result", ev => {
+    const d = JSON.parse(ev.data).data || {};
+    const kind  = d.kind === "ok" ? "ok" : (d.kind === "busy" ? "warn" : "err");
+    const label = d.label || (d.kind === "ok" ? "✅ 预约成功"
+                             : d.kind === "busy" ? "⚠ 系统繁忙"
+                             : "❌ 下单失败");
+    const name  = d.name || (d.court ? `${d.court}号场` : "");
+    const msg   = d.msg ? `  —  ${d.msg}` : "";
+    const code  = (d.code != null && d.code !== "") ? `  [code=${d.code}]` : "";
+    toast(`${label} · ${name}${code}${msg}`, kind, 5000);
+  });
 }
 
-// ── 日期切换：自动保存 ────────────────────────────────
+// ── 全自动参数：变更即写回 config.toml，多设备共享 ──
+async function saveAutoPlan() {
+  const r = await fetch("/api/auto/config", {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({
+      slot_start: $("auto-ss").value,
+      slot_end:   $("auto-se").value,
+      refresh_at: $("auto-rt").value.trim(),
+    }),
+  });
+  const j = await r.json();
+  if (!j.ok) toast("全自动参数保存失败：" + (j.msg || ""), "err", 3000);
+}
+["auto-ss", "auto-se", "auto-rt"].forEach(id =>
+  $(id).addEventListener("change", saveAutoPlan));
+
+// ── 日期切换：自动保存 ──
 $("date-offset").onchange = async () => {
   const sel = $("date-offset");
   const label = sel.selectedOptions[0].textContent;
-  const body = { offset_days: +sel.value };
   sel.disabled = true;
   try {
     const r = await fetch("/api/config", {
       method: "POST", headers: {"Content-Type": "application/json"},
-      body: JSON.stringify(body),
+      body: JSON.stringify({ offset_days: +sel.value }),
     });
     const j = await r.json();
     if (!j.ok) {
       toast(j.msg || "日期保存失败", "err");
-      // 回滚到服务端当前值（下次 config.updated 也会纠正）
       await loadConfig();
       return;
     }
@@ -598,7 +645,7 @@ $("date-offset").onchange = async () => {
   }
 };
 
-// ── 保存按钮：只负责保存 token ────────────────────────
+// ── 保存 token ──
 $("btn-save").onclick = async () => {
   const tok = $("token").value.trim();
   if (!tok) { toast("Token 为空，无需保存", "err"); return; }
@@ -656,29 +703,39 @@ $("btn-auto").onclick = async () => {
     await fetch("/api/auto/stop", {method: "POST"});
     return;
   }
-  const body = {
-    slot_start: $("auto-ss").value, slot_end: $("auto-se").value,
-    refresh_at: $("auto-rt").value.trim(), submit_at: $("auto-st").value.trim(),
-    max_orders: +$("auto-mo").value,
-  };
-  const d = await (await fetch("/api/auto/start", {
-    method: "POST", headers: {"Content-Type": "application/json"},
-    body: JSON.stringify(body),
-  })).json();
+  const d = await (await fetch("/api/auto/start", {method: "POST"})).json();
   if (!d.ok) { toast(d.msg, "err"); return; }
   toast("全自动已启动", "ok");
 };
 
-document.addEventListener("click", ev => {
+// ── 点击场地：立即 ack，结果走 SSE ──
+document.addEventListener("click", async ev => {
   const el = ev.target.closest("[data-court]");
   if (!el) return;
-  fetch("/api/reserve", {
-    method: "POST", headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({
-      court_no: +el.dataset.court,
-      start: el.dataset.start, end: el.dataset.end,
-    }),
-  });
+
+  const courtNo = +el.dataset.court;
+  const start   = el.dataset.start;
+  const end     = el.dataset.end;
+  const name    = `${courtNo}号场 ${start}-${end}`;
+
+  try {
+    const r = await fetch("/api/reserve", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ court_no: courtNo, start, end }),
+    });
+    const d = await r.json();
+
+    if (d.accepted) {
+      toast(`⏳ 提交中：${name}…`, "ok", 1500);
+    } else {
+      const kind = d.kind === "warn" ? "warn" : "err";
+      toast(`${d.label || "❌ 无法提交"} · ${name}`
+            + (d.msg ? `  —  ${d.msg}` : ""), kind, 4000);
+    }
+  } catch (e) {
+    toast(`❌ 请求失败：${e}`, "err", 4000);
+  }
 });
 
 setInterval(async () => {
@@ -700,7 +757,6 @@ setInterval(async () => {
       $("auto-status").style.display = "";
       $("auto-phase").textContent = d.phase;
       $("auto-msg").textContent = d.msg;
-      $("auto-cands").textContent = (d.candidates || []).map(c => c.name).join(" / ") || "无";
       $("auto-applied").textContent =
         (d.applied || []).map(a => `${a.name}${a.ok ? "✓" : "✗"}`).join(" / ") || "无";
     }
