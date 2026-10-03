@@ -1,173 +1,272 @@
-# SUSTech 羽毛球预约工具
+# 🏸 SUSTech 羽毛球预约脚本：新电脑部署指南
 
-本项目提供羽毛球场预约查询、Token 自动抓取、场地刷新等功能。
+> 适用于 Windows 10 / Windows 11。  
+> 目标：在一台全新的电脑上，从零配置到可以直接运行：
+>
+> ```powershell
+> python app.py
+> ```
+>
+> 项目地址：`https://github.com/fynngwu/badminton_scripts`
 
-整体网络结构：
+---
+
+## 0. 先看这里：新电脑需要重新配置什么？
+
+代码从 GitHub 克隆下来只是第一步。下面这些属于“电脑环境”，**不会跟着 Git 仓库自动迁移**：
+
+1. Python 环境和 Python 包
+2. `config.toml` 中当前使用者的信息
+3. mitmproxy 根证书
+4. Clash Verge / Mihomo 的转发规则
+5. 企业微信登录状态和预约页面
+6. 如果需要手机远程访问，还要重新配置 Windows 防火墙 / Tailscale
+
+推荐先完整按照本文执行一次，不要直接复制旧电脑的 `.venv`、`.mitmproxy` 或 `config.toml`。
+
+---
+
+# 1. 安装基础软件
+
+至少需要：
+
+- Windows 10 / 11
+- Git
+- Python 3.11
+- 企业微信 Windows 客户端
+- Clash Verge Rev / 其他 Mihomo 客户端
+
+推荐使用 **Python 3.11 64-bit**。
+
+安装 Python 时一定勾选：
 
 ```text
-企业微信预约页面
-        │
-        ▼
-     Clash
-        │
-        ├── reservation.sustech.edu.cn
-        │          │
-        │          ▼
-        │     mitmproxy :8080
-        │          │
-        │          ▼
-        │   reservation 服务器
-        │
-        └── 其他网络流量
-                   │
-                   ▼
-              Clash 原规则
+Add python.exe to PATH
+```
 
-浏览器 / 手机
-        │
-        ▼
-   FastAPI :8000
+安装完成后打开 PowerShell：
+
+```powershell
+python --version
+pip --version
+git --version
+```
+
+推荐看到类似：
+
+```text
+Python 3.11.x
+```
+
+如果 `python` 找不到，可以尝试：
+
+```powershell
+py -3.11 --version
+```
+
+---
+
+# 2. 下载项目
+
+在准备放代码的目录打开 PowerShell：
+
+```powershell
+git clone https://github.com/fynngwu/badminton_scripts.git
+cd badminton_scripts
+```
+
+项目正常应该至少包含：
+
+```text
+badminton_scripts/
+├─ app.py
+├─ engine.py
+├─ utils.py
+├─ mitm_addon.py
+├─ index.html
+├─ fast_db.npz
+├─ requirements.txt
+├─ config.example.toml
+└─ ...
 ```
 
 其中：
 
-- `8000`：本项目 Web 服务端口
-- `8080`：mitmproxy 本地代理端口
-- mitmproxy 只用于监听 `reservation.sustech.edu.cn`
-- 其他网站不应转发到 `8080`
-- Token 抓取流程为：刷新企业微信预约页面 → mitmproxy 捕获请求 → 写入 `config.toml`
+- `app.py`：FastAPI Web 服务入口
+- `engine.py`：状态机、VID 池、自动预约等运行逻辑
+- `utils.py`：请求、验证码、窗口控制、mitmproxy 等底层功能
+- `mitm_addon.py`：mitmproxy 抓 Token 的插件
+- `index.html`：网页前端
+- `fast_db.npz`：验证码识别所需数据库
+- `config.toml`：本机用户配置，不应提交到 GitHub
+
+**不要只复制 `app.py`。**
 
 ---
 
-## 1. 环境要求
+# 3. 创建 Python 虚拟环境
 
-推荐：
+推荐每台电脑创建自己的 `.venv`。
+
+在项目目录执行：
+
+```powershell
+python -m venv .venv
+```
+
+激活：
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+```
+
+成功后 PowerShell 前面通常会出现：
 
 ```text
-Windows 10 / 11
-Python 3.11+
-uv
-Clash Verge / Mihomo
-Tailscale（可选，用于手机远程访问）
-企业微信桌面端
+(.venv)
 ```
 
-进入项目目录后安装依赖。
-
-如果项目已经带有 `pyproject.toml`：
+如果 PowerShell 提示禁止执行脚本，可以只对当前用户执行：
 
 ```powershell
-uv sync
+Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
 ```
 
-否则根据项目实际依赖安装。
-
-确认 Python：
+然后重新打开 PowerShell，再执行：
 
 ```powershell
-uv run python --version
-```
-
-确认 mitmproxy：
-
-```powershell
-uv run mitmdump --version
+.\.venv\Scripts\Activate.ps1
 ```
 
 ---
 
-## 2. 配置 config.toml
+# 4. 安装依赖
 
-复制或修改：
+先升级 pip：
+
+```powershell
+python -m pip install -U pip
+```
+
+然后：
+
+```powershell
+pip install -r requirements.txt
+```
+
+
+安装完成后检查：
+
+```powershell
+python -c "import fastapi, cv2, httpx, mitmproxy, win32gui; print('dependencies OK')"
+```
+
+如果输出：
+
+```text
+dependencies OK
+```
+
+说明主要依赖已经正常。
+
+---
+
+# 5. 创建自己的 config.toml
+
+仓库不会提交真实的 `config.toml`，这是故意的，因为其中包含个人信息和 Token。
+
+执行：
+
+```powershell
+Copy-Item config.example.toml config.toml
+```
+
+然后用 VS Code / 记事本打开：
 
 ```text
 config.toml
 ```
 
-填写当前用户、场馆和预约配置。
-
-示意：
+重点修改：
 
 ```toml
 [user]
-id = "..."
-customer_id = "..."
-name = "..."
-tel = "..."
-
-[gym]
-id = "..."
-name = "..."
+id          = "YOUR_USER_ID"
+customer_id = "YOUR_CUSTOMER_ID"
+name        = "YOUR_NAME"
+tel         = "YOUR_PHONE"
 
 [order]
 offset_days = 1
 token = ""
-
-[courts]
-1 = "..."
-2 = "..."
 ```
 
-建议初次部署时：
+第一次部署建议：
 
 ```toml
 token = ""
 ```
 
-Token 由程序自动捕获并写入。
+后面由程序自动抓取 Token。
 
-注意：
+## 不要做这件事
 
-```text
-config.toml 可能包含个人信息，不建议提交到公开 Git 仓库。
-```
-
-建议加入：
-
-```gitignore
-config.toml
-```
-
-或者提供一个：
+不要把别人的：
 
 ```text
-config.example.toml
+user id
+customer_id
+姓名
+手机号
+token
 ```
 
-供新设备复制。
+原样复制过来。
+
+这些字段对应的是具体用户。
+
+场馆 ID 和场地 ID 如果仍然使用同一个润扬羽毛球馆，一般可以保留仓库示例中的值。
 
 ---
 
-# 3. 安装 mitmproxy 根证书
+# 6. 第一次启动 mitmproxy，生成 CA 证书
 
-这是迁移到新电脑时最容易遗漏的一步。
+激活 `.venv` 后：
 
-mitmproxy 第一次运行后通常会在：
-
-```text
-%USERPROFILE%\.mitmproxy
+```powershell
+mitmdump --listen-host 127.0.0.1 --listen-port 8080
 ```
 
-生成：
+第一次启动后，mitmproxy 会生成：
+
+```text
+C:\Users\<你的Windows用户名>\.mitmproxy\
+```
+
+里面应包含类似：
 
 ```text
 mitmproxy-ca-cert.cer
-mitmproxy-ca-cert.p12
 mitmproxy-ca-cert.pem
-mitmproxy-ca.p12
 mitmproxy-ca.pem
-mitmproxy-dhparam.pem
+...
 ```
 
-例如：
+看到后按：
 
 ```text
-C:\Users\你的用户名\.mitmproxy
+Ctrl + C
 ```
 
-## 推荐：安装到 Windows 计算机根证书库
+退出 mitmdump。
 
-使用管理员 PowerShell：
+---
+
+# 7. 安装 mitmproxy 根证书
+
+这是换电脑时最容易遗漏的一步。
+
+以 **管理员身份** 打开 PowerShell，执行：
 
 ```powershell
 certutil -addstore Root "$env:USERPROFILE\.mitmproxy\mitmproxy-ca-cert.cer"
@@ -179,209 +278,552 @@ certutil -addstore Root "$env:USERPROFILE\.mitmproxy\mitmproxy-ca-cert.cer"
 certutil -store Root | findstr /i mitmproxy
 ```
 
-能够看到：
+如果能看到类似：
 
 ```text
 O=mitmproxy, CN=mitmproxy
 ```
 
-即可。
+说明证书已安装。
 
-也可以检查证书指纹：
+### 重要
 
-```powershell
-(Get-PfxCertificate "$env:USERPROFILE\.mitmproxy\mitmproxy-ca-cert.cer").Thumbprint
-```
+安装证书以后，建议：
 
-以及：
+1. 完全退出企业微信
+2. 再重新打开企业微信
+3. 重新进入羽毛球预约网页
 
-```powershell
-Get-ChildItem Cert:\LocalMachine\Root |
-  Where-Object {$_.Subject -like "*mitmproxy*"} |
-  Format-List Subject, Thumbprint, NotBefore, NotAfter
-```
-
-两边 Thumbprint 应能对应。
+不要只关闭预约小窗口。
 
 ---
 
-## 换 Windows 账户时特别注意
+# 8. 配置 Clash Verge Rev
 
-mitmproxy 默认目录跟 Windows 用户有关：
-
-```text
-C:\Users\旧账户\.mitmproxy
-```
-
-换账户后会变成：
+脚本抓 Token 的网络路径应该是：
 
 ```text
-C:\Users\新账户\.mitmproxy
+企业微信预约页面
+        │
+        ▼
+      Clash
+        │
+        ├── reservation.sustech.edu.cn
+        │               │
+        │               ▼
+        │       mitmproxy 127.0.0.1:8080
+        │               │
+        │               ▼
+        │        预约系统服务器
+        │
+        └── 其他网站
+                │
+                ▼
+           Clash 原来的规则
 ```
 
-因此不要假设旧账户生成的证书会自动被新账户使用。
+也就是说：
 
-最稳妥的做法是：
+> **只把 reservation.sustech.edu.cn 交给 mitmproxy，不要把所有网络都送到 8080。**
 
-1. 在新账户启动一次 mitmproxy
-2. 让它重新生成 `.mitmproxy`
-3. 将新生成的 CA 安装到 Windows Root
-4. 重启企业微信
+在 Clash Verge Rev 的左边栏目的订阅中“全局扩展脚本”中，可以加入：
 
-如果希望固定使用同一个证书目录，可以显式指定 mitmproxy `confdir`。
+```javascript
+function main(config) {
+  const mitmProxy = {
+    name: "MITM-Reservation",
+    type: "http",
+    server: "127.0.0.1",
+    port: 8080
+  };
 
----
+  config.proxies = config.proxies || [];
 
-# 4. 配置 Clash / Mihomo
+  // 防止重复添加
+  config.proxies = config.proxies.filter(
+    p => p.name !== "MITM-Reservation"
+  );
 
-不要把 Windows 全局代理直接设置成：
+  config.proxies.push(mitmProxy);
+
+  config.rules = config.rules || [];
+
+  const reservationRule =
+    "DOMAIN,reservation.sustech.edu.cn,MITM-Reservation";
+
+  // 防止重复规则
+  config.rules = config.rules.filter(
+    r => r !== reservationRule
+  );
+
+  // 放到最前面，确保优先命中
+  config.rules.unshift(reservationRule);
+
+  return config;
+}
+```
+
+保存并重新加载 Clash 配置。
+
+### 不要这样做
+
+不要把 Windows 系统代理直接改成：
 
 ```text
 127.0.0.1:8080
 ```
 
-否则所有 HTTPS 流量都会经过 mitmproxy。
+8080 只是 mitmproxy 的本地监听端口。
 
-本项目只需要：
+正常情况下 Windows / 企业微信仍然走 Clash，只是 Clash 把预约域名单独转给 mitmproxy。
+
+---
+
+# 9. 确认企业微信预约页面已经打开
+
+登录企业微信，然后进入：
 
 ```text
 reservation.sustech.edu.cn
 ```
 
-经过 mitmproxy。
+对应的羽毛球预约页面。
 
-推荐结构：
+**自动抓 Token 时这个窗口必须存在。**
 
-```text
-企业微信
-   ↓
-Clash
-   ├── reservation.sustech.edu.cn → 127.0.0.1:8080
-   └── 其他域名 → 原 Clash 规则
-```
-
-也就是说：
+程序会寻找标题中包含：
 
 ```text
-8080 只处理预约网站
+reservation.sustech.edu.cn
 ```
 
-而不是作为整个系统的全局代理。
-
-如果配置错误造成：
+或：
 
 ```text
-mitmproxy → Clash → mitmproxy
+reservation
 ```
 
-会形成代理环路。
+的窗口，然后自动将窗口切到前台并发送：
+
+```text
+Ctrl + R
+```
+
+因此：
+
+- 企业微信必须处于登录状态
+- 预约页面必须已经打开
+- 不建议把预约窗口彻底关闭
+- 自动刷新时不要锁屏
 
 ---
 
-# 5. 启动后端
+# 10. 启动程序
 
-推荐：
-
-```powershell
-uv run uvicorn app:app --host 0.0.0.0 --port 8000
-```
-
-关键是：
-
-```text
---host 0.0.0.0
-```
-
-不要只监听：
-
-```text
-127.0.0.1
-```
-
-否则只能电脑本机访问。
-
-确认：
+回到项目目录，确认虚拟环境已激活：
 
 ```powershell
-netstat -ano | findstr :8000
+.\.venv\Scripts\Activate.ps1
 ```
 
-正常应看到类似：
+运行：
+
+```powershell
+python app.py
+```
+
+正常情况下会看到类似：
+
+```text
+Uvicorn running on http://0.0.0.0:8000
+```
+
+浏览器打开：
+
+```text
+http://127.0.0.1:8000
+```
+
+即可进入控制页面。
+
+`python app.py` 会让 FastAPI 监听：
 
 ```text
 0.0.0.0:8000
 ```
 
-而不是：
-
-```text
-127.0.0.1:8000
-```
-
-本机测试：
-
-```text
-http://127.0.0.1:8000
-```
+因此既可以本机访问，也可以在正确配置防火墙后从其他设备访问。
 
 ---
 
-# 6. Windows 防火墙
+# 11. 第一次不要直接抢场，按这个顺序测试
 
-如果只在本机使用：
+建议第一次部署按照下面顺序检查。
+
+## Test 1：网页能不能打开
+
+打开：
 
 ```text
 http://127.0.0.1:8000
 ```
 
-通常不需要额外开放防火墙。
+如果页面正常出现，说明：
 
-但如果需要：
+```text
+Python
+FastAPI
+app.py
+engine.py
+index.html
+```
 
-- 手机通过 Tailscale 访问
-- 局域网其他电脑访问
-- 其他设备访问该 FastAPI 服务
+基本正常。
 
-则需要允许 TCP `8000` 入站。
+---
 
-管理员 PowerShell：
+## Test 2：mitmproxy 是否启动
+
+程序运行后执行：
 
 ```powershell
-New-NetFirewallRule `
-  -DisplayName "Court Server 8000" `
-  -Direction Inbound `
-  -Protocol TCP `
-  -LocalPort 8000 `
-  -Action Allow
+netstat -ano | findstr :8080
 ```
+
+正常应看到：
+
+```text
+127.0.0.1:8080
+```
+
+处于监听状态。
+
+也可以在网页上查看 mitm 状态。
+
+---
+
+## Test 3：直接测试 mitmproxy HTTPS
+
+另开一个 PowerShell：
+
+```powershell
+curl.exe -x http://127.0.0.1:8080 `
+  https://reservation.sustech.edu.cn/ `
+  -v -o NUL
+```
+
+如果 HTTPS 能正常建立并返回网页响应，说明：
+
+```text
+电脑
+  ↓
+mitmproxy
+  ↓
+reservation.sustech.edu.cn
+```
+
+链路基本正常。
+
+如果出现：
+
+```text
+unknown ca
+certificate verify failed
+```
+
+优先重新检查第 7 步的 mitmproxy CA 安装。
+
+---
+
+## Test 4：自动获取 Token
+
+保证：
+
+```text
+企业微信已登录
+预约页面已打开
+Clash 正常运行
+程序正在运行
+```
+
+然后网页点击：
+
+```text
+🔑 自动获取 Token
+```
+
+正常流程应该是：
+
+```text
+点击按钮
+   ↓
+程序找到企业微信预约窗口
+   ↓
+窗口被切到前台
+   ↓
+自动 Ctrl+R
+   ↓
+预约请求经过 Clash
+   ↓
+Clash 将 reservation 域名送到 127.0.0.1:8080
+   ↓
+mitmproxy 捕获请求
+   ↓
+mitm_addon.py 提取 Token
+   ↓
+Token 写入 config.toml
+```
+
+如果成功，页面 / 日志应该能够看到 Token 已更新。
+
+此时也可以直接打开：
+
+```text
+config.toml
+```
+
+确认：
+
+```toml
+token = "..."
+```
+
+已经自动变化。
+
+---
+
+## Test 5：刷新场地
+
+Token 正常后点击：
+
+```text
+刷新场地
+```
+
+如果网页能够显示各个球场的空闲 / 占用状态，说明：
+
+```text
+Token
+用户 ID
+场地 ID
+getOrder API
+```
+
+均已经正常。
+
+---
+
+## Test 6：VID 验证码
+
+点击：
+
+```text
+启动 VID
+```
+
+查看 VID 缓存是否开始增加。
+
+如果这里报：
+
+```text
+fast_db.npz not found
+```
+
+说明项目文件不完整。
+
+请确认：
+
+```text
+fast_db.npz
+```
+
+与：
+
+```text
+utils.py
+```
+
+位于同一个项目目录。
+
+---
+
+# 12. 最常见错误
+
+## ① `ModuleNotFoundError: No module named 'win32gui'`
+
+执行：
+
+```powershell
+pip install pywin32
+```
+
+并确认自己是在项目的 `.venv` 中运行。
 
 检查：
 
 ```powershell
-Get-NetFirewallRule -DisplayName "Court Server 8000"
+where.exe python
 ```
 
-删除：
-
-```powershell
-Remove-NetFirewallRule -DisplayName "Court Server 8000"
-```
-
-因此：
+应该优先指向：
 
 ```text
-迁移到新电脑后，如果还希望手机访问，防火墙规则需要重新创建。
+...\badminton_scripts\.venv\Scripts\python.exe
 ```
-
-防火墙规则不会跟项目文件一起迁移。
 
 ---
 
-# 7. Tailscale 手机访问
+## ② `No module named fastapi / cv2 / mitmproxy`
 
-这一步仅在需要手机远程打开预约界面时配置。
+重新激活：
 
-电脑和手机登录同一个 Tailnet。
+```powershell
+.\.venv\Scripts\Activate.ps1
+```
+
+再执行：
+
+```powershell
+pip install -r requirements.txt
+pip install pywin32
+```
+
+---
+
+## ③ `fast_db.npz` 找不到
+
+重新：
+
+```powershell
+git pull
+```
+
+并检查：
+
+```powershell
+Get-ChildItem fast_db.npz
+```
+
+不要只复制 Python 文件。
+
+---
+
+## ④ 网页打不开
+
+先看：
+
+```powershell
+netstat -ano | findstr :8000
+```
+
+然后访问：
+
+```text
+http://127.0.0.1:8000
+```
+
+如果 8000 已被其他程序占用：
+
+```powershell
+netstat -ano | findstr :8000
+```
+
+记下 PID，再：
+
+```powershell
+tasklist | findstr <PID>
+```
+
+---
+
+## ⑤ 自动获取 Token 提示找不到窗口
+
+确认：
+
+1. 企业微信已打开
+2. 预约网页已经进入
+3. 页面窗口标题与 reservation 有关
+4. Windows 当前没有锁屏
+
+也可以手工测试窗口刷新逻辑：
+
+```powershell
+python mitm_addon.py refresh
+```
+
+如果正常，企业微信预约窗口应该被切到前台并刷新。
+
+---
+
+## ⑥ Token 一直获取不到
+
+按顺序排查：
+
+```text
+企业微信预约页面是否打开
+        ↓
+python mitm_addon.py refresh 是否能刷新窗口
+        ↓
+8080 是否监听
+        ↓
+Clash reservation 规则是否命中
+        ↓
+mitmproxy CA 是否安装
+        ↓
+企业微信是否在安装证书后彻底重启
+```
+
+---
+
+## ⑦ mitmproxy 显示 `Client TLS handshake failed / unknown ca`
+
+首先不要只看日志，要测试真正需要的预约域名：
+
+```powershell
+curl.exe -x http://127.0.0.1:8080 `
+  https://reservation.sustech.edu.cn/ `
+  -v -o NUL
+```
+
+如果 reservation 请求本身可以被正常代理，并且 Token 能抓到，那么部分企业微信内部的其他 TLS 请求失败通常不影响脚本使用。
+
+如果 reservation 自己也失败，则重新安装 CA 并重启企业微信。
+
+---
+
+## ⑧ Clash 开启后网络异常
+
+最常见原因是代理环路：
+
+```text
+Clash
+  ↓
+mitmproxy
+  ↓
+Clash
+  ↓
+mitmproxy
+  ↓
+...
+```
+
+确保：
+
+- 只对 `reservation.sustech.edu.cn` 使用 `MITM-Reservation`
+- 不要把整个系统代理改成 `127.0.0.1:8080`
+- 如果使用 Clash TUN 模式后出现循环，先关闭 TUN，只保留普通系统代理验证流程
+
+先把最简单的链路跑通，再考虑 TUN。
+
+---
+
+# 13. 如果需要手机访问网页
+
+只在电脑本机用的话，这部分不用配置。
+
+如果希望手机打开控制页面，推荐 Tailscale。
+
+电脑和手机安装 Tailscale，并登录同一个 Tailnet。
 
 电脑执行：
 
@@ -389,22 +831,33 @@ Remove-NetFirewallRule -DisplayName "Court Server 8000"
 tailscale ip -4
 ```
 
-例如：
+例如得到：
 
 ```text
-100.x.x.x
+100.88.xx.xx
 ```
 
-然后手机访问：
+管理员 PowerShell 添加 Windows 防火墙规则：
 
-```text
-http://100.x.x.x:8000
+```powershell
+New-NetFirewallRule `
+  -DisplayName "Badminton Server 8000" `
+  -Direction Inbound `
+  -Protocol TCP `
+  -LocalPort 8000 `
+  -Action Allow
 ```
 
-注意：
+然后手机打开：
 
 ```text
-使用 http://
+http://100.88.xx.xx:8000
+```
+
+注意是：
+
+```text
+http://
 ```
 
 不是：
@@ -413,378 +866,152 @@ http://100.x.x.x:8000
 https://
 ```
 
-本项目的 FastAPI 默认没有配置 HTTPS。
+---
+
+# 14. 日常使用只需要这几步
+
+以后电脑已经配置好后，一般只需要：
+
+```powershell
+cd <项目目录>
+.\.venv\Scripts\Activate.ps1
+python app.py
+```
+
+然后：
+
+1. 登录企业微信
+2. 打开预约页面
+3. 打开 Clash
+4. 浏览器打开 `http://127.0.0.1:8000`
+5. 点击“自动获取 Token”
+6. 点击“刷新场地”
+7. 再按需要启动 VID / 全自动模式
 
 ---
 
-## Tailscale 排查顺序
+# 15. 更新代码
 
-首先电脑本机测试：
+作者更新 GitHub 后：
+
+```powershell
+cd <项目目录>
+git pull
+```
+
+如果 `requirements.txt` 有变化，再执行：
+
+```powershell
+pip install -r requirements.txt
+pip install pywin32
+```
+
+自己的：
 
 ```text
-http://127.0.0.1:8000
+config.toml
+```
+
+被 `.gitignore` 忽略，正常情况下不会被 `git pull` 覆盖。
+
+---
+
+# 16. 一键自检命令
+
+遇到问题时，可以依次把下面这些命令的输出发给维护者：
+
+```powershell
+python --version
+where.exe python
+pip --version
+git status
+python -c "import fastapi, cv2, httpx, mitmproxy, win32gui; print('Python deps OK')"
+Get-ChildItem fast_db.npz
+netstat -ano | findstr :8000
+netstat -ano | findstr :8080
+certutil -store Root | findstr /i mitmproxy
 ```
 
 再测试：
 
-```text
-http://电脑的Tailscale-IP:8000
-```
-
-例如：
-
-```powershell
-curl http://100.x.x.x:8000/api/mitm/state
-```
-
-判断方式：
-
-```text
-127.0.0.1 能访问
-但 Tailscale IP 不能访问
-
-→ 检查 uvicorn 是否使用 --host 0.0.0.0
-```
-
-如果：
-
-```text
-电脑通过 Tailscale IP 能访问
-但手机不能访问
-
-→ 优先检查 Windows 防火墙
-→ 再检查 Tailscale 是否连接
-```
-
-查看 Tailnet：
-
-```powershell
-tailscale status
-```
-
-测试设备连接：
-
-```powershell
-tailscale ping <手机的Tailscale-IP>
-```
-
----
-
-# 8. 检查 mitmproxy
-
-程序启动后应监听：
-
-```text
-127.0.0.1:8080
-```
-
-测试：
-
 ```powershell
 curl.exe -x http://127.0.0.1:8080 `
   https://reservation.sustech.edu.cn/ `
   -v -o NUL
 ```
 
-如果能够得到：
+这样通常很快就能定位问题是在：
 
 ```text
-HTTP/1.1 200 OK
+Python
+依赖
+项目文件
+FastAPI
+mitmproxy
+证书
+Clash
+企业微信
 ```
 
-说明：
-
-```text
-Windows
-→ mitmproxy
-→ reservation.sustech.edu.cn
-```
-
-这条 HTTPS 链路已经正常。
+中的哪一层。
 
 ---
 
-# 9. Token 自动获取
+# 17. 新电脑最终 Checklist
 
-确保：
-
-1. 企业微信已经登录
-2. 已打开预约页面
-3. Clash 已启用对应规则
-4. mitmproxy 正在运行
-5. mitmproxy CA 已信任
-
-然后在 Web 页面点击：
+部署完成前逐项确认：
 
 ```text
-自动获取 Token
-```
+[ ] 安装 Git
+[ ] 安装 Python 3.11 64-bit
+[ ] git clone 项目
+[ ] 创建 .venv
+[ ] pip install -r requirements.txt
 
-程序会：
+[ ] config.example.toml → config.toml
+[ ] 修改成自己的 user / customer 信息
+[ ] token 初始留空
 
-```text
-找到企业微信预约窗口
-        ↓
-发送 Ctrl+R
-        ↓
-页面刷新
-        ↓
-请求经过 Clash
-        ↓
-reservation 域名进入 mitmproxy
-        ↓
-提取请求中的 token
-        ↓
-写入 config.toml
-```
+[ ] fast_db.npz 存在
 
-日志出现：
+[ ] mitmdump 至少手动启动过一次
+[ ] %USERPROFILE%\.mitmproxy 已生成
+[ ] mitmproxy CA 已加入 Windows Root
 
-```text
-[TOKEN] captured: xxxxxxxx...
-```
+[ ] Clash 已加入 MITM-Reservation 节点
+[ ] reservation.sustech.edu.cn 已路由到 127.0.0.1:8080
+[ ] 没有把整个系统直接代理到 8080
 
-即代表成功。
+[ ] 企业微信已登录
+[ ] 企业微信预约页面已打开
+[ ] 安装 CA 后企业微信已经重启
 
----
+[ ] python app.py 能启动
+[ ] http://127.0.0.1:8000 能打开
 
-# 10. 关于 TLS `unknown ca`
+[ ] 自动获取 Token 成功
+[ ] 刷新场地成功
+[ ] VID 求解正常
 
-日志偶尔可能出现：
-
-```text
-Client TLS handshake failed.
-The client does not trust the proxy's certificate
-(tlsv1 alert unknown ca)
-```
-
-如果同时能够稳定看到：
-
-```text
-[TOKEN] captured
-```
-
-并且下面的测试：
-
-```powershell
-curl.exe -x http://127.0.0.1:8080 `
-  https://reservation.sustech.edu.cn/ `
-  -v -o NUL
-```
-
-能够得到：
-
-```text
-HTTP/1.1 200 OK
-```
-
-则说明：
-
-```text
-mitmproxy 主链路正常
-Windows 信任当前 mitmproxy CA
-预约 Token 请求能够成功解密
-```
-
-此时部分 `unknown ca` 很可能来自企业微信内部其他网络组件，它们可能采用不同的证书信任机制。
-
-只要目标 Token 请求能稳定捕获，可以暂时忽略这些失败连接。
-
----
-
-# 11. 多份 mitmproxy
-
-系统中可能同时存在：
-
-```text
-uv tool 安装的 mitmproxy
-项目 .venv 中安装的 mitmproxy
-```
-
-检查：
-
-```powershell
-where.exe mitmdump
-```
-
-或者：
-
-```powershell
-Get-Command mitmdump -All
-```
-
-项目后端会优先使用当前 Python 环境附近的 `mitmdump.exe`。
-
-多个 mitmproxy 安装本身通常没有问题。
-
-真正重要的是：
-
-```text
-它们使用的是哪一个 confdir / CA
-```
-
-通常默认：
-
-```text
-%USERPROFILE%\.mitmproxy
-```
-
-只要使用同一个 Windows 用户和同一个 `.mitmproxy` 目录，通常会共用同一套 CA。
-
----
-
-# 12. 新电脑迁移 Checklist
-
-复制项目后依次检查：
-
-```text
-[ ] 安装 Python / uv
-
-[ ] uv sync / 安装项目依赖
-
-[ ] 确认 config.toml
-    不要直接公开提交个人信息
-
-[ ] 安装 / 确认 Clash
-
-[ ] 配置 reservation.sustech.edu.cn
-    单域名转发至 127.0.0.1:8080
-
-[ ] 启动一次 mitmproxy
-    生成 %USERPROFILE%\.mitmproxy
-
-[ ] 安装 mitmproxy 根证书到 Windows Root
-
-[ ] 完全退出并重新启动企业微信
-
-[ ] 启动后端：
-    uv run uvicorn app:app --host 0.0.0.0 --port 8000
-
-[ ] 本机访问：
-    http://127.0.0.1:8000
-
-[ ] 测试 mitmproxy：
-    curl.exe -x http://127.0.0.1:8080 https://reservation.sustech.edu.cn/
-
-[ ] 测试自动获取 Token
-
-[ ] 如需手机访问：
-    安装并登录 Tailscale
-
-[ ] Windows 防火墙开放 TCP 8000
-
-[ ] 获取 Tailscale IP：
-    tailscale ip -4
-
-[ ] 手机访问：
-    http://<Tailscale-IP>:8000
+[ ] 如需手机访问，再配置 Tailscale
+[ ] 如需手机访问，Windows 防火墙开放 TCP 8000
 ```
 
 ---
 
-# 13. 最常用故障判断
+## 最后一句
 
-## 本机 localhost 无法访问
-
-```text
-127.0.0.1:8000 ❌
-```
-
-检查：
+迁移时最容易误以为“GitHub 拉下来就能跑”，但这个项目实际上有三层：
 
 ```text
-FastAPI 是否启动
-8000 是否被占用
-Python 是否报错
+代码层
+  app.py / engine.py / utils.py / fast_db.npz
+          ↓
+Python 环境层
+  FastAPI / OpenCV / mitmproxy / pywin32
+          ↓
+Windows 网络与桌面环境层
+  mitmproxy CA / Clash / 企业微信窗口
 ```
 
----
-
-## localhost 能访问，但电脑自己的 IP 不能访问
-
-```text
-127.0.0.1:8000 ✅
-100.x.x.x:8000 ❌
-```
-
-检查：
-
-```text
-uvicorn 是否使用：
---host 0.0.0.0
-```
-
----
-
-## 电脑自己的 Tailscale IP 能访问，手机不能
-
-```text
-电脑访问 100.x.x.x:8000 ✅
-手机访问 100.x.x.x:8000 ❌
-```
-
-优先检查：
-
-```text
-Windows Firewall TCP 8000
-Tailscale 是否在线
-Tailnet ACL
-手机是否同时启用了其他 VPN
-```
-
----
-
-## Token 一直超时
-
-检查日志是否出现：
-
-```text
-[TOKEN] captured
-```
-
-如果没有，依次检查：
-
-```text
-企业微信预约窗口是否打开
-        ↓
-Ctrl+R 是否成功
-        ↓
-Clash 单域名规则是否命中
-        ↓
-mitmproxy 是否监听 8080
-        ↓
-mitmproxy CA 是否被信任
-```
-
----
-
-## 推荐最终部署结构
-
-```text
-Windows
-│
-├── 项目
-│   ├── app.py
-│   ├── mitm_addon.py
-│   ├── index.html
-│   └── config.toml
-│
-├── .venv
-│   └── mitmdump.exe
-│
-├── C:\Users\<username>\.mitmproxy
-│   └── mitmproxy CA
-│
-├── Clash
-│   └── reservation.sustech.edu.cn → 127.0.0.1:8080
-│
-├── Tailscale
-│   └── 手机访问 :8000
-│
-└── Windows Firewall
-    └── Allow TCP 8000
-```
-
-迁移时最重要的一句话：
-
-> **项目代码可以复制，但证书信任、Clash 规则、Windows 防火墙和 Tailscale 登录都属于机器环境，需要在新电脑重新配置。**
+三层都正常，`python app.py` 才会真正完整工作。
