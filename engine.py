@@ -41,6 +41,8 @@ class Tuning:
     probe_max_tries:          int   = 6
     auth_refresh_timeout:     float = 4.0
     token_refresh_lead_sec:   int   = 120
+    auto_query_batch_size:    int   = 3
+    auto_query_batch_timeout: float = 3.0
     vid_timeout:              float = 3.5
     vid_max_age:              float = 8.0
     vid_pool_size:            int   = 3
@@ -304,16 +306,42 @@ class Engine:
 
     async def _watch_config(self, poll: float = 1.0):
         log.info("配置监听已启动: %s", CONFIG_PATH)
+
+        last_today = datetime.now().date()
+
         while True:
             try:
-                if self.reload_config():
-                    log.info("检测到 config.toml 变化: date=%s token=%s courts=%d",
-                             self.target_date,
-                             (self.token[:8] + "...") if self.token else "空",
-                             len(self.courts))
-                    await self.bus.publish("config.updated", self.public_config())
+                config_changed = self.reload_config()
+                today = datetime.now().date()
+                day_changed = today != last_today
+
+                if day_changed:
+                    log.info(
+                        "本地日期跨天: %s → %s | 目标预约日更新为 %s",
+                        last_today, today, self.target_date
+                    )
+
+                if config_changed or day_changed:
+                    await self.bus.publish(
+                        "config.updated",
+                        self.public_config()
+                    )
+                # 跨天后，自动启动下一天的全自动预约任务
+                if day_changed and not self.auto.running:
+                    log.info("日期已更新，自动启动新一天的全自动模式")
+                    result = await self.start_auto()
+
+                    if not result.get("ok"):
+                        log.warning(
+                            "每日全自动启动失败: %s",
+                            result.get("msg", "")
+                        )
+
+                last_today = today
+
             except Exception as e:
-                log.warning("配置监听异常: %s", e)
+                log.warning("配置/日期监听异常: %s", e)
+
             await asyncio.sleep(poll)
 
     # ══════════════════════════════════════════════════
@@ -807,6 +835,8 @@ class Engine:
             "slot_end":   a.get("slot_end",   "21:30"),
             "refresh_at": a.get("refresh_at", "20:00:01"),
             "excluded_courts": list(self.AUTO_EXCLUDE_COURTS),
+            "query_batch_size": max(1, int(self.tuning.auto_query_batch_size)),
+            "query_batch_timeout": max(0.2, float(self.tuning.auto_query_batch_timeout)),
         }
         self._auto_task = asyncio.create_task(self._auto_loop())
         return {"ok": True}
@@ -823,13 +853,125 @@ class Engine:
         self.auto.msg = "已手动停止"
         self.auto.finished_at = datetime.now().strftime("%H:%M:%S")
 
-    async def _auto_loop(self):
-        """自动模式主循环。
+    async def _auto_query_batch(
+        self, batch: list[Court], date: str, token: str,
+        slot_start: str, slot_end: str,
+    ) -> tuple[Court | None, bool]:
+        """一次最多并发查询 batch 中的场地，返回 (第一个空场, 是否出现鉴权失败)。
 
-        * 全程使用 self.token / self.target_date，与 config.toml 保持一致。
-        * 随机遍历场地并排除 AUTO_EXCLUDE_COURTS。
-        * 「系统异常」视为场地被占，继续遍历下一个。
+        仅 *查询* 并行；谁先返回满足目标时段的空位，就立即选中。
+        其他未完成的查询会被取消并回收；本方法绝不发出下单请求。
         """
+        tasks = {
+            asyncio.create_task(get_order_once(c, date, token, self.user_id)): c
+            for c in batch
+        }
+        pending = set(tasks)
+        auth_failed = False
+        started = time.monotonic()
+        max_wait = max(0.2, float(self.tuning.auto_query_batch_timeout))
+        deadline = started + max_wait
+
+        try:
+            while pending:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                done, pending = await asyncio.wait(
+                    pending, timeout=remaining,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if not done:
+                    break
+                # 同一轮多个任务一起完成时，按原随机序列稳定选一个。
+                # 单次只消费一个空位，不会并发下单。
+                for task in sorted(done, key=lambda t: batch.index(tasks[t])):
+                    court = tasks[task]
+                    try:
+                        result = task.result()
+                        if not isinstance(result, dict):
+                            raise TypeError("查询结果不是 dict")
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        result = {
+                            "ok": False, "auth_fail": False,
+                            "error": f"查询执行异常: {exc}",
+                        }
+
+                    try:
+                        await self._publish_refresh(court, result)
+                    except Exception as exc:
+                        log.warning("自动模式: %s 刷新前端状态失败: %s", court.name, exc)
+
+                    elapsed = (time.monotonic() - started) * 1000
+                    if not result.get("ok"):
+                        auth_failed |= bool(result.get("auth_fail"))
+                        log.warning(
+                            "自动模式: %s 查询失败 (+%.0fms): %s，继续本批",
+                            court.name, elapsed, result.get("error", "未知错误"),
+                        )
+                        continue
+
+                    try:
+                        available = slot_covers(result["avail"], slot_start, slot_end)
+                    except Exception as exc:
+                        log.warning("自动模式: %s 可用性数据异常: %s", court.name, exc)
+                        continue
+
+                    if available:
+                        log.info(
+                            "自动模式: %s 有空场 (+%.0fms)，立即尝试下单！",
+                            court.name, elapsed,
+                        )
+                        return court, auth_failed
+
+                    log.info("自动模式: %s 无目标空场 (+%.0fms)", court.name, elapsed)
+
+            if pending:
+                log.warning("自动模式: 本批 %.1fs 截止，%d 个查询未完成，进入下一批",
+                            max_wait, len(pending))
+                for task in pending:
+                    court = tasks[task]
+                    try:
+                        await self._publish_refresh(court, {
+                            "ok": False, "error": f"本批查询超时（{max_wait:.1f}s）",
+                        })
+                    except Exception as exc:
+                        log.warning("自动模式: %s 超时通知失败: %s", court.name, exc)
+            return None, auth_failed
+        finally:
+            # 异常、命中空场或用户停止自动模式，都不能留下孤儿请求。
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _auto_refresh_auth_token(self) -> None:
+        """整批出现鉴权失败时最多刷新一次 Token，避免三个并发刷新窗口。"""
+        old_token = self.token
+        log.warning("自动模式: 本批出现鉴权失败，尝试刷新一次 Token")
+        try:
+            result = await self.fetch_token()
+            if not result.get("ok"):
+                log.warning("自动模式: Token 刷新失败: %s", result.get("msg"))
+                return
+            deadline = time.monotonic() + max(0.0, self.tuning.auth_refresh_timeout)
+            while time.monotonic() < deadline:
+                # fetch_token 只负责触发窗口刷新，实际 token 由 mitmproxy 异步写入。
+                self.reload_config()
+                if self.token and self.token != old_token:
+                    log.info("自动模式: Token 已更新，继续查询下一批")
+                    return
+                await asyncio.sleep(0.1)
+            log.warning("自动模式: 等待新 Token 超时，继续查询下一批")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("自动模式: Token 刷新异常: %s，继续查询下一批", exc)
+
+    async def _auto_loop(self):
+        """全自动：每批并发查询 3 个；一批最多串行下单 1 次。"""
         applied: list[dict] = []
 
         def has_success() -> bool:
@@ -847,7 +989,7 @@ class Engine:
             refresh_at = a.get("refresh_at", "20:00:01")
             refresh_dt = self._parse_hms(refresh_at)
 
-            # ── ① Token 自动刷新 ──
+            # ── ① Token 自动刷新（保留原逻辑） ──
             if datetime.now() < refresh_dt:
                 lead = max(0, int(self.tuning.token_refresh_lead_sec))
                 tr_dt = refresh_dt - timedelta(seconds=lead)
@@ -865,9 +1007,8 @@ class Engine:
                 try:
                     r = await self.fetch_token()
                     if r.get("ok"):
-                        log.info("自动模式: ✅ Token 刷新成功 (%s)",
-                                 r.get("token_preview"))
-                        self.auto.msg = f"Token OK ({r.get('token_preview')})"
+                        log.info("自动模式: ✅ 已触发 Token 刷新（异步等待写入配置）")
+                        self.auto.msg = "Token 刷新已触发"
                     else:
                         log.warning("自动模式: ⚠ Token 刷新失败: %s", r.get("msg"))
                         self.auto.msg = f"Token 刷新失败: {r.get('msg')}"
@@ -877,7 +1018,7 @@ class Engine:
             else:
                 log.info("自动模式: 已过触发时间，跳过自动刷新 Token")
 
-            # ── ② 启动 VID 池（自动模式专属） ──
+            # ── ② 启动 VID 池（保持原逻辑） ──
             if not self.vid_running:
                 vid_dt = refresh_dt - timedelta(seconds=8)
                 if datetime.now() < vid_dt:
@@ -896,98 +1037,81 @@ class Engine:
             log.info("自动模式: 等待触发 %s", refresh_at)
             await self._sleep_until(refresh_dt)
 
-            # ── ④ 随机遍历场地（排除 5、6 号） ──
+            # ── ④ 随机遍历，每批最多三个，排除原有 5、6 号 ──
             pool = [c for c in self.courts
                     if c.no not in self.AUTO_EXCLUDE_COURTS]
             random.shuffle(pool)
             total = len(pool)
-            log.info("自动模式: 随机遍历 %d 个场地 (时段 %s-%s)，已排除 %s",
-                     total, slot_start, slot_end, list(self.AUTO_EXCLUDE_COURTS))
+            batch_size = max(1, int(self.tuning.auto_query_batch_size))
+            round_total = (total + batch_size - 1) // batch_size
+            log.info(
+                "自动模式: %d 个候选场地，%d 批，每批最多 %d 个并发查询 "
+                "(每批最多 %.1fs，时段 %s-%s，排除 %s)",
+                total, round_total, batch_size,
+                max(0.2, float(self.tuning.auto_query_batch_timeout)),
+                slot_start, slot_end,
+                list(self.AUTO_EXCLUDE_COURTS),
+            )
 
-            for idx, court in enumerate(pool, 1):
+            for offset in range(0, total, batch_size):
                 if has_success():
                     break
-
+                batch = pool[offset:offset + batch_size]
+                batch_no = offset // batch_size + 1
+                names = ", ".join(c.name for c in batch)
                 self.auto.phase = "scanning"
-                self.auto.msg = f"扫描 {court.name}（{idx}/{total}）"
+                self.auto.msg = f"并发查询第 {batch_no}/{round_total} 批：{names}"
+                log.info("自动模式: 第 %d/%d 批并发查询: %s",
+                         batch_no, round_total, names)
 
-                res = await get_order_once(court, self.target_date,
-                                           self.token, self.user_id)
-
-                # 鉴权失败 → 刷新 token 后重试一次
-                if not res.get("ok") and res.get("auth_fail"):
-                    log.warning("自动模式: %s 鉴权失败，自动刷新 Token 后重试",
-                                court.name)
-                    r = await self.fetch_token()
-                    if r.get("ok"):
-                        res = await get_order_once(court, self.target_date,
-                                                   self.token, self.user_id)
-                    else:
-                        log.warning("自动模式: Token 刷新失败: %s，继续下一个",
-                                    r.get("msg"))
-                        await self.bus.publish("refresh.result", {
-                            "court": court.no, "name": court.name, "ok": False,
-                            "error": f"鉴权失败且 Token 刷新失败: {r.get('msg')}",
-                            "ts": datetime.now().strftime("%H:%M:%S"),
-                        })
-                        continue
-
-                if not res.get("ok"):
-                    err = str(res.get("error", "") or "")
-                    log.info("自动模式: %s 查询失败: %s → 下一个", court.name, err)
-                    await self.bus.publish("refresh.result", {
-                        "court": court.no, "name": court.name, "ok": False,
-                        "error": err,
-                        "ts": datetime.now().strftime("%H:%M:%S"),
-                    })
+                court, auth_failed = await self._auto_query_batch(
+                    batch, self.target_date, self.token, slot_start, slot_end,
+                )
+                if court is None:
+                    if auth_failed:
+                        await self._auto_refresh_auth_token()
+                    log.info("自动模式: 第 %d 批无可下单场地，继续下一批", batch_no)
                     continue
 
-                await self.bus.publish("refresh.result", {
-                    "court": court.no, "name": court.name, "ok": True,
-                    "avail":  res["avail"], "blocks": res["blocks"],
-                    "ts": datetime.now().strftime("%H:%M:%S"),
-                })
-
-                if not slot_covers(res["avail"], slot_start, slot_end):
-                    log.info("自动模式: %s 该时段无空场 → 下一个", court.name)
-                    continue
-
-                log.info("自动模式: %s 有空场，立即抢！", court.name)
+                # ── ⑤ 一批最多尝试一次下单（沿用原有 VID/saveOrder 逻辑） ──
+                self.auto.phase = "ordering"
                 self.auto.msg = f"抢 {court.name}…"
+                try:
+                    vid = await self.take_vid(timeout=2.0)
+                    if not vid:
+                        log.info("自动模式: VID 池暂无货，同步兜底求解")
+                        async with self._solve_sem:
+                            vid, _ = await get_vid_once(timeout=self.tuning.vid_timeout)
 
-                vid = await self.take_vid(timeout=2.0)
-                if not vid:
-                    log.info("自动模式: VID 池暂无货，同步兜底求解")
-                    async with self._solve_sem:
-                        vid, _ = await get_vid_once(timeout=self.tuning.vid_timeout)
+                    r = await self._save_order(vid, court, self.target_date,
+                                               slot_start, slot_end, self.token)
+                    await self._publish_order_result(court, r)
+                    ok = bool(r.get("success"))
+                    msg = str(r.get("msg", "") or "")
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    ok = False
+                    msg = f"下单流程异常: {type(exc).__name__}: {exc}"
+                    log.warning("自动模式: %s %s", court.name, msg)
+                    try:
+                        await self._publish_order_result(court, {"success": False, "msg": msg})
+                    except Exception as publish_exc:
+                        log.warning("自动模式: 下单结果通知异常: %s", publish_exc)
 
-                r = await self._save_order(vid, court, self.target_date,
-                                           slot_start, slot_end, self.token)
-                await self._publish_order_result(court, r)
-
-                ok = bool(r.get("success"))
-                msg = str(r.get("msg", "") or "")
                 record(court, ok, msg)
-
                 if ok:
-                    log.info("自动模式: ✅ %s 抢场成功，结束遍历", court.name)
+                    log.info("自动模式: ✅ %s 抢场成功，立即停止全部查询", court.name)
                     break
 
-                # 「系统异常」= 场地被占，继续下一个；系统繁忙等 4s
-                if "系统异常" in msg:
-                    log.info("自动模式: %s 系统异常（场地被占）→ 下一个", court.name)
-                    continue
+                # 失败不再等待 4 秒；立即转到下一批，没有第二个同批下单。
+                kind, _ = classify_order_reply({"success": False, "msg": msg})
+                log.warning(
+                    "自动模式: %s 下单未成功 (%s): %s，立即查询下一批",
+                    court.name, kind, msg or "未知错误",
+                )
 
-                kind, _ = classify_order_reply(r)
-                if kind == "busy":
-                    log.warning("自动模式: %s 系统繁忙，等 4s 后继续下一个",
-                                court.name)
-                    await asyncio.sleep(4.0)
-                    continue
-
-                log.info("自动模式: %s 抢场失败: %s → 下一个", court.name, msg)
-
-            log.info("自动模式: 遍历结束 | 已尝试 %d | 成功 %s",
+            log.info("自动模式: 遍历结束 | 已尝试下单 %d 次 | 成功 %s",
                      len(applied), "是" if has_success() else "否")
 
         except asyncio.CancelledError:
@@ -996,7 +1120,7 @@ class Engine:
         except Exception as e:
             log.exception("自动模式异常: %s", e)
         finally:
-            if has_success() and self.vid_running:
+            if self.vid_running:
                 log.info("自动模式: 抢场成功，停止 VID 池")
                 await self.stop_vid_pool()
 
