@@ -6,3 +6,6 @@ start.cmd
 卸载使用uninstall.cmd
 注意setup会改变 %APPDATA%中clashio profile中的script文件，有概率如果clash不是正规下载导致位置不正确而无法启动clash
 注意必须使用clash的规则模式才能正常路由捕获到token
+Unblock-File .\start.ps1
+Unblock-File .\stop.ps1
+.\start.ps1

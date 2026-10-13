@@ -7,6 +7,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import os
+import signal
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -22,10 +25,12 @@ from utils import ROOT
 # ══════════════════════════════════════════════════════
 @asynccontextmanager
 async def lifespan(app):
+    logging.getLogger("court").info("[生命周期] FastAPI 启动 PID=%s, PPID=%s", os.getpid(), os.getppid())
     await engine.start()
     try:
         yield
     finally:
+        logging.getLogger("court").warning("[生命周期] FastAPI lifespan 收到关闭流程，正在清理任务")
         await engine.stop()
 
 
@@ -215,4 +220,20 @@ async def stream_ep(since: int = 0):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+
+    class SignalLoggingServer(uvicorn.Server):
+        """使用 python app.py 启动时，记录导致 Uvicorn 退出的 OS 信号。"""
+        def handle_exit(self, sig, frame):
+            try:
+                name = signal.Signals(sig).name
+            except ValueError:
+                name = str(sig)
+            logging.getLogger("court").warning(
+                "[生命周期] Uvicorn 收到退出信号 %s (%s), PID=%s",
+                name, sig, os.getpid(),
+            )
+            return super().handle_exit(sig, frame)
+
+    SignalLoggingServer(uvicorn.Config(
+        app, host="0.0.0.0", port=8000, log_level="info",
+    )).run()

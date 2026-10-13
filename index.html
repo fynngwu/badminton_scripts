@@ -283,13 +283,13 @@ const hm2min = t => {
 
 const ACTIVITY_KEYWORDS = [
   "工会", "比赛", "活动", "大会", "赛", "训练",
-  "校队", "俱乐部", "考试", "赛事", "选拔",
+  "校队", "俱乐部", "考试", "赛事", "选拔","羽毛球队"
 ];
 function isActivity(name) {
   if (!name) return false;
   return ACTIVITY_KEYWORDS.some(kw => name.includes(kw));
 }
-function isEvening(start) { return start >= "18:00" && start <= "21:30"; }
+function isEvening(start) { return start >= "19:00" && start <= "21:30"; }
 
 function isFree(avail, t) {
   if (!avail) return false;
@@ -398,6 +398,7 @@ function renderOccupied() {
   const courses = [], activities = [], evening = [], day = [];
   for (const sp of allSpans) {
     if (sp.status === "0")               courses.push(sp);
+    else if (String(sp.type || "").trim() === "PC端") activities.push(sp);
     else if (isActivity(sp.name))        activities.push(sp);
     else if (isEvening(sp.start))        evening.push(sp);
     else                                 day.push(sp);
