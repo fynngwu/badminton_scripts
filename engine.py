@@ -990,7 +990,7 @@ class Engine:
             slot_start = a.get("slot_start", "19:30")
             slot_end   = a.get("slot_end",   "21:30")
             refresh_at = a.get("refresh_at", "20:00:04")
-            refresh_dt = self._parse_hms(refresh_at)+ timedelta(milliseconds=800)
+            refresh_dt = self._parse_hms(refresh_at)+ timedelta(milliseconds=300)
 
             # ── ① Token 自动刷新（保留原逻辑） ──
             if datetime.now() < refresh_dt:
