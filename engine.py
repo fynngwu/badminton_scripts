@@ -41,7 +41,6 @@ class Tuning:
     probe_max_tries:          int   = 6
     auth_refresh_timeout:     float = 4.0
     token_refresh_lead_sec:   int   = 120
-    auto_query_batch_size:    int   = 3
     auto_query_batch_timeout: float = 3.0
     vid_timeout:              float = 3.5
     vid_max_age:              float = 8.0
@@ -259,7 +258,7 @@ class Engine:
             "auto": {
                 "slot_start": a.get("slot_start", "19:30"),
                 "slot_end":   a.get("slot_end", "21:30"),
-                "refresh_at": a.get("refresh_at", "20:00:01"),
+                "refresh_at": a.get("refresh_at", "20:00:04"),
             },
         }
 
@@ -803,8 +802,13 @@ class Engine:
     # ══════════════════════════════════════════════════
     # 全自动流程
     # ══════════════════════════════════════════════════
-    # 自动模式排除的场地号
-    AUTO_EXCLUDE_COURTS: tuple[int, ...] = (5, 6)
+    # 全自动固定场地批次
+    AUTO_COURT_BATCHES = (
+        (3, 9),
+        (2, 8),
+        (1, 7, 4, 10),
+        (5, 6),
+    )
 
     def auto_state(self) -> dict:
         s = self.auto
@@ -833,9 +837,8 @@ class Engine:
             "date": self.target_date,
             "slot_start": a.get("slot_start", "19:30"),
             "slot_end":   a.get("slot_end",   "21:30"),
-            "refresh_at": a.get("refresh_at", "20:00:01"),
-            "excluded_courts": list(self.AUTO_EXCLUDE_COURTS),
-            "query_batch_size": max(1, int(self.tuning.auto_query_batch_size)),
+            "refresh_at": a.get("refresh_at", "20:00:04"),
+            "court_batches": self.AUTO_COURT_BATCHES,
             "query_batch_timeout": max(0.2, float(self.tuning.auto_query_batch_timeout)),
         }
         self._auto_task = asyncio.create_task(self._auto_loop())
@@ -986,8 +989,8 @@ class Engine:
             a = self.config_data.get("auto", {}) or {}
             slot_start = a.get("slot_start", "19:30")
             slot_end   = a.get("slot_end",   "21:30")
-            refresh_at = a.get("refresh_at", "20:00:01")
-            refresh_dt = self._parse_hms(refresh_at)
+            refresh_at = a.get("refresh_at", "20:00:04")
+            refresh_dt = self._parse_hms(refresh_at)+ timedelta(milliseconds=800)
 
             # ── ① Token 自动刷新（保留原逻辑） ──
             if datetime.now() < refresh_dt:
@@ -1020,7 +1023,7 @@ class Engine:
 
             # ── ② 启动 VID 池（保持原逻辑） ──
             if not self.vid_running:
-                vid_dt = refresh_dt - timedelta(seconds=8)
+                vid_dt = refresh_dt - timedelta(seconds=4)
                 if datetime.now() < vid_dt:
                     self.auto.msg = f"等待启动 VID（{vid_dt.strftime('%H:%M:%S')}）"
                     log.info("自动模式: 等待 %s 启动 VID",
@@ -1037,27 +1040,17 @@ class Engine:
             log.info("自动模式: 等待触发 %s", refresh_at)
             await self._sleep_until(refresh_dt)
 
-            # ── ④ 随机遍历，每批最多三个，排除原有 5、6 号 ──
-            pool = [c for c in self.courts
-                    if c.no not in self.AUTO_EXCLUDE_COURTS]
-            random.shuffle(pool)
-            total = len(pool)
-            batch_size = max(1, int(self.tuning.auto_query_batch_size))
-            round_total = (total + batch_size - 1) // batch_size
-            log.info(
-                "自动模式: %d 个候选场地，%d 批，每批最多 %d 个并发查询 "
-                "(每批最多 %.1fs，时段 %s-%s，排除 %s)",
-                total, round_total, batch_size,
-                max(0.2, float(self.tuning.auto_query_batch_timeout)),
-                slot_start, slot_end,
-                list(self.AUTO_EXCLUDE_COURTS),
-            )
+            # ── ④ 按固定顺序逐批查询，批内并发 ──
+            batches = [
+                [self.court_by_no[no] for no in numbers]
+                for numbers in self.AUTO_COURT_BATCHES
+            ]
 
-            for offset in range(0, total, batch_size):
+            round_total = len(batches)
+
+            for batch_no, batch in enumerate(batches, start=1):
                 if has_success():
                     break
-                batch = pool[offset:offset + batch_size]
-                batch_no = offset // batch_size + 1
                 names = ", ".join(c.name for c in batch)
                 self.auto.phase = "scanning"
                 self.auto.msg = f"并发查询第 {batch_no}/{round_total} 批：{names}"
@@ -1138,8 +1131,12 @@ class Engine:
         parts = [int(x) for x in t.split(":")]
         while len(parts) < 3:
             parts.append(0)
-        return datetime.now().replace(hour=parts[0], minute=parts[1],
-                                      second=parts[2], microsecond=0)
+        return datetime.now().replace(
+            hour=parts[0],
+            minute=parts[1],
+            second=parts[2],
+            microsecond=0,
+        ) 
 
     @staticmethod
     async def _sleep_until(target: datetime):
