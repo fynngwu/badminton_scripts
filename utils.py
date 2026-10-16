@@ -129,9 +129,35 @@ async def limited_get(url, **kwargs):
                 _get_starts.append(now)
                 break
             delay = max(0.001, _get_starts[0] + 8.7 - now)
-            log.info("[GET限流] 已达14次，等待 %.0fms", delay * 1000)
             await asyncio.sleep(delay)
-    return await get_client().get(url, **kwargs)
+    name = url.rsplit("/", 1)[-1]
+    sent = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    start = time.monotonic()
+    log.info("[GET %s] → 发送 @ %s", name, sent)
+    try:
+        r = await get_client().get(url, **kwargs)
+        info = ""
+        try:
+            j = r.json()
+            data = j.get("data") or {}
+            if name == "getGroundDetailByParam":
+                info = f"maxDay={data.get('canOrderMaxDay')}"
+            elif name == "getOrderTimeConfigList":
+                slots = [b for c in data.get("configList", []) for b in c.get("timeBlockList", [])]
+                info = f"free={sum(b.get('status') == '1' for b in slots)}/{len(slots)}"
+            else:
+                info = f"success={j.get('success')}"
+            if j.get("success") is False:
+                info += f" code={j.get('code')} msg={str(j.get('msg') or '')[:60]}"
+        except (ValueError, TypeError, AttributeError, KeyError):
+            info = "non-json/字段异常"
+        log.info("[GET %s] ← 返回 @ %s (+%.0fms) HTTP %d %s",
+                 name, datetime.now().strftime("%H:%M:%S.%f")[:-3],
+                 (time.monotonic()-start)*1000, r.status_code, info)
+        return r
+    except Exception as e:
+        log.warning("[GET %s] ✗ 异常 @ %s (+%.0fms): %s", name, datetime.now().strftime("%H:%M:%S.%f")[:-3], (time.monotonic()-start)*1000, e)
+        raise
 
 
 # ══════════════════════════════════════════════════════
@@ -360,11 +386,9 @@ async def get_order_once(court: Court, date: str, token: str, user_id: str,
             "userid": user_id, "token": token,
         }, timeout=timeout)
     except Exception as e:
-        log.warning("查询 %s 异常: %s", court.name, e)
         return {"ok": False, "auth_fail": False, "error": f"网络异常: {e}"}
 
     if r.status_code != 200:
-        log.warning("查询 %s HTTP %d: %s", court.name, r.status_code, r.text[:120])
         return {"ok": False, "auth_fail": False, "error": f"HTTP {r.status_code}"}
 
     try:
@@ -375,8 +399,6 @@ async def get_order_once(court: Court, date: str, token: str, user_id: str,
     if not j.get("success"):
         msg = str(j.get("msg", "") or "")
         auth = is_auth_fail(j)
-        log.warning("查询 %s %s: %s",
-                    court.name, "鉴权失败" if auth else "success=false", msg)
         return {"ok": False, "auth_fail": auth,
                 "error": msg or f"success=false (code={j.get('code')})"}
 

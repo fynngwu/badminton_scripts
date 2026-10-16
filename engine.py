@@ -649,8 +649,6 @@ class Engine:
             dt = (time.monotonic() - t0) * 1000
 
             if res.get("ok"):
-                log.info("探测 %s 成功 (%.0fms, 第 %d 次)，并发剩余 %d 个场地",
-                         probe.name, dt, attempt, len(rest))
                 await self._publish_refresh(probe, res)
                 ok = True
                 break
@@ -663,10 +661,6 @@ class Engine:
                     await self.fetch_token()
                 except Exception as e:
                     log.warning("自动获取 Token 异常: %s", e)
-            else:
-                log.info("探测 %s 失败 (%.0fms, %d/%d): %s",
-                         probe.name, dt, attempt, max_tries,
-                         res.get("error", ""))
 
             if backoff > 0:
                 await asyncio.sleep(backoff)
@@ -689,13 +683,6 @@ class Engine:
         res = await get_order_once(court, self.target_date,
                                    self.token, self.user_id)
         dt = (time.monotonic() - t0) * 1000
-
-        if res.get("ok"):
-            log.info("%s OK (%.0fms)", court.name, dt)
-        else:
-            tag = "鉴权失败" if res.get("auth_fail") else "失败"
-            log.info("%s %s (%.0fms): %s",
-                     court.name, tag, dt, res.get("error", ""))
 
         await self._publish_refresh(court, res)
 
@@ -909,10 +896,6 @@ class Engine:
                     elapsed = (time.monotonic() - started) * 1000
                     if not result.get("ok"):
                         auth_failed |= bool(result.get("auth_fail"))
-                        log.warning(
-                            "自动模式: %s 查询失败 (+%.0fms): %s，继续本批",
-                            court.name, elapsed, result.get("error", "未知错误"),
-                        )
                         continue
 
                     try:
@@ -928,7 +911,6 @@ class Engine:
                         )
                         return court, auth_failed
 
-                    log.info("自动模式: %s 无目标空场 (+%.0fms)", court.name, elapsed)
 
             if pending:
                 log.warning("自动模式: 本批 %.1fs 截止，%d 个查询未完成，进入下一批",
@@ -1053,7 +1035,6 @@ class Engine:
             self.auto.phase, self.auto.msg = "waiting_open", "等待9号场 maxDay=3"
             deadline, opened = time.monotonic() + 3, False
             while time.monotonic() < deadline:
-                t0 = time.monotonic()
                 try:
                     r = await limited_get(
                         "https://reservation.sustech.edu.cn/api/blade-app/qywx/getGroundDetailByParam",
@@ -1061,11 +1042,10 @@ class Engine:
                                 "groundId": self.court_by_no[9].id}, timeout=2.0)
                     j = r.json()
                     days = j.get("data", {}).get("canOrderMaxDay") if j.get("success") else None
-                    log.info("[开放探查] %s maxDay=%s 耗时=%.0fms", datetime.now().strftime("%H:%M:%S.%f")[:-3], days, (time.monotonic()-t0)*1000)
                     if days is not None and int(days) == 3:
                         opened = True; break
-                except Exception as e:
-                    log.warning("[开放探查] %s 异常: %s", datetime.now().strftime("%H:%M:%S.%f")[:-3], e)
+                except Exception:
+                    pass  # limited_get 已记录网络异常
                 await asyncio.sleep(0.15)
             if not opened:
                 log.warning("[开放探查] 3秒内未检测到 maxDay=3，本轮停止"); return
