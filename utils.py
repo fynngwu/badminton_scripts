@@ -118,7 +118,7 @@ _get_starts = deque()
 _get_lock = asyncio.Lock()
 
 
-async def limited_get(url, **kwargs):
+async def limited_get(url, *, court_name="", **kwargs):
     """同进程所有 GET 共用限流：任意 8.7 秒内最多 14 次起发。"""
     async with _get_lock:
         while True:
@@ -131,9 +131,10 @@ async def limited_get(url, **kwargs):
             delay = max(0.001, _get_starts[0] + 8.7 - now)
             await asyncio.sleep(delay)
     name = url.rsplit("/", 1)[-1]
+    tag = f"{name} {court_name}" if court_name else name
     sent = datetime.now().strftime("%H:%M:%S.%f")[:-3]
     start = time.monotonic()
-    log.info("[GET %s] → 发送 @ %s", name, sent)
+    log.info("[GET %s] → 发送 @ %s", tag, sent)
     try:
         r = await get_client().get(url, **kwargs)
         info = ""
@@ -142,17 +143,14 @@ async def limited_get(url, **kwargs):
             data = j.get("data") or {}
             if name == "getGroundDetailByParam":
                 info = f"maxDay={data.get('canOrderMaxDay')}"
-            elif name == "getOrderTimeConfigList":
-                slots = [b for c in data.get("configList", []) for b in c.get("timeBlockList", [])]
-                info = f"free={sum(b.get('status') == '1' for b in slots)}/{len(slots)}"
-            else:
+            elif name != "getOrderTimeConfigList":
                 info = f"success={j.get('success')}"
             if j.get("success") is False:
                 info += f" code={j.get('code')} msg={str(j.get('msg') or '')[:60]}"
         except (ValueError, TypeError, AttributeError, KeyError):
             info = "non-json/字段异常"
         log.info("[GET %s] ← 返回 @ %s (+%.0fms) HTTP %d %s",
-                 name, datetime.now().strftime("%H:%M:%S.%f")[:-3],
+                 tag, datetime.now().strftime("%H:%M:%S.%f")[:-3],
                  (time.monotonic()-start)*1000, r.status_code, info)
         return r
     except Exception as e:
@@ -381,7 +379,7 @@ async def get_order_once(court: Court, date: str, token: str, user_id: str,
         {"ok": bool, "auth_fail": bool, "avail": dict, "blocks": list, "error": str}
     """
     try:
-        r = await limited_get(URL_QUERY, params={
+        r = await limited_get(URL_QUERY, court_name=court.name, params={
             "groundId": court.id, "startDate": date, "endDate": date,
             "userid": user_id, "token": token,
         }, timeout=timeout)

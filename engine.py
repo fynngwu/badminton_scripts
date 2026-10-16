@@ -1038,7 +1038,7 @@ class Engine:
                 try:
                     r = await limited_get(
                         "https://reservation.sustech.edu.cn/api/blade-app/qywx/getGroundDetailByParam",
-                        params={"userid": self.user_id, "token": self.token,
+                        court_name="9号场", params={"userid": self.user_id, "token": self.token,
                                 "groundId": self.court_by_no[9].id}, timeout=2.0)
                     j = r.json()
                     days = j.get("data", {}).get("canOrderMaxDay") if j.get("success") else None
