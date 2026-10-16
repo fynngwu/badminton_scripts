@@ -129,6 +129,7 @@ async def limited_get(url, *, court_name="", **kwargs):
                 _get_starts.append(now)
                 break
             delay = max(0.001, _get_starts[0] + 8.7 - now)
+            log.warning("[GET限流] 14次/8.7s 已满，等待 %.0fms", delay * 1000)
             await asyncio.sleep(delay)
     name = url.rsplit("/", 1)[-1]
     tag = f"{name} {court_name}" if court_name else name
@@ -255,8 +256,14 @@ class _CaptchaSolver:
                                     timeout=self.timeout)
         r.raise_for_status()
         j = r.json()
-        if not isinstance(j, dict) or "id" not in j or "captcha" not in j:
-            raise RuntimeError(f"generate 字段异常: {j!r}")
+        if not isinstance(j, dict):
+            raise RuntimeError(f"验证码生成响应异常: {str(j)[:180]}")
+        if not j.get("success", True):
+            raise RuntimeError(f"验证码生成失败: {j.get('msg', j)}")
+        if not isinstance(j.get("captcha"), dict):
+            raise RuntimeError(f"验证码数据异常: {j.get('msg', '')} captcha={str(j.get('captcha'))[:100]}")
+        if not j.get("id"):
+            raise RuntimeError(f"验证码缺少 id: {str(j)[:180]}")
         return j["id"], j["captcha"]
 
     async def _check(self, cid, track, start, stop):
