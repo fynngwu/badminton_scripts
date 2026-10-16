@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
 import logging
@@ -19,6 +20,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -110,6 +112,26 @@ def get_client() -> httpx.AsyncClient:
     if _client is None:
         _client = httpx.AsyncClient(headers=HEADERS, timeout=6.0, trust_env=False)
     return _client
+
+
+_get_starts = deque()
+_get_lock = asyncio.Lock()
+
+
+async def limited_get(url, **kwargs):
+    """同进程所有 GET 共用限流：任意 8.7 秒内最多 14 次起发。"""
+    async with _get_lock:
+        while True:
+            now = time.monotonic()
+            while _get_starts and now - _get_starts[0] >= 8.7:
+                _get_starts.popleft()
+            if len(_get_starts) < 14:
+                _get_starts.append(now)
+                break
+            delay = max(0.001, _get_starts[0] + 8.7 - now)
+            log.info("[GET限流] 已达14次，等待 %.0fms", delay * 1000)
+            await asyncio.sleep(delay)
+    return await get_client().get(url, **kwargs)
 
 
 # ══════════════════════════════════════════════════════
@@ -333,7 +355,7 @@ async def get_order_once(court: Court, date: str, token: str, user_id: str,
         {"ok": bool, "auth_fail": bool, "avail": dict, "blocks": list, "error": str}
     """
     try:
-        r = await get_client().get(URL_QUERY, params={
+        r = await limited_get(URL_QUERY, params={
             "groundId": court.id, "startDate": date, "endDate": date,
             "userid": user_id, "token": token,
         }, timeout=timeout)

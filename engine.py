@@ -20,7 +20,7 @@ from utils import (
     CONFIG_PATH,
     MITM_HOST, MITM_PORT, MITM_UPSTREAM,
     read_config_dict, write_config_string, write_config_int,
-    get_vid_once, get_order_once, save_order_once,
+    limited_get, get_vid_once, get_order_once, save_order_once,
     refresh_window,
     slot_covers, classify_order_reply,
     port_listening, kill_port_holder, spawn_mitmdump,
@@ -972,6 +972,17 @@ class Engine:
         except Exception as exc:
             log.warning("自动模式: Token 刷新异常: %s，继续查询下一批", exc)
 
+    async def _try_auto_order(self, court, start, end):
+        try:
+            vid = await self.take_vid(timeout=2.0)
+            if not vid:
+                async with self._solve_sem:
+                    vid, _ = await get_vid_once(timeout=self.tuning.vid_timeout)
+            r = await self._save_order(vid, court, self.target_date, start, end, self.token)
+        except Exception as e: r = {"success": False, "msg": f"下单异常: {type(e).__name__}: {e}"}
+        await self._publish_order_result(court, r)
+        return bool(r.get("success")), str(r.get("msg", "") or "")
+
     async def _auto_loop(self):
         """全自动：每批并发查询 3 个；一批最多串行下单 1 次。"""
         applied: list[dict] = []
@@ -1039,9 +1050,39 @@ class Engine:
             log.info("自动模式: 等待触发 %s", refresh_at)
             await self._sleep_until(refresh_dt)
 
-            # ── ④ 按固定顺序逐批查询，批内并发 ──
+            self.auto.phase, self.auto.msg = "waiting_open", "等待9号场 maxDay=3"
+            deadline, opened = time.monotonic() + 3, False
+            while time.monotonic() < deadline:
+                t0 = time.monotonic()
+                try:
+                    r = await limited_get(
+                        "https://reservation.sustech.edu.cn/api/blade-app/qywx/getGroundDetailByParam",
+                        params={"userid": self.user_id, "token": self.token,
+                                "groundId": self.court_by_no[9].id}, timeout=2.0)
+                    j = r.json()
+                    days = j.get("data", {}).get("canOrderMaxDay") if j.get("success") else None
+                    log.info("[开放探查] %s maxDay=%s 耗时=%.0fms", datetime.now().strftime("%H:%M:%S.%f")[:-3], days, (time.monotonic()-t0)*1000)
+                    if days is not None and int(days) == 3:
+                        opened = True; break
+                except Exception as e:
+                    log.warning("[开放探查] %s 异常: %s", datetime.now().strftime("%H:%M:%S.%f")[:-3], e)
+                await asyncio.sleep(0.15)
+            if not opened:
+                log.warning("[开放探查] 3秒内未检测到 maxDay=3，本轮停止"); return
+            log.info("[开放探查] ✅ maxDay=3，立即尝试9号场下单")
+            court9 = self.court_by_no[9]
+            self.auto.phase, self.auto.msg = "ordering", "首次尝试9号场…"
+            ok, msg = await self._try_auto_order(court9, slot_start, slot_end)
+            record(court9, ok, msg)
+            log.info("[开放探查] 9号场下单结果 @ %s: %s %s",
+                     datetime.now().strftime("%H:%M:%S.%f")[:-3],
+                     "成功，停止" if ok else "失败，继续原有批次", msg)
+            if ok:
+                return
+
+            # ── ④ 按固定顺序逐批查询，批内并发（9号场已尝试一次，跳过） ──
             batches = [
-                [self.court_by_no[no] for no in numbers]
+                [self.court_by_no[no] for no in numbers if no != 9]
                 for numbers in self.AUTO_COURT_BATCHES
             ]
 
@@ -1068,29 +1109,7 @@ class Engine:
                 # ── ⑤ 一批最多尝试一次下单（沿用原有 VID/saveOrder 逻辑） ──
                 self.auto.phase = "ordering"
                 self.auto.msg = f"抢 {court.name}…"
-                try:
-                    vid = await self.take_vid(timeout=2.0)
-                    if not vid:
-                        log.info("自动模式: VID 池暂无货，同步兜底求解")
-                        async with self._solve_sem:
-                            vid, _ = await get_vid_once(timeout=self.tuning.vid_timeout)
-
-                    r = await self._save_order(vid, court, self.target_date,
-                                               slot_start, slot_end, self.token)
-                    await self._publish_order_result(court, r)
-                    ok = bool(r.get("success"))
-                    msg = str(r.get("msg", "") or "")
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    ok = False
-                    msg = f"下单流程异常: {type(exc).__name__}: {exc}"
-                    log.warning("自动模式: %s %s", court.name, msg)
-                    try:
-                        await self._publish_order_result(court, {"success": False, "msg": msg})
-                    except Exception as publish_exc:
-                        log.warning("自动模式: 下单结果通知异常: %s", publish_exc)
-
+                ok, msg = await self._try_auto_order(court, slot_start, slot_end)
                 record(court, ok, msg)
                 if ok:
                     log.info("自动模式: ✅ %s 抢场成功，立即停止全部查询", court.name)
