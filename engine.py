@@ -20,7 +20,7 @@ from utils import (
     CONFIG_PATH,
     MITM_HOST, MITM_PORT, MITM_UPSTREAM,
     read_config_dict, write_config_string, write_config_int,
-    limited_get, get_vid_once, get_order_once, save_order_once,
+    get_vid_once, get_order_once, save_order_once,
     refresh_window,
     slot_covers, classify_order_reply,
     port_listening, kill_port_holder, spawn_mitmdump,
@@ -857,6 +857,8 @@ class Engine:
         }
         pending = set(tasks)
         auth_failed = False
+        first_court = None
+        order_task = None
         started = time.monotonic()
         max_wait = max(0.2, float(self.tuning.auto_query_batch_timeout))
         deadline = started + max_wait
@@ -904,12 +906,15 @@ class Engine:
                         log.warning("自动模式: %s 可用性数据异常: %s", court.name, exc)
                         continue
 
-                    if available:
+                    if available and first_court is None:
+                        first_court = court
+                        if not any(a["ok"] for a in self.auto.applied):
+                            order_task = asyncio.create_task(self._try_auto_order(court, slot_start, slot_end))
                         log.info(
-                            "自动模式: %s 有空场 (+%.0fms)，立即尝试下单！",
-                            court.name, elapsed,
+                            "自动模式: %s 有空场 (+%.0fms)，%s",
+                            court.name, elapsed, "立即尝试下单" if order_task else "仅刷新状态",
                         )
-                        return court, auth_failed
+
 
 
             if pending:
@@ -923,7 +928,7 @@ class Engine:
                         })
                     except Exception as exc:
                         log.warning("自动模式: %s 超时通知失败: %s", court.name, exc)
-            return None, auth_failed
+            return (first_court, auth_failed, order_task)
         finally:
             # 异常、命中空场或用户停止自动模式，都不能留下孤儿请求。
             for task in tasks:
@@ -982,7 +987,7 @@ class Engine:
             slot_start = a.get("slot_start", "19:30")
             slot_end   = a.get("slot_end",   "21:30")
             refresh_at = a.get("refresh_at", "20:00:04")
-            refresh_dt = self._parse_hms(refresh_at)+ timedelta(milliseconds=300)
+            refresh_dt = self._parse_hms(refresh_at)+ timedelta(milliseconds=500)
 
             # ── ① Token 自动刷新（保留原逻辑） ──
             if datetime.now() < refresh_dt:
@@ -1032,68 +1037,36 @@ class Engine:
             log.info("自动模式: 等待触发 %s", refresh_at)
             await self._sleep_until(refresh_dt)
 
-            self.auto.phase, self.auto.msg = "waiting_open", "等待9号场 maxDay=3"
-            deadline, opened = time.monotonic() + 3, False
-            while time.monotonic() < deadline:
-                try:
-                    r = await limited_get(
-                        "https://reservation.sustech.edu.cn/api/blade-app/qywx/getGroundDetailByParam",
-                        court_name="9号场", params={"userid": self.user_id, "token": self.token,
-                                "groundId": self.court_by_no[9].id}, timeout=2.0)
-                    j = r.json()
-                    days = j.get("data", {}).get("canOrderMaxDay") if j.get("success") else None
-                    if days is not None and int(days) == 3:
-                        opened = True; break
-                except Exception:
-                    pass  # limited_get 已记录网络异常
-                await asyncio.sleep(0.15)
-            if not opened:
-                log.warning("[开放探查] 3秒内未检测到 maxDay=3，本轮停止"); return
-            log.info("[开放探查] ✅ maxDay=3，立即尝试9号场下单")
-            court9 = self.court_by_no[9]
-            self.auto.phase, self.auto.msg = "ordering", "首次尝试9号场…"
-            ok, msg = await self._try_auto_order(court9, slot_start, slot_end)
-            record(court9, ok, msg)
-            log.info("[开放探查] 9号场下单结果 @ %s: %s %s",
-                     datetime.now().strftime("%H:%M:%S.%f")[:-3],
-                     "成功，停止" if ok else "失败，继续原有批次", msg)
-            if ok:
-                return
-
-            # ── ④ 按固定顺序逐批查询，批内并发（9号场已尝试一次，跳过） ──
-            batches = [
-                [self.court_by_no[no] for no in numbers if no != 9]
-                for numbers in self.AUTO_COURT_BATCHES
-            ]
+            # ── ④ 按固定顺序逐批查询全部场地 ──
+            batches = [[self.court_by_no[no] for no in numbers]
+                       for numbers in self.AUTO_COURT_BATCHES]
 
             round_total = len(batches)
 
             for batch_no, batch in enumerate(batches, start=1):
-                if has_success():
-                    break
                 names = ", ".join(c.name for c in batch)
                 self.auto.phase = "scanning"
                 self.auto.msg = f"并发查询第 {batch_no}/{round_total} 批：{names}"
                 log.info("自动模式: 第 %d/%d 批并发查询: %s",
                          batch_no, round_total, names)
 
-                court, auth_failed = await self._auto_query_batch(
+                court, auth_failed, order_task = await self._auto_query_batch(
                     batch, self.target_date, self.token, slot_start, slot_end,
                 )
-                if court is None:
+                if order_task is None:
                     if auth_failed:
                         await self._auto_refresh_auth_token()
-                    log.info("自动模式: 第 %d 批无可下单场地，继续下一批", batch_no)
+                    log.info("自动模式: 第 %d 批查询完成，继续下一批", batch_no)
                     continue
 
                 # ── ⑤ 一批最多尝试一次下单（沿用原有 VID/saveOrder 逻辑） ──
                 self.auto.phase = "ordering"
                 self.auto.msg = f"抢 {court.name}…"
-                ok, msg = await self._try_auto_order(court, slot_start, slot_end)
+                ok, msg = await order_task
                 record(court, ok, msg)
                 if ok:
-                    log.info("自动模式: ✅ %s 抢场成功，立即停止全部查询", court.name)
-                    break
+                    log.info("自动模式: ✅ %s 抢场成功，继续查询剩余场地", court.name)
+                    continue
 
                 # 失败不再等待 4 秒；立即转到下一批，没有第二个同批下单。
                 kind, _ = classify_order_reply({"success": False, "msg": msg})
