@@ -41,7 +41,7 @@ class Tuning:
     probe_max_tries:          int   = 6
     auth_refresh_timeout:     float = 4.0
     token_refresh_lead_sec:   int   = 120
-    auto_query_batch_timeout: float = 3.0
+    auto_query_batch_timeout: float = 2.0
     vid_timeout:              float = 3.5
     vid_max_age:              float = 8.0
     vid_pool_size:            int   = 3
@@ -942,7 +942,7 @@ class Engine:
             results = await self._refresh_courts(courts, self.tuning.auto_query_batch_timeout)
             available = [c for c, r in results if r.get("ok") and slot_covers(r["avail"], slot_start, slot_end)]
             log.info("自动模式: 十场探测结束，可抢: %s", [c.no for c in available])
-            if self.config_data.get("auto", {}).get("order_time_gate", False):
+            if bool(a.get("order_time_gate", False)):
                 await self._sleep_until(datetime.now().replace(hour=20, minute=0, second=4, microsecond=600000))
             for court in available:
                 self.auto.phase, self.auto.msg = "ordering", f"抢 {court.name}…"
