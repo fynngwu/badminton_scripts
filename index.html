@@ -213,6 +213,7 @@ button:disabled {
   <span style="color:#a371f7;">—</span>
   <select id="auto-se"></select>
   <label>触发</label><input id="auto-rt" style="width:85px">
+  <label><input type="checkbox" id="auto-gate"> 下单限时门槛 20:00:04.700</label>
   <button class="auto" id="btn-auto">启动全自动</button>
 </div>
 
@@ -566,6 +567,7 @@ function applyConfig(cfg) {
   $("auto-ss").value = a.slot_start;
   $("auto-se").value = a.slot_end;
   $("auto-rt").value = a.refresh_at;
+  $("auto-gate").checked = !!a.order_time_gate;
 }
 
 async function loadConfig() {
@@ -617,12 +619,13 @@ async function saveAutoPlan() {
       slot_start: $("auto-ss").value,
       slot_end:   $("auto-se").value,
       refresh_at: $("auto-rt").value.trim(),
+      order_time_gate: $("auto-gate").checked,
     }),
   });
   const j = await r.json();
   if (!j.ok) toast("全自动参数保存失败：" + (j.msg || ""), "err", 3000);
 }
-["auto-ss", "auto-se", "auto-rt"].forEach(id =>
+["auto-ss", "auto-se", "auto-rt", "auto-gate"].forEach(id =>
   $(id).addEventListener("change", saveAutoPlan));
 
 // ── 日期切换：自动保存 ──
