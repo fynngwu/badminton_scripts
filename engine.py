@@ -807,8 +807,8 @@ class Engine:
     # ══════════════════════════════════════════════════
     # 全自动固定场地批次
     AUTO_COURT_BATCHES = (
-        (8, 9, 2, 3),
-        (1, 4, 7, 10),
+        (9, 8, 2, 3),
+        (7, 1, 4, 10),
         (5, 6),
     )
 
@@ -870,7 +870,7 @@ class Engine:
         return bool(r.get("success")), str(r.get("msg", "") or "")
 
     async def _auto_loop(self):
-        """全自动：十场并发探测，按优先级串行下单。"""
+        """全自动：十场并发探测，每两场并发尝试下单。"""
         applied: list[dict] = []
 
         def has_success() -> bool:
@@ -944,14 +944,15 @@ class Engine:
             log.info("自动模式: 十场探测结束，可抢: %s", [c.no for c in available])
             if bool(a.get("order_time_gate", False)):
                 await self._sleep_until(datetime.now().replace(hour=20, minute=0, second=4, microsecond=600000))
-            for court in available:
-                self.auto.phase, self.auto.msg = "ordering", f"抢 {court.name}…"
-                ok, msg = await self._try_auto_order(court, slot_start, slot_end)
-                record(court, ok, msg)
-                if ok:
-                    log.info("自动模式: %s 下单成功，停止尝试", court.name)
+            for i in range(0, len(available), 2):
+                pair = available[i:i + 2]
+                self.auto.phase, self.auto.msg = "ordering", f"并发抢 {[c.no for c in pair]}号场…"
+                outcomes = await asyncio.gather(*(self._try_auto_order(c, slot_start, slot_end) for c in pair))
+                for court, (ok, msg) in zip(pair, outcomes):
+                    record(court, ok, msg)
+                    log.info("自动模式: %s 下单%s: %s", court.name, "成功" if ok else "失败", msg)
+                if any(ok for ok, _ in outcomes):
                     break
-                log.warning("自动模式: %s 下单失败: %s，尝试下一优先级", court.name, msg)
 
             log.info("自动模式: 遍历结束 | 已尝试下单 %d 次 | 成功 %s",
                      len(applied), "是" if has_success() else "否")
@@ -999,5 +1000,3 @@ class Engine:
 # ══════════════════════════════════════════════════════
 # 模块级单例
 # ══════════════════════════════════════════════════════
-engine = Engine()
-setup_logging()
