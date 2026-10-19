@@ -213,7 +213,8 @@ button:disabled {
   <span style="color:#a371f7;">—</span>
   <select id="auto-se"></select>
   <label>触发</label><input id="auto-rt" style="width:85px">
-  <label><input type="checkbox" id="auto-gate"> 下单限时门槛 20:00:04.700</label>
+  <label><input type="checkbox" id="auto-gate"> 下单门槛 20:00:04.600</label>
+  <label><input type="checkbox" id="auto-pair" checked onchange="saveAutoPlan()"> 双场并发下单（关闭则单场串行）</label>
   <button class="auto" id="btn-auto">启动全自动</button>
 </div>
 
@@ -567,7 +568,7 @@ function applyConfig(cfg) {
   $("auto-ss").value = a.slot_start;
   $("auto-se").value = a.slot_end;
   $("auto-rt").value = a.refresh_at;
-  $("auto-gate").checked = !!a.order_time_gate;
+  $("auto-gate").checked = !!a.order_time_gate; $("auto-pair").checked = a.pair_order !== false;
 }
 
 async function loadConfig() {
@@ -619,7 +620,7 @@ async function saveAutoPlan() {
       slot_start: $("auto-ss").value,
       slot_end:   $("auto-se").value,
       refresh_at: $("auto-rt").value.trim(),
-      order_time_gate: $("auto-gate").checked,
+      order_time_gate: $("auto-gate").checked, pair_order: $("auto-pair").checked,
     }),
   });
   const j = await r.json();

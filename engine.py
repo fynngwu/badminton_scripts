@@ -259,7 +259,7 @@ class Engine:
                 "slot_start": a.get("slot_start", "19:30"),
                 "slot_end":   a.get("slot_end", "21:30"),
                 "refresh_at": a.get("refresh_at", "20:00:04"),
-                "order_time_gate": bool(a.get("order_time_gate", False)),
+                "order_time_gate": bool(a.get("order_time_gate", False)), "pair_order": bool(a.get("pair_order", True)),
             },
         }
 
@@ -273,7 +273,7 @@ class Engine:
             write_config_string("token", token)
 
     def update_auto_config(self, slot_start: str, slot_end: str,
-                           refresh_at: str, order_time_gate: bool = False) -> None:
+                           refresh_at: str, order_time_gate: bool = False, pair_order: bool = True) -> None:
         write_config_string("slot_start", slot_start.strip())
         write_config_string("slot_end",   slot_end.strip())
         write_config_string("refresh_at", refresh_at.strip())
@@ -281,6 +281,7 @@ class Engine:
         if "order_time_gate =" not in text:
             CONFIG_PATH.write_text(text.replace("[auto]", "[auto]\norder_time_gate = 0", 1), encoding="utf-8")
         write_config_int("order_time_gate", int(order_time_gate))
+        write_config_int("pair_order", int(pair_order)) if "pair_order =" in (pair_cfg := CONFIG_PATH.read_text(encoding="utf-8")) else CONFIG_PATH.write_text(pair_cfg.replace("[auto]", f"[auto]\npair_order = {int(pair_order)}", 1), encoding="utf-8")
 
     async def apply_config_change(self):
         self.reload_config(force=True)
@@ -886,7 +887,7 @@ class Engine:
             slot_start = a.get("slot_start", "19:30")
             slot_end   = a.get("slot_end",   "21:30")
             refresh_at = a.get("refresh_at", "20:00:02")
-            refresh_dt = self._parse_hms(refresh_at)
+            refresh_dt = self._parse_hms(refresh_at) + timedelta(milliseconds=600)
 
             # ── ① Token 自动刷新（保留原逻辑） ──
             if datetime.now() < refresh_dt:
@@ -944,8 +945,8 @@ class Engine:
             log.info("自动模式: 十场探测结束，可抢: %s", [c.no for c in available])
             if bool(a.get("order_time_gate", False)):
                 await self._sleep_until(datetime.now().replace(hour=20, minute=0, second=4, microsecond=600000))
-            for i in range(0, len(available), 2):
-                pair = available[i:i + 2]
+            for i in range(0, len(available), 2 if a.get("pair_order", True) else 1):
+                pair = available[i:i + (2 if a.get("pair_order", True) else 1)]
                 self.auto.phase, self.auto.msg = "ordering", f"并发抢 {[c.no for c in pair]}号场…"
                 outcomes = await asyncio.gather(*(self._try_auto_order(c, slot_start, slot_end) for c in pair))
                 for court, (ok, msg) in zip(pair, outcomes):
