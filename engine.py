@@ -914,7 +914,7 @@ class Engine:
 
             # ── ② 启动 VID 池（保持原逻辑） ──
             if not self.vid_running:
-                vid_dt = refresh_dt - timedelta(seconds=4)
+                vid_dt = refresh_dt - timedelta(seconds=5)
                 if datetime.now() < vid_dt:
                     self.auto.msg = f"等待启动 VID（{vid_dt.strftime('%H:%M:%S')}）"
                     log.info("自动模式: 等待 %s 启动 VID",
@@ -940,8 +940,7 @@ class Engine:
                     await asyncio.gather(*(scan_one(self.court_by_no[n]) for n in group if n in self.court_by_no))
             scan_task = asyncio.create_task(scan())
 
-            saveorder_dt = refresh_dt + timedelta(milliseconds=700)
-            await self._sleep_until(saveorder_dt)
+            await asyncio.sleep(0.8)
             if a.get("order_time_gate", False): await self._sleep_until(datetime.now().replace(hour=20, minute=0, second=4, microsecond=600000))
                         # ── ④ 遍历下单：两个两个并发提交 ──
             while any(c.no not in blocked for c in candidates) and not has_success():
