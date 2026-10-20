@@ -24,7 +24,7 @@ from utils import (
     read_config_dict, write_config_string, write_config_int,
     get_vid_once, get_order_once, save_order_once,
     refresh_window,
-    slot_covers, classify_order_reply,
+    classify_order_reply,
     port_listening, kill_port_holder, spawn_mitmdump,
 )
 
@@ -823,8 +823,8 @@ class Engine:
     # ══════════════════════════════════════════════════
     # 全自动流程
     # ══════════════════════════════════════════════════
-    # 全自动固定场地批次
-    AUTO_COURT_BATCHES = ((9, 8, 3), (7, 4, 10))
+    # 全自动固定抢场顺序：3 → 8 → 9，一个一个抢
+    AUTO_COURT_ORDER = (3, 8, 9)
 
     def auto_state(self) -> dict:
         s = self.auto
@@ -854,7 +854,7 @@ class Engine:
             "slot_start": a.get("slot_start", "19:30"),
             "slot_end":   a.get("slot_end",   "21:30"),
             "refresh_at": a.get("refresh_at", "20:00:04"),
-            "court_batches": self.AUTO_COURT_BATCHES,
+            "court_order": list(self.AUTO_COURT_ORDER),
             "query_batch_timeout": max(0.2, float(self.tuning.auto_query_batch_timeout)),
         }
         self._auto_task = asyncio.create_task(self._auto_loop())
@@ -899,7 +899,7 @@ class Engine:
             slot_start = a.get("slot_start", "19:30")
             slot_end   = a.get("slot_end",   "21:30")
             refresh_at = a.get("refresh_at", "20:00:02")
-            refresh_dt = self._parse_hms(refresh_at) + timedelta(milliseconds=700)
+            refresh_dt = self._parse_hms(refresh_at) + timedelta(milliseconds=200)
 
             # ── ① Token 自动刷新（保留原逻辑） ──
             if datetime.now() < refresh_dt:
@@ -948,54 +948,28 @@ class Engine:
             self.auto.msg = f"等待 {refresh_at}"
             log.info("自动模式: 等待触发 %s", refresh_dt.strftime("%H:%M:%S.%f")[:-3])
             await self._sleep_until(refresh_dt)
-            
-            blocked, candidates = set(), [self.court_by_no[n] for group in self.AUTO_COURT_BATCHES for n in group if n in self.court_by_no]
-            async def scan_one(c):
-                _, r = await self._refresh_one(c, self.tuning.auto_query_batch_timeout)
-                if r.get("ok") and not slot_covers(r["avail"], slot_start, slot_end): blocked.add(c.no)
-            async def scan():
-                for group in self.AUTO_COURT_BATCHES:
-                    await asyncio.gather(*(scan_one(self.court_by_no[n]) for n in group if n in self.court_by_no))
-            scan_task = asyncio.create_task(scan())
 
-            await asyncio.sleep(0.8)
-            if a.get("order_time_gate", False): await self._sleep_until(datetime.now().replace(hour=20, minute=0, second=4, microsecond=600000))
-                        # ── ④ 遍历下单：两个两个并发提交 ──
-            while any(c.no not in blocked for c in candidates) and not has_success():
-                # 每批最多取 2 个（pair_order=False 时退化为 1 个）
-                pair = [c for c in candidates
-                        if c.no not in blocked][:2 if a.get("pair_order", True) else 1]
-
-                # 先整体摘下，避免并发时重复选中同一场地
-                for court in pair:
-                    candidates.remove(court)
-
-                if not pair:
-                    break
-
-                log.info("自动模式: 并发提交 [%s]",
-                         " / ".join(c.name for c in pair))
-
-                # 同一批两个场地同时 save order
-                results = await asyncio.gather(
-                    *(self._try_auto_order(c, slot_start, slot_end) for c in pair),
-                    return_exceptions=True,
+            # 可选的额外门闩（保持原配置项，默认关闭=触发时刻直接抢）
+            if a.get("order_time_gate", False):
+                await self._sleep_until(
+                    datetime.now().replace(hour=20, minute=0, second=4, microsecond=600000)
                 )
 
-                batch_ok = False
-                for court, r in zip(pair, results):
-                    if isinstance(r, Exception):
-                        record(court, False, f"下单异常: {type(r).__name__}: {r}")
-                        log.warning("自动模式: %s 下单异常: %s", court.name, r)
-                        continue
-                    ok, msg = r
-                    record(court, ok, msg)
-                    log.info("自动模式: %s 下单%s: %s",
-                             court.name, "成功" if ok else "失败", msg)
-                    if ok:
-                        batch_ok = True
+            # ── ④ 顺序抢 3 → 8 → 9：成功即停，失败继续 ──
+            for court_no in self.AUTO_COURT_ORDER:
+                court = self.court_by_no.get(court_no)
+                if not court:
+                    log.warning("自动模式: 场地 %d 未配置，跳过", court_no)
+                    continue
 
-                if batch_ok:
+                log.info("自动模式: 抢 %s", court.name)
+                ok, msg = await self._try_auto_order(court, slot_start, slot_end)
+                record(court, ok, msg)
+                log.info("自动模式: %s 下单%s: %s",
+                         court.name, "成功" if ok else "失败", msg)
+
+                if ok:
+                    log.info("自动模式: ✅ 成功，停止后续场地")
                     break
 
             log.info("自动模式: 遍历结束 | 已尝试下单 %d 次 | 成功 %s",
@@ -1007,7 +981,6 @@ class Engine:
         except Exception as e:
             log.exception("自动模式异常: %s", e)
         finally:
-            if "scan_task" in locals(): scan_task.cancel(); await asyncio.gather(scan_task, return_exceptions=True)
             if self.vid_running:
                 log.info("自动模式: 结束，停止 VID 池")
                 await self.stop_vid_pool()
