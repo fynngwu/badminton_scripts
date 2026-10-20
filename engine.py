@@ -11,6 +11,8 @@ import random
 import subprocess
 import time
 from collections import deque
+from logging.handlers import TimedRotatingFileHandler
+from pathlib import Path
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any
@@ -118,9 +120,20 @@ class _BufHandler(logging.Handler):
 def setup_logging():
     if log.handlers:
         return
-    log.setLevel(logging.INFO)
-    log.addHandler(_BufHandler())
-    log.addHandler(logging.StreamHandler())
+    log.setLevel(logging.DEBUG)
+    display = _BufHandler()
+    display.setLevel(logging.INFO)
+    log.addHandler(display)
+    console = logging.StreamHandler()
+    console.setLevel(logging.INFO)
+    log.addHandler(console)
+    folder = Path(__file__).resolve().parent / "logs"
+    folder.mkdir(exist_ok=True)
+    archive = TimedRotatingFileHandler(folder / "debug.log", when="midnight", backupCount=0, encoding="utf-8")
+    archive.suffix = "%Y-%m-%d"
+    archive.setLevel(logging.DEBUG)
+    archive.setFormatter(logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+    log.addHandler(archive)
 
 
 def get_logs(since: int = 0):
@@ -714,6 +727,11 @@ class Engine:
             evt["blocks"] = res["blocks"]
         else:
             evt["error"] = res.get("error", "查询失败")
+        if evt["ok"]:
+            free = [t for t, status in evt["avail"].items() if str(status) == "1"]
+            log.info("刷新 %s：%s", court.name, "有空场（%s）" % ", ".join(sorted(free)) if free else "无空场")
+        else:
+            log.warning("刷新 %s：查询失败（%s）", court.name, evt["error"])
         await self.bus.publish("refresh.result", evt)
 
     # ══════════════════════════════════════════════════

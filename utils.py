@@ -135,7 +135,7 @@ async def limited_get(url, *, court_name="", **kwargs):
     tag = f"{name} {court_name}" if court_name else name
     sent = datetime.now().strftime("%H:%M:%S.%f")[:-3]
     start = time.monotonic()
-    log.info("[GET %s] → 发送 @ %s", tag, sent)
+    log.debug("[GET %s] → 发送 @ %s", tag, sent)
     try:
         r = await get_client().get(url, **kwargs)
         info = ""
@@ -150,7 +150,7 @@ async def limited_get(url, *, court_name="", **kwargs):
                 info += f" code={j.get('code')} msg={str(j.get('msg') or '')[:60]}"
         except (ValueError, TypeError, AttributeError, KeyError):
             info = "non-json/字段异常"
-        log.info("[GET %s] ← 返回 @ %s (+%.0fms) HTTP %d %s",
+        log.debug("[GET %s] ← 返回 @ %s (+%.0fms) HTTP %d %s",
                  tag, datetime.now().strftime("%H:%M:%S.%f")[:-3],
                  (time.monotonic()-start)*1000, r.status_code, info)
         return r
