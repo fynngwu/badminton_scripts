@@ -824,7 +824,7 @@ class Engine:
     # 全自动流程
     # ══════════════════════════════════════════════════
     # 全自动固定抢场顺序：3 → 8 → 9，一个一个抢
-    AUTO_COURT_ORDER = (3, 8, 9)
+    AUTO_COURT_ORDER = (9,8,3)
 
     def auto_state(self) -> dict:
         s = self.auto
@@ -944,6 +944,8 @@ class Engine:
                 log.info("自动模式: VID 池已在运行，跳过启动")
 
             # ── ③ 等到触发时间 ──
+            slot_start = a.get("slot_start", "19:30")
+            slot_end   = a.get("slot_end",   "21:30")
             self.auto.phase = "waiting"
             self.auto.msg = f"等待 {refresh_at}"
             log.info("自动模式: 等待触发 %s", refresh_dt.strftime("%H:%M:%S.%f")[:-3])
