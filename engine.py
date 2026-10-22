@@ -47,7 +47,7 @@ class Tuning:
 
     # ── VID ──
     vid_timeout:              float = 2.0     # 单次 generate/check 超时
-    vid_max_age:              float = 40.0    # VID 有效期（覆盖 30s 提前量）
+    vid_max_age:              float = 7.9    # VID 有效期（覆盖 30s 提前量）
     vid_pool_size:            int   = 4       # worker 数量
     vid_pool_stagger:         float = 1.0     # worker i 延迟 i*stagger 启动
     vid_pool_interval_min:    float = 3.0     # 每次申请后随机间隔下限
