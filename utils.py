@@ -306,7 +306,7 @@ class _CaptchaSolver:
         session = curl_requests.AsyncSession(
             impersonate=self.impersonate,
             timeout=self.timeout,
-            http_version=CurlHttpVersion.v1_1,
+            http_version=CurlHttpVersion.V1_1,
         )
         try:
             cid, cap = await self._generate(session)
