@@ -182,7 +182,7 @@ class Engine:
         self.auto = AutoState()
 
         # 队列：4 worker × 4 批缓冲
-        self._vid_queue: asyncio.Queue = asyncio.Queue(maxsize=12)
+        self._vid_queue: asyncio.Queue = asyncio.Queue(maxsize=4)
         self._vid_tasks: list[asyncio.Task] = []
         self._vid_stats: deque = deque(maxlen=30)
 
