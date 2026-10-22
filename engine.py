@@ -49,9 +49,9 @@ class Tuning:
     vid_timeout:              float = 2.0     # 单次 generate/check 超时
     vid_max_age:              float = 40.0    # VID 有效期（覆盖 30s 提前量）
     vid_pool_size:            int   = 4       # worker 数量
-    vid_pool_stagger:         float = 0.5     # worker i 延迟 i*stagger 启动
-    vid_pool_interval_min:    float = 0.0     # 每次申请后随机间隔下限
-    vid_pool_interval_max:    float = 6.0     # 每次申请后随机间隔上限
+    vid_pool_stagger:         float = 1.0     # worker i 延迟 i*stagger 启动
+    vid_pool_interval_min:    float = 3.0     # 每次申请后随机间隔下限
+    vid_pool_interval_max:    float = 5.0     # 每次申请后随机间隔上限
     vid_pool_lead_sec:        int   = 30      # 自动模式提前多少秒启动 VID 池
 
     # ── mitm ──
@@ -182,7 +182,7 @@ class Engine:
         self.auto = AutoState()
 
         # 队列：4 worker × 4 批缓冲
-        self._vid_queue: asyncio.Queue = asyncio.Queue(maxsize=16)
+        self._vid_queue: asyncio.Queue = asyncio.Queue(maxsize=12)
         self._vid_tasks: list[asyncio.Task] = []
         self._vid_stats: deque = deque(maxlen=30)
 
