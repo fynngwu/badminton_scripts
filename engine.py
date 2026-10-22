@@ -44,10 +44,13 @@ class Tuning:
     auth_refresh_timeout:     float = 4.0
     token_refresh_lead_sec:   int   = 120
     auto_query_batch_timeout: float = 2.0
-    vid_timeout:              float = 3.5
-    vid_max_age:              float = 8.0
-    vid_pool_size:            int   = 6      # 每批 6 个不同指纹
-    vid_pool_period:          float = 8.2    # 每批之间间隔
+    vid_timeout:              float = 2.0
+    vid_max_age:              float = 40.0
+    vid_pool_size:            int   = 4       # 4 个独立 worker
+    vid_pool_stagger:         float = 0.5     # 启动错峰（worker i 延迟 i*stagger）
+    vid_pool_interval_min:    float = 0.0     # 每次申请后随机间隔下限
+    vid_pool_interval_max:    float = 6.0     # 每次申请后随机间隔上限
+    vid_pool_lead_sec:        int   = 30      # 提前多少秒启动 VID 池
     mitm_startup_timeout:     float = 12.0
     mitm_shutdown_grace:      float = 3.0
 
@@ -144,7 +147,7 @@ def get_logs(since: int = 0):
 # Engine
 # ══════════════════════════════════════════════════════
 class Engine:
-    # 批内每个 VID 使用不同指纹，确保同批 6 个不会触发同指纹限流
+    # worker i 用 IMPERSONATE_ROTATION[i] —— 4 个 worker 覆盖 4 个不同指纹
     IMPERSONATE_ROTATION = (
         "chrome", "safari17_0", "firefox133",
         "edge101", "safari15_5", "chrome124",
@@ -174,8 +177,8 @@ class Engine:
         self.bus = EventBus()
         self.auto = AutoState()
 
-        # 队列：3 批缓冲
-        self._vid_queue: asyncio.Queue = asyncio.Queue(maxsize=6)
+        # 队列：4 worker × 4 批缓冲
+        self._vid_queue: asyncio.Queue = asyncio.Queue(maxsize=16)
         self._vid_tasks: list[asyncio.Task] = []
         self._vid_stats: deque = deque(maxlen=30)
 
@@ -510,7 +513,7 @@ class Engine:
             self._token_fetch_busy = False
 
     # ══════════════════════════════════════════════════
-    # VID 池（批量模式：每批 N 个不同指纹，严格周期）
+    # VID 池（4 个独立 worker 并发申请，成功后随机间隔 0-6s）
     # ══════════════════════════════════════════════════
     @property
     def vid_running(self) -> bool:
@@ -523,7 +526,7 @@ class Engine:
         return {
             "running": self.vid_running,
             "count": self.vid_count(),
-            "stats": list(self._vid_stats)[-6:],
+            "stats": list(self._vid_stats)[-8:],
         }
 
     async def start_vid_pool(self) -> dict:
@@ -531,7 +534,9 @@ class Engine:
             return {"ok": True, "started": False, "count": self.vid_count()}
 
         size = max(1, int(self.tuning.vid_pool_size))
-        period = max(1.0, float(self.tuning.vid_pool_period))
+        stagger = max(0.0, float(self.tuning.vid_pool_stagger))
+        interval_min = max(0.0, float(self.tuning.vid_pool_interval_min))
+        interval_max = max(interval_min, float(self.tuning.vid_pool_interval_max))
 
         while not self._vid_queue.empty():
             try:
@@ -539,10 +544,16 @@ class Engine:
             except asyncio.QueueEmpty:
                 break
 
-        self._vid_tasks = [asyncio.create_task(self._vid_loop(size, period))]
+        self._vid_tasks = [
+            asyncio.create_task(
+                self._vid_worker(i + 1, i * stagger, interval_min, interval_max)
+            )
+            for i in range(size)
+        ]
         log.info(
-            "VID 批量池启动: 每批 %d 个 / 周期 %.1fs / 有效期 %.1fs / 队列上限 %d / 指纹轮转=%s",
-            size, period, self.tuning.vid_max_age, self._vid_queue.maxsize,
+            "VID 池启动: %d workers / 错峰 %.2fs / 间隔 %.1f-%.1fs / 有效期 %.1fs / 队列上限 %d / 指纹=%s",
+            size, stagger, interval_min, interval_max,
+            self.tuning.vid_max_age, self._vid_queue.maxsize,
             ", ".join(self.IMPERSONATE_ROTATION[:size]),
         )
         return {"ok": True, "started": True, "count": self.vid_count()}
@@ -555,32 +566,21 @@ class Engine:
         self._vid_tasks = []
         log.info("VID 池已停止")
 
-    async def _vid_loop(self, size: int, period: float):
-        """严格周期：批次耗时 + 等待 = period。"""
-        while True:
-            t0 = time.monotonic()
-            try:
-                await self._vid_fill_batch(size)
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                log.warning("VID 批次异常: %s", e)
-            await asyncio.sleep(period)
+    async def _vid_worker(self, tid: int, initial_delay: float,
+                          interval_min: float, interval_max: float):
+        """单个 VID worker：
+           * 错峰启动（worker i 延迟 i*stagger）
+           * 成功后 put 到 queue，再 sleep random(interval_min, interval_max)
+           * 失败也 sleep random(interval_min, interval_max) 后重试
+           * 每个 worker 固定绑定一个指纹（不同 worker 不同指纹）
+        """
+        impersonate = self.IMPERSONATE_ROTATION[(tid - 1) % len(self.IMPERSONATE_ROTATION)]
 
-    async def _vid_fill_batch(self, size: int):
-        imps = [self.IMPERSONATE_ROTATION[i % len(self.IMPERSONATE_ROTATION)]
-                for i in range(size)]
-        t0 = time.monotonic()
-        log.info("VID 批次开始: %d 个（%s）", size, ", ".join(imps))
-        tasks = [self._vid_one(i, imps[i]) for i in range(size)]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        ok = sum(1 for r in results if r is True)
-        ms = (time.monotonic() - t0) * 1000
-        log.info("VID 批次完成: %d/%d 成功 / %.0fms", ok, size, ms)
+        if initial_delay > 0:
+            await asyncio.sleep(initial_delay)
 
-    async def _vid_one(self, i: int, impersonate: str) -> bool:
         attempt = 0
-        while True:                                    # ← 改 1：循环
+        while True:
             attempt += 1
             try:
                 vid, timing = await get_vid_once(
@@ -588,24 +588,26 @@ class Engine:
                     impersonate=impersonate,
                 )
                 self._vid_stats.append({
-                    "ok": True, "imp": impersonate, "attempt": attempt,
+                    "ok": True, "tid": tid, "imp": impersonate, "attempt": attempt,
                     "ts": datetime.now().strftime("%H:%M:%S"), **timing,
                 })
                 await self._vid_put(vid)
-                if attempt > 1:                        # ← 改 2：首次成功不打日志
-                    log.info("VID-OK [%s] 第 %d 次尝试成功", impersonate, attempt)
-                return True
+                if attempt > 1:
+                    log.info("VID-OK [T%d/%s] 第 %d 次成功", tid, impersonate, attempt)
+                attempt = 0
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 self._vid_stats.append({
-                    "ok": False, "imp": impersonate, "attempt": attempt,
+                    "ok": False, "tid": tid, "imp": impersonate, "attempt": attempt,
                     "error": str(e)[:200],
                     "ts": datetime.now().strftime("%H:%M:%S"),
                 })
-                log.warning("VID-RETRY [%s] 第 %d 次失败: %s",
-                            impersonate, attempt, str(e)[:80])
-                await asyncio.sleep(0.1)               # ← 改 3：失败后重试，不 return
+                log.warning("VID-RETRY [T%d/%s] 第 %d 次失败: %s",
+                            tid, impersonate, attempt, str(e)[:80])
+
+            wait = random.uniform(interval_min, interval_max)
+            await asyncio.sleep(wait)
 
     async def _vid_put(self, vid: str):
         item = (time.monotonic(), vid)
@@ -794,7 +796,7 @@ class Engine:
 
             if not vid:
                 async with self._solve_sem:
-                    vid, _ = await get_vid_once(timeout=self.tuning.vid_timeout)
+                    vid, _ = await get_vid_once(timeout=self.tuning.vid_timeout,impersonate="chrome124")
 
             r = await self._save_order(vid, court, self.target_date,
                                        start, end, self.token)
@@ -840,7 +842,7 @@ class Engine:
     # ══════════════════════════════════════════════════
     # 全自动流程
     # ══════════════════════════════════════════════════
-    AUTO_COURT_ORDER = (5,6)
+    AUTO_COURT_ORDER = (5, 6)
 
     def auto_state(self) -> dict:
         s = self.auto
@@ -955,15 +957,16 @@ class Engine:
             else:
                 log.info("自动模式: 已过触发时间，跳过自动刷新 Token")
 
-            # ── ② 启动 VID 池 ──
+            # ── ② 提前 30s 启动 VID 池，让整点零新建连接 ──
             if not self.vid_running:
-                vid_dt = refresh_dt - timedelta(seconds=5)
+                lead_sec = max(1, int(self.tuning.vid_pool_lead_sec))
+                vid_dt = refresh_dt - timedelta(seconds=lead_sec)
                 if datetime.now() < vid_dt:
                     self.auto.msg = f"等待启动 VID（{vid_dt.strftime('%H:%M:%S')}）"
-                    log.info("自动模式: 等待 %s 启动 VID",
-                            vid_dt.strftime('%H:%M:%S'))
+                    log.info("自动模式: 等待 %s 启动 VID（提前 %ds）",
+                            vid_dt.strftime('%H:%M:%S'), lead_sec)
                     await self._sleep_until(vid_dt)
-                log.info("自动模式: 启动 VID 池")
+                log.info("自动模式: 启动 VID 池（提前 %ds）", lead_sec)
                 await self.start_vid_pool()
             else:
                 log.info("自动模式: VID 池已在运行，跳过启动")
@@ -1000,9 +1003,9 @@ class Engine:
             if not courts_to_grab:
                 log.warning("自动模式: 没有可抢的场地")
             else:
-                log.info("自动模式: 并发抢 %s（时段 %s-%s）",
+                log.info("自动模式: 并发抢 %s（时段 %s-%s，VID 队列 %d）",
                         ", ".join(c.name for c in courts_to_grab),
-                        slot_start, slot_end)
+                        slot_start, slot_end, self.vid_count())
                 await asyncio.gather(
                     *[_grab_one(c, slot_start, slot_end) for c in courts_to_grab]
                 )
@@ -1025,6 +1028,9 @@ class Engine:
             self.auto.msg = (f"结束：{'✅ 成功' if has_success() else '❌ 未成功'}"
                             f"（尝试 {len(applied)} 个）")
             self.auto.finished_at = datetime.now().strftime("%H:%M:%S")
+
+    # ══════════════════════════════════════════════════
+    # 时间小工具
     # ══════════════════════════════════════════════════
     @staticmethod
     def _parse_hms(t: str) -> datetime:

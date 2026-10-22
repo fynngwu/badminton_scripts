@@ -4,7 +4,7 @@
     Engine 决定何时调用、调几次、调用后状态怎么变。
 
 依赖：
-    pip install pywin32 httpx curl_cffi opencv-python pillow numpy
+    pip install pywin32 httpx[socks] curl_cffi opencv-python-headless pillow numpy
 """
 from __future__ import annotations
 
@@ -33,6 +33,7 @@ import httpx
 import numpy as np
 from PIL import Image
 from curl_cffi import requests as curl_requests
+from curl_cffi import CurlHttpVersion
 
 try:
     import tomllib
@@ -279,7 +280,7 @@ def slot_covers(avail: dict, start: str, end: str) -> bool:
 
 
 # ══════════════════════════════════════════════════════
-# 验证码 ROTATE 求解（curl_cffi 指纹）
+# 验证码 ROTATE 求解（curl_cffi 指纹 + HTTP/1.1）
 # ══════════════════════════════════════════════════════
 _DB = np.load(ROOT / "fast_db.npz", allow_pickle=False)
 _BG_DESCS    = _DB["bg_descs"]
@@ -293,7 +294,7 @@ class _CaptchaSolver:
     W, H, TRAVEL = 242, 180, 242
     BG_W, BG_H   = 48, 36
 
-    def __init__(self, timeout: float = 3.5, impersonate: str = "chrome"):
+    def __init__(self, timeout: float = 2.0, impersonate: str = "chrome"):
         self.timeout = timeout
         self.impersonate = impersonate
         self.timing: dict = {}
@@ -301,8 +302,11 @@ class _CaptchaSolver:
     async def solve(self) -> str:
         t0 = time.perf_counter()
         # 整次 generate+check 复用同一个 session → 同一指纹
+        # http_version=v1_1：避免 HTTP/2 RST_STREAM 静默掐断，限流时能看到明确的 429/503
         session = curl_requests.AsyncSession(
-            impersonate=self.impersonate, timeout=self.timeout,
+            impersonate=self.impersonate,
+            timeout=self.timeout,
+            http_version=CurlHttpVersion.v1_1,
         )
         try:
             cid, cap = await self._generate(session)
@@ -452,7 +456,7 @@ class _CaptchaSolver:
         return out
 
 
-async def get_vid_once(timeout: float = 3.5,
+async def get_vid_once(timeout: float = 2.0,
                        impersonate: str = "chrome") -> tuple[str, dict]:
     """单次：generate → recognize → track → check，返回 (vid, timing)。"""
     solver = _CaptchaSolver(timeout, impersonate)
