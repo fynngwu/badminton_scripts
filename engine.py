@@ -46,8 +46,8 @@ class Tuning:
     auto_query_batch_timeout: float = 2.0
     vid_timeout:              float = 3.5
     vid_max_age:              float = 8.0
-    vid_pool_size:            int   = 3
-    vid_pool_period:          float = 8.0
+    vid_pool_size:            int   = 6      # 每批 6 个不同指纹
+    vid_pool_period:          float = 8.2    # 每批之间间隔
     mitm_startup_timeout:     float = 12.0
     mitm_shutdown_grace:      float = 3.0
 
@@ -144,6 +144,12 @@ def get_logs(since: int = 0):
 # Engine
 # ══════════════════════════════════════════════════════
 class Engine:
+    # 批内每个 VID 使用不同指纹，确保同批 6 个不会触发同指纹限流
+    IMPERSONATE_ROTATION = (
+        "chrome", "safari17_0", "firefox133",
+        "edge101", "safari15_5", "chrome124",
+    )
+
     def __init__(self):
         # ── 配置快照 ──
         self.config_data: dict[str, Any] = {}
@@ -168,7 +174,8 @@ class Engine:
         self.bus = EventBus()
         self.auto = AutoState()
 
-        self._vid_queue: asyncio.Queue = asyncio.Queue(maxsize=3)
+        # 队列：3 批缓冲
+        self._vid_queue: asyncio.Queue = asyncio.Queue(maxsize=6)
         self._vid_tasks: list[asyncio.Task] = []
         self._vid_stats: deque = deque(maxlen=30)
 
@@ -344,7 +351,6 @@ class Engine:
                         "config.updated",
                         self.public_config()
                     )
-                # 跨天后，自动启动下一天的全自动预约任务
                 if day_changed and not self.auto.running:
                     log.info("日期已更新，自动启动新一天的全自动模式")
                     result = await self.start_auto()
@@ -363,7 +369,7 @@ class Engine:
             await asyncio.sleep(poll)
 
     # ══════════════════════════════════════════════════
-    # mitmdump 生命周期（严格单实例：本进程启动，本进程关闭）
+    # mitmdump 生命周期
     # ══════════════════════════════════════════════════
     def _mitm_lock_get(self) -> asyncio.Lock:
         if self._mitm_lock is None:
@@ -371,26 +377,16 @@ class Engine:
         return self._mitm_lock
 
     async def _ensure_mitm(self) -> bool:
-        """确保 mitmdump 就绪。
-
-        规则：
-            1) 自启进程存活且端口在监听 → 直接 True。
-            2) 端口被其他进程占用 → 强杀占用者，再启动新的。
-            3) 未启动 → 启动并等待端口监听。
-        """
         async with self._mitm_lock_get():
-            # 清理已退出的句柄
             if self._mitm_proc is not None and self._mitm_proc.poll() is not None:
                 log.warning("[mitm] 之前启动的 mitmdump 已退出 (code=%s)",
                             self._mitm_proc.returncode)
                 self._mitm_proc = None
 
-            # 自启进程仍在监听 → 就绪
             if self._mitm_proc is not None and port_listening(MITM_HOST, MITM_PORT, 0.2):
                 log.info("[mitm] ✅ mitmproxy 已就绪：%s:%d", MITM_HOST, MITM_PORT)
                 return True
 
-            # 端口被外人占用 → 强杀
             if self._mitm_proc is None and port_listening(MITM_HOST, MITM_PORT, 0.2):
                 log.warning("[mitm] 端口 %s:%d 被占用，正在结束占用进程…",
                             MITM_HOST, MITM_PORT)
@@ -400,7 +396,6 @@ class Engine:
                     log.info("[mitm] 已结束占用进程 PID: %s", killed)
                 else:
                     log.warning("[mitm] 未找到占用进程（可能已自行退出）")
-                # 等端口真正释放
                 deadline = time.monotonic() + 3.0
                 while time.monotonic() < deadline:
                     if not port_listening(MITM_HOST, MITM_PORT, 0.2):
@@ -411,7 +406,6 @@ class Engine:
                               MITM_HOST, MITM_PORT)
                     return False
 
-            # 未启动或句柄已死 → 拉起
             if self._mitm_proc is None or self._mitm_proc.poll() is not None:
                 log.info("[mitm] 正在拉起 mitmdump（%s:%d，无窗口）…",
                          MITM_HOST, MITM_PORT)
@@ -420,7 +414,6 @@ class Engine:
                     return False
                 self._mitm_proc = proc
 
-            # 等待端口监听
             deadline = time.monotonic() + self.tuning.mitm_startup_timeout
             while time.monotonic() < deadline:
                 if self._mitm_proc.poll() is not None:
@@ -517,7 +510,7 @@ class Engine:
             self._token_fetch_busy = False
 
     # ══════════════════════════════════════════════════
-    # VID 池（只服务自动模式）
+    # VID 池（批量模式：每批 N 个不同指纹，严格周期）
     # ══════════════════════════════════════════════════
     @property
     def vid_running(self) -> bool:
@@ -530,7 +523,7 @@ class Engine:
         return {
             "running": self.vid_running,
             "count": self.vid_count(),
-            "stats": list(self._vid_stats)[-3:],
+            "stats": list(self._vid_stats)[-6:],
         }
 
     async def start_vid_pool(self) -> dict:
@@ -546,13 +539,12 @@ class Engine:
             except asyncio.QueueEmpty:
                 break
 
-        stagger = period / size
-        self._vid_tasks = [
-            asyncio.create_task(self._vid_worker(i + 1, i * stagger, period))
-            for i in range(size)
-        ]
-        log.info("VID 池启动: %d workers / 周期 %.1fs / 有效期 %.1fs / 队列上限 %d",
-                 size, period, self.tuning.vid_max_age, self._vid_queue.maxsize)
+        self._vid_tasks = [asyncio.create_task(self._vid_loop(size, period))]
+        log.info(
+            "VID 批量池启动: 每批 %d 个 / 周期 %.1fs / 有效期 %.1fs / 队列上限 %d / 指纹轮转=%s",
+            size, period, self.tuning.vid_max_age, self._vid_queue.maxsize,
+            ", ".join(self.IMPERSONATE_ROTATION[:size]),
+        )
         return {"ok": True, "started": True, "count": self.vid_count()}
 
     async def stop_vid_pool(self):
@@ -562,6 +554,72 @@ class Engine:
             await asyncio.gather(*self._vid_tasks, return_exceptions=True)
         self._vid_tasks = []
         log.info("VID 池已停止")
+
+    async def _vid_loop(self, size: int, period: float):
+        """严格周期：批次耗时 + 等待 = period。"""
+        while True:
+            t0 = time.monotonic()
+            try:
+                await self._vid_fill_batch(size)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                log.warning("VID 批次异常: %s", e)
+            await asyncio.sleep(period)
+
+    async def _vid_fill_batch(self, size: int):
+        imps = [self.IMPERSONATE_ROTATION[i % len(self.IMPERSONATE_ROTATION)]
+                for i in range(size)]
+        t0 = time.monotonic()
+        log.info("VID 批次开始: %d 个（%s）", size, ", ".join(imps))
+        tasks = [self._vid_one(i, imps[i]) for i in range(size)]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        ok = sum(1 for r in results if r is True)
+        ms = (time.monotonic() - t0) * 1000
+        log.info("VID 批次完成: %d/%d 成功 / %.0fms", ok, size, ms)
+
+    async def _vid_one(self, i: int, impersonate: str) -> bool:
+        attempt = 0
+        while True:                                    # ← 改 1：循环
+            attempt += 1
+            try:
+                vid, timing = await get_vid_once(
+                    timeout=self.tuning.vid_timeout,
+                    impersonate=impersonate,
+                )
+                self._vid_stats.append({
+                    "ok": True, "imp": impersonate, "attempt": attempt,
+                    "ts": datetime.now().strftime("%H:%M:%S"), **timing,
+                })
+                await self._vid_put(vid)
+                if attempt > 1:                        # ← 改 2：首次成功不打日志
+                    log.info("VID-OK [%s] 第 %d 次尝试成功", impersonate, attempt)
+                return True
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self._vid_stats.append({
+                    "ok": False, "imp": impersonate, "attempt": attempt,
+                    "error": str(e)[:200],
+                    "ts": datetime.now().strftime("%H:%M:%S"),
+                })
+                log.warning("VID-RETRY [%s] 第 %d 次失败: %s",
+                            impersonate, attempt, str(e)[:80])
+                await asyncio.sleep(0.1)               # ← 改 3：失败后重试，不 return
+
+    async def _vid_put(self, vid: str):
+        item = (time.monotonic(), vid)
+        try:
+            self._vid_queue.put_nowait(item)
+        except asyncio.QueueFull:
+            try:
+                self._vid_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+            try:
+                self._vid_queue.put_nowait(item)
+            except asyncio.QueueFull:
+                pass
 
     async def take_vid(self, timeout: float = 5.0,
                        max_age: float | None = None) -> str | None:
@@ -580,42 +638,6 @@ class Engine:
             if age <= limit:
                 return vid
             log.warning("VID 过期丢弃 (存活 %.1fs > %.1fs)", age, limit)
-
-    async def _vid_worker(self, tid: int, delay: float, period: float):
-        if delay > 0:
-            await asyncio.sleep(delay)
-        while True:
-            started = time.monotonic()
-            try:
-                vid, timing = await get_vid_once(timeout=self.tuning.vid_timeout)
-                self._vid_stats.append({
-                    "ok": True,
-                    "ts": datetime.now().strftime("%H:%M:%S"),
-                    **timing,
-                })
-                item = (time.monotonic(), vid)
-                try:
-                    self._vid_queue.put_nowait(item)
-                except asyncio.QueueFull:
-                    try:
-                        self._vid_queue.get_nowait()
-                    except asyncio.QueueEmpty:
-                        pass
-                    try:
-                        self._vid_queue.put_nowait(item)
-                    except asyncio.QueueFull:
-                        pass
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                self._vid_stats.append({
-                    "ok": False,
-                    "error": str(e),
-                    "ts": datetime.now().strftime("%H:%M:%S"),
-                })
-                log.warning("VID-ERR [T%d] %s，稍后重试", tid, e); await asyncio.sleep(0.5)
-                continue
-            await asyncio.sleep(period)
 
     # ══════════════════════════════════════════════════
     # Refresh（刷新场地）
@@ -762,11 +784,6 @@ class Engine:
                 "start": start, "end": end}
 
     async def _reserve_worker(self, key, court: Court, start: str, end: str):
-        """手动下单：只解一个 VID，用完即弃。
-
-        * 池在跑 → 顺手从池里取一个（快）。
-        * 池没跑 → 现解一个，绝不拉起 pool（避免污染全局状态）。
-        """
         try:
             vid: str | None = None
 
@@ -823,8 +840,7 @@ class Engine:
     # ══════════════════════════════════════════════════
     # 全自动流程
     # ══════════════════════════════════════════════════
-    # 全自动固定抢场顺序：3 → 8 → 9，一个一个抢
-    AUTO_COURT_ORDER = (9,8,3)
+    AUTO_COURT_ORDER = (5,6)
 
     def auto_state(self) -> dict:
         s = self.auto
@@ -894,6 +910,15 @@ class Engine:
                             "ok": ok, "msg": msg})
             self.auto.applied = list(applied)
 
+        async def _grab_one(court: Court, start: str, end: str) -> None:
+            try:
+                ok, msg = await self._try_auto_order(court, start, end)
+            except Exception as e:
+                ok, msg = False, f"异常: {type(e).__name__}: {e}"
+            record(court, ok, msg)
+            log.info("自动模式: %s 下单%s: %s",
+                    court.name, "成功" if ok else "失败", msg)
+
         try:
             a = self.config_data.get("auto", {}) or {}
             slot_start = a.get("slot_start", "19:30")
@@ -901,16 +926,16 @@ class Engine:
             refresh_at = a.get("refresh_at", "20:00:02")
             refresh_dt = self._parse_hms(refresh_at) + timedelta(milliseconds=200)
 
-            # ── ① Token 自动刷新（保留原逻辑） ──
+            # ── ① Token 自动刷新 ──
             if datetime.now() < refresh_dt:
                 lead = max(0, int(self.tuning.token_refresh_lead_sec))
                 tr_dt = refresh_dt - timedelta(seconds=lead)
                 if datetime.now() < tr_dt:
                     self.auto.phase = "waiting_token"
                     self.auto.msg = (f"等待自动刷新 Token"
-                                     f"（{tr_dt.strftime('%H:%M:%S')}）")
+                                    f"（{tr_dt.strftime('%H:%M:%S')}）")
                     log.info("自动模式: Token 将在 %s 自动刷新",
-                             tr_dt.strftime('%H:%M:%S'))
+                            tr_dt.strftime('%H:%M:%S'))
                     await self._sleep_until(tr_dt)
 
                 self.auto.phase = "fetching_token"
@@ -930,13 +955,13 @@ class Engine:
             else:
                 log.info("自动模式: 已过触发时间，跳过自动刷新 Token")
 
-            # ── ② 启动 VID 池（保持原逻辑） ──
+            # ── ② 启动 VID 池 ──
             if not self.vid_running:
                 vid_dt = refresh_dt - timedelta(seconds=5)
                 if datetime.now() < vid_dt:
                     self.auto.msg = f"等待启动 VID（{vid_dt.strftime('%H:%M:%S')}）"
                     log.info("自动模式: 等待 %s 启动 VID",
-                             vid_dt.strftime('%H:%M:%S'))
+                            vid_dt.strftime('%H:%M:%S'))
                     await self._sleep_until(vid_dt)
                 log.info("自动模式: 启动 VID 池")
                 await self.start_vid_pool()
@@ -944,38 +969,46 @@ class Engine:
                 log.info("自动模式: VID 池已在运行，跳过启动")
 
             # ── ③ 等到触发时间 ──
-            slot_start = a.get("slot_start", "19:30")
-            slot_end   = a.get("slot_end",   "21:30")
             self.auto.phase = "waiting"
             self.auto.msg = f"等待 {refresh_at}"
             log.info("自动模式: 等待触发 %s", refresh_dt.strftime("%H:%M:%S.%f")[:-3])
             await self._sleep_until(refresh_dt)
 
-            # 可选的额外门闩（保持原配置项，默认关闭=触发时刻直接抢）
-            if a.get("order_time_gate", False):
+            # 抢场前重新读取最新配置，支持中途修改
+            a2 = self.config_data.get("auto", {}) or {}
+            slot_start = a2.get("slot_start", slot_start)
+            slot_end   = a2.get("slot_end",   slot_end)
+            if (slot_start, slot_end) != (a.get("slot_start"), a.get("slot_end")):
+                log.info("自动模式: 检测到时段变更 %s-%s → %s-%s",
+                        a.get("slot_start"), a.get("slot_end"),
+                        slot_start, slot_end)
+
+            if a2.get("order_time_gate", False):
                 await self._sleep_until(
                     datetime.now().replace(hour=20, minute=0, second=4, microsecond=600000)
                 )
 
-            # ── ④ 顺序抢 3 → 8 → 9：成功即停，失败继续 ──
+            # ── ④ 并发抢 5、6 号场 ──
+            courts_to_grab: list[Court] = []
             for court_no in self.AUTO_COURT_ORDER:
-                court = self.court_by_no.get(court_no)
-                if not court:
+                c = self.court_by_no.get(court_no)
+                if c:
+                    courts_to_grab.append(c)
+                else:
                     log.warning("自动模式: 场地 %d 未配置，跳过", court_no)
-                    continue
 
-                log.info("自动模式: 抢 %s", court.name)
-                ok, msg = await self._try_auto_order(court, slot_start, slot_end)
-                record(court, ok, msg)
-                log.info("自动模式: %s 下单%s: %s",
-                         court.name, "成功" if ok else "失败", msg)
+            if not courts_to_grab:
+                log.warning("自动模式: 没有可抢的场地")
+            else:
+                log.info("自动模式: 并发抢 %s（时段 %s-%s）",
+                        ", ".join(c.name for c in courts_to_grab),
+                        slot_start, slot_end)
+                await asyncio.gather(
+                    *[_grab_one(c, slot_start, slot_end) for c in courts_to_grab]
+                )
 
-                if ok:
-                    log.info("自动模式: ✅ 成功，停止后续场地")
-                    break
-
-            log.info("自动模式: 遍历结束 | 已尝试下单 %d 次 | 成功 %s",
-                     len(applied), "是" if has_success() else "否")
+            log.info("自动模式: 并发结束 | 已尝试下单 %d 次 | 成功 %s",
+                    len(applied), "是" if has_success() else "否")
 
         except asyncio.CancelledError:
             log.info("自动模式: 被取消")
@@ -990,11 +1023,8 @@ class Engine:
             self.auto.running = False
             self.auto.phase = "done"
             self.auto.msg = (f"结束：{'✅ 成功' if has_success() else '❌ 未成功'}"
-                             f"（尝试 {len(applied)} 个）")
+                            f"（尝试 {len(applied)} 个）")
             self.auto.finished_at = datetime.now().strftime("%H:%M:%S")
-
-    # ══════════════════════════════════════════════════
-    # 时间小工具
     # ══════════════════════════════════════════════════
     @staticmethod
     def _parse_hms(t: str) -> datetime:
@@ -1006,7 +1036,7 @@ class Engine:
             minute=parts[1],
             second=parts[2],
             microsecond=0,
-        ) 
+        )
 
     @staticmethod
     async def _sleep_until(target: datetime):

@@ -4,17 +4,20 @@
     Engine 决定何时调用、调几次、调用后状态怎么变。
 
 依赖：
-    pip install pywin32 httpx opencv-python pillow numpy
+    pip install pywin32 httpx curl_cffi opencv-python pillow numpy
 """
 from __future__ import annotations
 
 import asyncio
 import base64
 import io
+import json
+import itertools
 import logging
 import os
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -29,6 +32,7 @@ import cv2
 import httpx
 import numpy as np
 from PIL import Image
+from curl_cffi import requests as curl_requests
 
 try:
     import tomllib
@@ -102,15 +106,83 @@ def write_config_int(key: str, value: int, path: Path = CONFIG_PATH) -> None:
 
 
 # ══════════════════════════════════════════════════════
-# HTTP 客户端（进程内单例）
+# HTTP 客户端（进程内单例，用于订单/查询接口，带审计）
 # ══════════════════════════════════════════════════════
 _client: httpx.AsyncClient | None = None
+_http_seq = itertools.count(1)
+_http_lock = threading.Lock()
+_SECRET_KEYS = ("token", "authorization", "cookie", "password", "secret", "tel",
+                "phone", "email", "customername", "customerid", "userid", "code")
+
+
+def _safe_http(value):
+    """保留 HAR 风格结构，但不落盘凭据、身份信息或验证码图像。"""
+    if isinstance(value, dict):
+        return {k: ("[REDACTED]" if any(x in k.lower() for x in _SECRET_KEYS)
+                    or k.lower() in ("backgroundimage", "templateimage", "tracklist", "id")
+                    else _safe_http(v)) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_safe_http(v) for v in value[:100]]
+    if isinstance(value, str):
+        return value[:2000] + ("...[TRUNCATED]" if len(value) > 2000 else "")
+    return value
+
+
+def _http_body(raw: bytes):
+    if not raw:
+        return None
+    try:
+        return _safe_http(json.loads(raw))
+    except (ValueError, UnicodeError):
+        return "[NON_JSON_BODY_REDACTED]"
+
+
+async def _http_request_hook(request: httpx.Request):
+    request.extensions["audit_id"] = next(_http_seq)
+    request.extensions["audit_start"] = time.perf_counter()
+    request.extensions["audit_wall"] = datetime.now().astimezone().isoformat(timespec="milliseconds")
+    request.extensions["audit_request"] = {
+        "method": request.method, "url": str(request.url.copy_with(query=None)),
+        "query": _safe_http(dict(request.url.params)),
+        "headers": _safe_http(dict(request.headers)),
+        "body": _http_body(request.content),
+    }
+    log.info("[HTTP #%s] → %s %s @ %s", request.extensions["audit_id"],
+             request.method, request.url.path, request.extensions["audit_wall"])
+
+
+async def _http_response_hook(response: httpx.Response):
+    req = response.request
+    await response.aread()
+    elapsed = round((time.perf_counter() - req.extensions["audit_start"]) * 1000, 2)
+    body = _http_body(response.content)
+    entry = {
+        "id": req.extensions["audit_id"], "startedDateTime": req.extensions["audit_wall"],
+        "time_ms": elapsed, "request": req.extensions["audit_request"],
+        "response": {"status": response.status_code, "httpVersion": response.http_version,
+                     "headers": _safe_http(dict(response.headers)), "body": body,
+                     "bodyBytes": len(response.content)},
+    }
+    folder = ROOT / "logs"
+    folder.mkdir(exist_ok=True)
+    try:
+        with _http_lock:
+            with (folder / "http_trace.jsonl").open("a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
+    except OSError as exc:
+        log.warning("[HTTP审计] 写入失败: %s", exc)
+    info = body if isinstance(body, dict) else {}
+    log.info("[HTTP #%s] ← %s %s HTTP %s %.2fms code=%s success=%s msg=%s (详情: logs/http_trace.jsonl)",
+             entry["id"], req.method, req.url.path, response.status_code, elapsed,
+             info.get("code"), info.get("success"), str(info.get("msg", ""))[:250])
 
 
 def get_client() -> httpx.AsyncClient:
     global _client
     if _client is None:
-        _client = httpx.AsyncClient(headers=HEADERS, timeout=6.0, trust_env=False)
+        _client = httpx.AsyncClient(headers=HEADERS, timeout=6.0, trust_env=False,
+                                    event_hooks={"request": [_http_request_hook],
+                                                 "response": [_http_response_hook]})
     return _client
 
 
@@ -207,7 +279,7 @@ def slot_covers(avail: dict, start: str, end: str) -> bool:
 
 
 # ══════════════════════════════════════════════════════
-# 验证码 ROTATE 求解
+# 验证码 ROTATE 求解（curl_cffi 指纹）
 # ══════════════════════════════════════════════════════
 _DB = np.load(ROOT / "fast_db.npz", allow_pickle=False)
 _BG_DESCS    = _DB["bg_descs"]
@@ -221,39 +293,49 @@ class _CaptchaSolver:
     W, H, TRAVEL = 242, 180, 242
     BG_W, BG_H   = 48, 36
 
-    def __init__(self, timeout: float = 3.5):
+    def __init__(self, timeout: float = 3.5, impersonate: str = "chrome"):
         self.timeout = timeout
+        self.impersonate = impersonate
         self.timing: dict = {}
 
     async def solve(self) -> str:
         t0 = time.perf_counter()
-        cid, cap = await self._generate()
-        t1 = time.perf_counter()
+        # 整次 generate+check 复用同一个 session → 同一指纹
+        session = curl_requests.AsyncSession(
+            impersonate=self.impersonate, timeout=self.timeout,
+        )
+        try:
+            cid, cap = await self._generate(session)
+            t1 = time.perf_counter()
 
-        start, mono = datetime.now(), time.monotonic()
-        move_x = await __import__("asyncio").to_thread(self._recognize, cap)
-        t2 = time.perf_counter()
+            start, mono = datetime.now(), time.monotonic()
+            move_x = await __import__("asyncio").to_thread(self._recognize, cap)
+            t2 = time.perf_counter()
 
-        track = await __import__("asyncio").to_thread(self._make_track_sync, move_x, mono)
-        t3 = time.perf_counter()
+            track = await __import__("asyncio").to_thread(
+                self._make_track_sync, move_x, mono)
+            t3 = time.perf_counter()
 
-        stop = datetime.now()
-        vid = await self._check(cid, track, start, stop)
-        t4 = time.perf_counter()
+            stop = datetime.now()
+            vid = await self._check(session, cid, track, start, stop)
+            t4 = time.perf_counter()
 
-        self.timing = {
-            "gen_ms":   round((t1 - t0) * 1000, 1),
-            "rec_ms":   round((t2 - t1) * 1000, 1),
-            "trk_ms":   round((t3 - t2) * 1000, 1),
-            "chk_ms":   round((t4 - t3) * 1000, 1),
-            "total_ms": round((t4 - t0) * 1000, 1),
-            "move_x":   move_x,
-        }
-        return vid
+            self.timing = {
+                "imp":      self.impersonate,
+                "gen_ms":   round((t1 - t0) * 1000, 1),
+                "rec_ms":   round((t2 - t1) * 1000, 1),
+                "trk_ms":   round((t3 - t2) * 1000, 1),
+                "chk_ms":   round((t4 - t3) * 1000, 1),
+                "total_ms": round((t4 - t0) * 1000, 1),
+                "move_x":   move_x,
+            }
+            return vid
+        finally:
+            await session.close()
 
-    async def _generate(self):
-        r = await get_client().post(URL_GEN, json={"type": "ROTATE"},
-                                    timeout=self.timeout)
+    async def _generate(self, session):
+        r = await session.post(URL_GEN, json={"type": "ROTATE"},
+                               timeout=self.timeout)
         r.raise_for_status()
         j = r.json()
         if not isinstance(j, dict):
@@ -261,12 +343,14 @@ class _CaptchaSolver:
         if not j.get("success", True):
             raise RuntimeError(f"验证码生成失败: {j.get('msg', j)}")
         if not isinstance(j.get("captcha"), dict):
-            raise RuntimeError(f"验证码数据异常: {j.get('msg', '')} captcha={str(j.get('captcha'))[:100]}")
+            raise RuntimeError(
+                f"验证码数据异常: {j.get('msg', '')} "
+                f"captcha={str(j.get('captcha'))[:100]}")
         if not j.get("id"):
             raise RuntimeError(f"验证码缺少 id: {str(j)[:180]}")
         return j["id"], j["captcha"]
 
-    async def _check(self, cid, track, start, stop):
+    async def _check(self, session, cid, track, start, stop):
         payload = {
             "id": cid,
             "data": {
@@ -277,7 +361,7 @@ class _CaptchaSolver:
                 "trackList": track,
             },
         }
-        r = await get_client().post(URL_CHK, json=payload, timeout=self.timeout)
+        r = await session.post(URL_CHK, json=payload, timeout=self.timeout)
         r.raise_for_status()
         j = r.json()
         if not j.get("success"):
@@ -368,9 +452,10 @@ class _CaptchaSolver:
         return out
 
 
-async def get_vid_once(timeout: float = 3.5) -> tuple[str, dict]:
+async def get_vid_once(timeout: float = 3.5,
+                       impersonate: str = "chrome") -> tuple[str, dict]:
     """单次：generate → recognize → track → check，返回 (vid, timing)。"""
-    solver = _CaptchaSolver(timeout)
+    solver = _CaptchaSolver(timeout, impersonate)
     vid = await solver.solve()
     return vid, solver.timing
 
@@ -380,11 +465,7 @@ async def get_vid_once(timeout: float = 3.5) -> tuple[str, dict]:
 # ══════════════════════════════════════════════════════
 async def get_order_once(court: Court, date: str, token: str, user_id: str,
                          timeout: float = 4.0) -> dict:
-    """单次查询某个场地的时段配置。
-
-    返回：
-        {"ok": bool, "auth_fail": bool, "avail": dict, "blocks": list, "error": str}
-    """
+    """单次查询某个场地的时段配置。"""
     try:
         r = await limited_get(URL_QUERY, court_name=court.name, params={
             "groundId": court.id, "startDate": date, "endDate": date,
@@ -709,7 +790,6 @@ def capture_token_from_flow(
 
     now = time.monotonic()
 
-    # 同一个 token 在 1 秒内出现多次，只处理第一次
     if token == _last_token_seen and now - _last_token_seen_at < 1.0:
         return
 
@@ -754,12 +834,9 @@ def capture_token_from_flow(
     except Exception as e:
         print(f"[TOKEN] 写入失败: {e}")
 
-def kill_port_holder(host: str, port: int) -> list[int]:
-    """强杀所有监听 host:port 的进程，返回被杀的 PID 列表。
 
-    Windows: netstat -ano 找 PID → taskkill /F
-    Linux/Mac: lsof -ti 找 PID → SIGKILL
-    """
+def kill_port_holder(host: str, port: int) -> list[int]:
+    """强杀所有监听 host:port 的进程，返回被杀的 PID 列表。"""
     pids: set[int] = set()
 
     if sys.platform == "win32":
@@ -812,6 +889,7 @@ def kill_port_holder(host: str, port: int) -> list[int]:
             log.warning("[kill-port] 结束 PID %d 失败: %s", pid, e)
     return killed
 
+
 # ══════════════════════════════════════════════════════
 # mitmdump 底层封装
 # ══════════════════════════════════════════════════════
@@ -850,7 +928,6 @@ def build_mitm_cmd() -> list[str] | None:
     return [sys.executable, "-m", "mitmproxy.tools.main", "dump"] + args
 
 
-# 白名单：只有命中这些关键字的行才进 log
 _KEEP_RE = re.compile(
     r"\[TOKEN\]"
     r"|listening at|Proxy server"
@@ -859,7 +936,6 @@ _KEEP_RE = re.compile(
     r"|Traceback|Exception"
 )
 
-# 黑名单：即便命中白名单，也要丢弃的行（噪音）
 _DROP_RE = re.compile(
     r"TLS handshake failed"
     r"|Client TLS"
@@ -869,8 +945,6 @@ _DROP_RE = re.compile(
 
 
 def _decode_mitm(raw: bytes) -> str:
-    """mitmdump 子进程在 Windows 上默认用 cp936(GBK) 写 stdout，
-    这里按 UTF-8 → GBK → 兜底 的顺序解码，避免中文变问号。"""
     for enc in ("utf-8", "gbk"):
         try:
             return raw.decode(enc)
@@ -887,9 +961,9 @@ def _mitm_reader(pipe) -> None:
             txt = _decode_mitm(raw).rstrip()
             if not txt:
                 continue
-            if _DROP_RE.search(txt):        # 先杀噪音
+            if _DROP_RE.search(txt):
                 continue
-            if _KEEP_RE.search(txt):        # 再走白名单
+            if _KEEP_RE.search(txt):
                 log.info("[mitm] %s", txt)
     except Exception as e:
         log.warning("[mitm] reader 异常: %s", e)
