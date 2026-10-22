@@ -44,13 +44,17 @@ class Tuning:
     auth_refresh_timeout:     float = 4.0
     token_refresh_lead_sec:   int   = 120
     auto_query_batch_timeout: float = 2.0
-    vid_timeout:              float = 2.0
-    vid_max_age:              float = 40.0
-    vid_pool_size:            int   = 4       # 4 个独立 worker
-    vid_pool_stagger:         float = 0.5     # 启动错峰（worker i 延迟 i*stagger）
+
+    # ── VID ──
+    vid_timeout:              float = 2.0     # 单次 generate/check 超时
+    vid_max_age:              float = 40.0    # VID 有效期（覆盖 30s 提前量）
+    vid_pool_size:            int   = 4       # worker 数量
+    vid_pool_stagger:         float = 0.5     # worker i 延迟 i*stagger 启动
     vid_pool_interval_min:    float = 0.0     # 每次申请后随机间隔下限
     vid_pool_interval_max:    float = 6.0     # 每次申请后随机间隔上限
-    vid_pool_lead_sec:        int   = 30      # 提前多少秒启动 VID 池
+    vid_pool_lead_sec:        int   = 30      # 自动模式提前多少秒启动 VID 池
+
+    # ── mitm ──
     mitm_startup_timeout:     float = 12.0
     mitm_shutdown_grace:      float = 3.0
 
@@ -254,17 +258,7 @@ class Engine:
 
     def _load_tuning(self):
         self.tuning = Tuning()
-        raw = self.config_data.get("tuning", {}) or {}
-        for k, v in raw.items():
-            if not hasattr(self.tuning, k):
-                log.warning("config.toml [tuning] 未知字段: %s", k)
-                continue
-            cur = getattr(self.tuning, k)
-            try:
-                setattr(self.tuning, k, type(cur)(v))
-            except (TypeError, ValueError) as e:
-                log.warning("config.toml [tuning].%s 值无效: %r (%s)", k, v, e)
-
+        
     def public_config(self) -> dict:
         tok = self.token or ""
         a = self.config_data.get("auto", {}) or {}
