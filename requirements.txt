@@ -6,5 +6,9 @@ numpy
 pillow
 opencv-python
 httpx
-mitmproxy
-pywin32
+curl_cffi
+tomli; python_version < "3.11"
+
+# 仅 Windows（窗口操作 + token 抓取）
+pywin32; sys_platform == "win32"
+mitmproxy; sys_platform == "win32"
