@@ -836,7 +836,7 @@ class Engine:
     # ══════════════════════════════════════════════════
     # 全自动流程
     # ══════════════════════════════════════════════════
-    AUTO_COURT_ORDER = (5, 6)
+    AUTO_COURT_ORDER = (3, 4, 10)
 
     def auto_state(self) -> dict:
         s = self.auto
@@ -920,7 +920,7 @@ class Engine:
             slot_start = a.get("slot_start", "19:30")
             slot_end   = a.get("slot_end",   "21:30")
             refresh_at = a.get("refresh_at", "20:00:02")
-            refresh_dt = self._parse_hms(refresh_at) + timedelta(milliseconds=200)
+            refresh_dt = self._parse_hms(refresh_at) + timedelta(milliseconds=50)
 
             # ── ① Token 自动刷新 ──
             if datetime.now() < refresh_dt:
