@@ -22,10 +22,12 @@ from utils import (
     CONFIG_PATH,
     MITM_HOST, MITM_PORT, MITM_UPSTREAM,
     read_config_dict, write_config_string, write_config_int,
+    write_config_string_renamed, write_config_int_list,
     get_vid_once, get_order_once, save_order_once,
     refresh_window,
     classify_order_reply,
     port_listening, kill_port_holder, spawn_mitmdump,
+    close_cffi_session,
 )
 
 
@@ -43,16 +45,15 @@ class Tuning:
     probe_max_tries:          int   = 6
     auth_refresh_timeout:     float = 4.0
     token_refresh_lead_sec:   int   = 120
-    auto_query_batch_timeout: float = 2.0
 
     # ── VID ──
-    vid_timeout:              float = 2.0     # 单次 generate/check 超时
-    vid_max_age:              float = 7.9    # VID 有效期（覆盖 30s 提前量）
-    vid_pool_size:            int   = 4       # worker 数量
-    vid_pool_stagger:         float = 1.0     # worker i 延迟 i*stagger 启动
-    vid_pool_interval_min:    float = 3.0     # 每次申请后随机间隔下限
-    vid_pool_interval_max:    float = 5.0     # 每次申请后随机间隔上限
-    vid_pool_lead_sec:        int   = 30      # 自动模式提前多少秒启动 VID 池
+    vid_timeout:              float = 2.0
+    vid_max_age:              float = 7.9
+    vid_pool_size:            int   = 4
+    vid_pool_stagger:         float = 1.0
+    vid_pool_interval_min:    float = 3.0
+    vid_pool_interval_max:    float = 5.0
+    vid_pool_lead_sec:        int   = 30
 
     # ── mitm ──
     mitm_startup_timeout:     float = 12.0
@@ -151,7 +152,6 @@ def get_logs(since: int = 0):
 # Engine
 # ══════════════════════════════════════════════════════
 class Engine:
-    # worker i 用 IMPERSONATE_ROTATION[i] —— 4 个 worker 覆盖 4 个不同指纹
     IMPERSONATE_ROTATION = (
         "chrome", "safari17_0", "firefox133",
         "edge101", "safari15_5", "chrome124",
@@ -176,12 +176,12 @@ class Engine:
         # ── session ──
         self.token = ""
         self.offset_days = 1
+        self.auto_court_order: list[int] = [3, 4, 10]
 
         # ── runtime ──
         self.bus = EventBus()
         self.auto = AutoState()
 
-        # 队列：4 worker × 4 批缓冲
         self._vid_queue: asyncio.Queue = asyncio.Queue(maxsize=4)
         self._vid_tasks: list[asyncio.Task] = []
         self._vid_stats: deque = deque(maxlen=30)
@@ -190,6 +190,7 @@ class Engine:
         self._refresh_tasks: list[asyncio.Task] = []
 
         self._auto_task: asyncio.Task | None = None
+        self._auto_warmup_task: asyncio.Task | None = None
 
         self._reserve_inflight: set = set()
         self._solve_sem = asyncio.Semaphore(3)
@@ -253,12 +254,22 @@ class Engine:
             self.offset_days = 1
         self.offset_days = max(0, min(2, self.offset_days))
 
+        a = data.get("auto", {}) or {}
+        co = a.get("court_order", [3, 4, 10])
+        if isinstance(co, (list, tuple)):
+            try:
+                self.auto_court_order = [int(x) for x in co if int(x) > 0]
+            except (TypeError, ValueError):
+                self.auto_court_order = [3, 4, 10]
+        else:
+            self.auto_court_order = [3, 4, 10]
+
         self._load_tuning()
         return True
 
     def _load_tuning(self):
         self.tuning = Tuning()
-        
+
     def public_config(self) -> dict:
         tok = self.token or ""
         a = self.config_data.get("auto", {}) or {}
@@ -275,8 +286,8 @@ class Engine:
             "auto": {
                 "slot_start": a.get("slot_start", "19:30"),
                 "slot_end":   a.get("slot_end", "21:30"),
-                "refresh_at": a.get("refresh_at", "20:00:04"),
-                "order_time_gate": bool(a.get("order_time_gate", False)), "pair_order": bool(a.get("pair_order", True)),
+                "save_order_at": a.get("save_order_at") or a.get("refresh_at", "20:00:04"),
+                "court_order": list(self.auto_court_order),
             },
         }
 
@@ -289,16 +300,14 @@ class Engine:
         if token:
             write_config_string("token", token)
 
-    def update_auto_config(self, slot_start: str, slot_end: str,
-                           refresh_at: str, order_time_gate: bool = False, pair_order: bool = True) -> None:
+    async def update_auto_config(self, slot_start: str, slot_end: str,
+                                 save_order_at: str,
+                                 court_order: list[int] | None = None) -> None:
         write_config_string("slot_start", slot_start.strip())
         write_config_string("slot_end",   slot_end.strip())
-        write_config_string("refresh_at", refresh_at.strip())
-        text = CONFIG_PATH.read_text(encoding="utf-8")
-        if "order_time_gate =" not in text:
-            CONFIG_PATH.write_text(text.replace("[auto]", "[auto]\norder_time_gate = 0", 1), encoding="utf-8")
-        write_config_int("order_time_gate", int(order_time_gate))
-        write_config_int("pair_order", int(pair_order)) if "pair_order =" in (pair_cfg := CONFIG_PATH.read_text(encoding="utf-8")) else CONFIG_PATH.write_text(pair_cfg.replace("[auto]", f"[auto]\npair_order = {int(pair_order)}", 1), encoding="utf-8")
+        write_config_string_renamed("save_order_at", "refresh_at", save_order_at.strip())
+        if court_order is not None:
+            write_config_int_list("court_order", court_order)
 
     async def apply_config_change(self):
         self.reload_config(force=True)
@@ -324,6 +333,7 @@ class Engine:
         await self.stop_vid_pool()
         await self.stop_refresh()
         await self.stop_auto()
+        await close_cffi_session()
         self._kill_mitm()
 
     async def _watch_config(self, poll: float = 1.0):
@@ -482,10 +492,7 @@ class Engine:
             ok = await self._ensure_mitm()
             if not ok:
                 log.error("❌ mitmdump 未就绪")
-                return {
-                    "ok": False,
-                    "msg": "mitmdump 未就绪，请查看日志",
-                }
+                return {"ok": False, "msg": "mitmdump 未就绪，请查看日志"}
 
             log.info("🪟 触发预约窗口刷新（Ctrl+R）…")
             ok = await asyncio.to_thread(
@@ -507,7 +514,7 @@ class Engine:
             self._token_fetch_busy = False
 
     # ══════════════════════════════════════════════════
-    # VID 池（4 个独立 worker 并发申请，成功后随机间隔 0-6s）
+    # VID 池
     # ══════════════════════════════════════════════════
     @property
     def vid_running(self) -> bool:
@@ -562,12 +569,6 @@ class Engine:
 
     async def _vid_worker(self, tid: int, initial_delay: float,
                           interval_min: float, interval_max: float):
-        """单个 VID worker：
-           * 错峰启动（worker i 延迟 i*stagger）
-           * 成功后 put 到 queue，再 sleep random(interval_min, interval_max)
-           * 失败也 sleep random(interval_min, interval_max) 后重试
-           * 每个 worker 固定绑定一个指纹（不同 worker 不同指纹）
-        """
         impersonate = self.IMPERSONATE_ROTATION[(tid - 1) % len(self.IMPERSONATE_ROTATION)]
 
         if initial_delay > 0:
@@ -753,7 +754,7 @@ class Engine:
         await self.bus.publish("refresh.result", evt)
 
     # ══════════════════════════════════════════════════
-    # 手动下单（不拉起 VID 池）
+    # 手动下单
     # ══════════════════════════════════════════════════
     async def reserve(self, court_no: int, start: str, end: str) -> dict:
         if not self.token:
@@ -790,7 +791,8 @@ class Engine:
 
             if not vid:
                 async with self._solve_sem:
-                    vid, _ = await get_vid_once(timeout=self.tuning.vid_timeout,impersonate="chrome124")
+                    vid, _ = await get_vid_once(timeout=self.tuning.vid_timeout,
+                                                impersonate="chrome124")
 
             r = await self._save_order(vid, court, self.target_date,
                                        start, end, self.token)
@@ -836,8 +838,6 @@ class Engine:
     # ══════════════════════════════════════════════════
     # 全自动流程
     # ══════════════════════════════════════════════════
-    AUTO_COURT_ORDER = (3, 4, 10)
-
     def auto_state(self) -> dict:
         s = self.auto
         return {
@@ -852,6 +852,8 @@ class Engine:
             return {"ok": False, "msg": "未配置 token"}
         if self.auto.running:
             return {"ok": False, "msg": "自动模式已在运行"}
+        if not self.auto_court_order:
+            return {"ok": False, "msg": "未配置候选场地（court_order）"}
 
         a = self.config_data.get("auto", {}) or {}
 
@@ -865,9 +867,8 @@ class Engine:
             "date": self.target_date,
             "slot_start": a.get("slot_start", "19:30"),
             "slot_end":   a.get("slot_end",   "21:30"),
-            "refresh_at": a.get("refresh_at", "20:00:04"),
-            "court_order": list(self.AUTO_COURT_ORDER),
-            "query_batch_timeout": max(0.2, float(self.tuning.auto_query_batch_timeout)),
+            "save_order_at": a.get("save_order_at") or a.get("refresh_at", "20:00:04"),
+            "court_order": list(self.auto_court_order),
         }
         self._auto_task = asyncio.create_task(self._auto_loop())
         return {"ok": True}
@@ -879,10 +880,34 @@ class Engine:
                 await self._auto_task
             except asyncio.CancelledError:
                 pass
+        if self._auto_warmup_task and not self._auto_warmup_task.done():
+            self._auto_warmup_task.cancel()
+            try:
+                await self._auto_warmup_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        self._auto_warmup_task = None
         self.auto.running = False
         self.auto.phase = "stopped"
         self.auto.msg = "已手动停止"
         self.auto.finished_at = datetime.now().strftime("%H:%M:%S")
+
+    async def _warmup_get_order(self):
+        """下单前预热 curl_cffi 连接：查当天 6 号场，不等结果，失败/超时忽略。
+        走 get_cffi_session() 全局池，连接留在池里，2s 后 saveOrder 复用同一条 TCP+TLS+H2。
+        """
+        court = self.court_by_no.get(6) or (self.courts[0] if self.courts else None)
+        if not court:
+            return
+        today = datetime.now().strftime("%Y-%m-%d")
+        try:
+            log.info("自动模式: 预热连接 → getOrderOnce %s @ %s", court.name, today)
+            await get_order_once(court, today, self.token, self.user_id, timeout=1.5)
+            log.info("自动模式: 预热完成 %s", court.name)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.info("自动模式: 预热异常（忽略）: %s", e)
 
     async def _try_auto_order(self, court, start, end):
         try:
@@ -891,7 +916,8 @@ class Engine:
                 async with self._solve_sem:
                     vid, _ = await get_vid_once(timeout=self.tuning.vid_timeout)
             r = await self._save_order(vid, court, self.target_date, start, end, self.token)
-        except Exception as e: r = {"success": False, "msg": f"下单异常: {type(e).__name__}: {e}"}
+        except Exception as e:
+            r = {"success": False, "msg": f"下单异常: {type(e).__name__}: {e}"}
         await self._publish_order_result(court, r)
         return bool(r.get("success")), str(r.get("msg", "") or "")
 
@@ -919,13 +945,13 @@ class Engine:
             a = self.config_data.get("auto", {}) or {}
             slot_start = a.get("slot_start", "19:30")
             slot_end   = a.get("slot_end",   "21:30")
-            refresh_at = a.get("refresh_at", "20:00:02")
-            refresh_dt = self._parse_hms(refresh_at) + timedelta(milliseconds=50)
+            save_order_at = a.get("save_order_at") or a.get("refresh_at", "20:00:02")
+            save_dt = self._parse_hms(save_order_at) + timedelta(milliseconds=50)
 
             # ── ① Token 自动刷新 ──
-            if datetime.now() < refresh_dt:
+            if datetime.now() < save_dt:
                 lead = max(0, int(self.tuning.token_refresh_lead_sec))
-                tr_dt = refresh_dt - timedelta(seconds=lead)
+                tr_dt = save_dt - timedelta(seconds=lead)
                 if datetime.now() < tr_dt:
                     self.auto.phase = "waiting_token"
                     self.auto.msg = (f"等待自动刷新 Token"
@@ -954,7 +980,7 @@ class Engine:
             # ── ② 提前 30s 启动 VID 池，让整点零新建连接 ──
             if not self.vid_running:
                 lead_sec = max(1, int(self.tuning.vid_pool_lead_sec))
-                vid_dt = refresh_dt - timedelta(seconds=lead_sec)
+                vid_dt = save_dt - timedelta(seconds=lead_sec)
                 if datetime.now() < vid_dt:
                     self.auto.msg = f"等待启动 VID（{vid_dt.strftime('%H:%M:%S')}）"
                     log.info("自动模式: 等待 %s 启动 VID（提前 %ds）",
@@ -965,11 +991,24 @@ class Engine:
             else:
                 log.info("自动模式: VID 池已在运行，跳过启动")
 
-            # ── ③ 等到触发时间 ──
+            # ── ③ 触发前 2s 预热连接（不等待返回）──
+            warmup_dt = save_dt - timedelta(seconds=2)
+            if datetime.now() < warmup_dt:
+                await self._sleep_until(warmup_dt)
+            self.auto.phase = "warmup"
+            self.auto.msg = "预热连接中…"
+            if self._auto_warmup_task and not self._auto_warmup_task.done():
+                self._auto_warmup_task.cancel()
+            self._auto_warmup_task = asyncio.create_task(self._warmup_get_order())
+
+            # ── ④ 等到 Save Order At ──
             self.auto.phase = "waiting"
-            self.auto.msg = f"等待 {refresh_at}"
-            log.info("自动模式: 等待触发 %s", refresh_dt.strftime("%H:%M:%S.%f")[:-3])
-            await self._sleep_until(refresh_dt)
+            self.auto.msg = f"等待 {save_order_at}"
+            log.info("自动模式: 等待触发 %s", save_dt.strftime("%H:%M:%S.%f")[:-3])
+            await self._sleep_until(save_dt - timedelta(seconds=1))
+            if self.vid_running:
+                await self.stop_vid_pool()
+            await self._sleep_until(save_dt)
 
             # 抢场前重新读取最新配置，支持中途修改
             a2 = self.config_data.get("auto", {}) or {}
@@ -980,14 +1019,9 @@ class Engine:
                         a.get("slot_start"), a.get("slot_end"),
                         slot_start, slot_end)
 
-            if a2.get("order_time_gate", False):
-                await self._sleep_until(
-                    datetime.now().replace(hour=20, minute=0, second=4, microsecond=600000)
-                )
-
-            # ── ④ 并发抢 5、6 号场 ──
+            # ── ⑤ 并发抢候选场 ──
             courts_to_grab: list[Court] = []
-            for court_no in self.AUTO_COURT_ORDER:
+            for court_no in self.auto_court_order:
                 c = self.court_by_no.get(court_no)
                 if c:
                     courts_to_grab.append(c)

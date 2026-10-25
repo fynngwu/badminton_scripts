@@ -74,15 +74,16 @@ async def set_config(d: ConfigIn):
 class AutoConfigIn(BaseModel):
     slot_start: str
     slot_end: str
-    refresh_at: str
-    order_time_gate: bool = False
-    pair_order: bool = True
+    save_order_at: str
+    court_order: list[int] | None = None
 
 
 @app.post("/api/auto/config")
 async def set_auto_config(d: AutoConfigIn):
     try:
-        engine.update_auto_config(d.slot_start, d.slot_end, d.refresh_at, d.order_time_gate, d.pair_order)
+        await engine.update_auto_config(
+            d.slot_start, d.slot_end, d.save_order_at, d.court_order,
+        )
     except Exception as e:
         return {"ok": False, "msg": str(e)}
     await engine.apply_config_change()

@@ -4,15 +4,13 @@
     Engine 决定何时调用、调几次、调用后状态怎么变。
 
 依赖：
-    pip install pywin32 httpx[socks] curl_cffi opencv-python-headless pillow numpy
+    pip install pywin32 curl_cffi opencv-python-headless pillow numpy
 """
 from __future__ import annotations
 
 import asyncio
 import base64
 import io
-import json
-import itertools
 import logging
 import os
 import re
@@ -29,11 +27,9 @@ from datetime import datetime
 from pathlib import Path
 
 import cv2
-import httpx
 import numpy as np
 from PIL import Image
 from curl_cffi import requests as curl_requests
-from curl_cffi import CurlHttpVersion
 
 try:
     import tomllib
@@ -63,14 +59,7 @@ MITM_UPSTREAM = os.environ.get("MITM_UPSTREAM", "").strip()
 RESERVATION_HOST = "reservation.sustech.edu.cn"
 WINDOW_KEYWORDS  = ("reservation.sustech.edu.cn", "reservation")
 
-HEADERS = {
-    "Accept": "application/json, text/plain, */*",
-    "Content-Type": "application/json;charset=UTF-8",
-    "Origin": BASE_URL,
-    "Referer": BASE_URL + "/",
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
-}
+
 
 
 @dataclass(frozen=True)
@@ -106,88 +95,70 @@ def write_config_int(key: str, value: int, path: Path = CONFIG_PATH) -> None:
     path.write_text(new_text, encoding="utf-8")
 
 
+def write_config_string_renamed(key: str, old_key: str, value: str,
+                                path: Path = CONFIG_PATH) -> None:
+    """写字符串字段；若新字段不存在，把旧字段整行改名为新字段再写。"""
+    text = path.read_text(encoding="utf-8")
+    pattern = rf'(?m)^(\s*{re.escape(key)}\s*=\s*)"[^"]*"'
+    new_text, n = re.subn(pattern, rf'\1"{value}"', text, count=1)
+    if n:
+        path.write_text(new_text, encoding="utf-8")
+        return
+    pattern_old = rf'(?m)^(\s*){re.escape(old_key)}(\s*=\s*)"[^"]*"'
+    new_text, n = re.subn(pattern_old, rf'\1{key}\2"{value}"', text, count=1)
+    if n:
+        path.write_text(new_text, encoding="utf-8")
+        return
+    raise RuntimeError(f"config.toml 未找到字段 {key!r} 或 {old_key!r}")
+
+
+def write_config_int_list(key: str, values: list[int],
+                          path: Path = CONFIG_PATH) -> None:
+    """写整型数组字段；若字段不存在，插到 [auto] 段首。"""
+    text = path.read_text(encoding="utf-8")
+    arr = "[" + ", ".join(str(int(v)) for v in values) + "]"
+    pattern = rf'(?m)^(\s*{re.escape(key)}\s*=\s*)\[[^\]]*\]'
+    new_text, n = re.subn(pattern, rf'\g<1>{arr}', text, count=1)
+    if n == 0:
+        m = re.search(r'(?m)^\[auto\][^\n]*$', text)
+        if not m:
+            raise RuntimeError("config.toml 未找到 [auto] 段，无法写入 court_order")
+        new_text = text[:m.end()] + f"\n{key} = {arr}" + text[m.end():]
+    path.write_text(new_text, encoding="utf-8")
+
+
 # ══════════════════════════════════════════════════════
-# HTTP 客户端（进程内单例，用于订单/查询接口，带审计）
+# HTTP 客户端（curl_cffi AsyncSession 全局单例）
+#
+#   * 默认 HTTP/2（curl_cffi 文档明确）
+#   * impersonate="chrome"：与 VID 池 worker-1 同源指纹
+#   * 全局单例 → getOrder / saveOrder 复用同一条 TCP+TLS+H2 连接
 # ══════════════════════════════════════════════════════
-_client: httpx.AsyncClient | None = None
-_http_seq = itertools.count(1)
-_http_lock = threading.Lock()
-_SECRET_KEYS = ("token", "authorization", "cookie", "password", "secret", "tel",
-                "phone", "email", "customername", "customerid", "userid", "code")
+_cffi_session: curl_requests.AsyncSession | None = None
 
 
-def _safe_http(value):
-    """保留 HAR 风格结构，但不落盘凭据、身份信息或验证码图像。"""
-    if isinstance(value, dict):
-        return {k: ("[REDACTED]" if any(x in k.lower() for x in _SECRET_KEYS)
-                    or k.lower() in ("backgroundimage", "templateimage", "tracklist", "id")
-                    else _safe_http(v)) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_safe_http(v) for v in value[:100]]
-    if isinstance(value, str):
-        return value[:2000] + ("...[TRUNCATED]" if len(value) > 2000 else "")
-    return value
+def get_cffi_session() -> curl_requests.AsyncSession:
+    global _cffi_session
+    if _cffi_session is None:
+        _cffi_session = curl_requests.AsyncSession(
+            impersonate="chrome",
+            timeout=6.0,
+            max_clients=20,
+        )
+    return _cffi_session
 
 
-def _http_body(raw: bytes):
-    if not raw:
-        return None
-    try:
-        return _safe_http(json.loads(raw))
-    except (ValueError, UnicodeError):
-        return "[NON_JSON_BODY_REDACTED]"
+async def close_cffi_session() -> None:
+    global _cffi_session
+    if _cffi_session is not None:
+        try:
+            await _cffi_session.close()
+        except Exception:
+            pass
+        _cffi_session = None
 
 
-async def _http_request_hook(request: httpx.Request):
-    request.extensions["audit_id"] = next(_http_seq)
-    request.extensions["audit_start"] = time.perf_counter()
-    request.extensions["audit_wall"] = datetime.now().astimezone().isoformat(timespec="milliseconds")
-    request.extensions["audit_request"] = {
-        "method": request.method, "url": str(request.url.copy_with(query=None)),
-        "query": _safe_http(dict(request.url.params)),
-        "headers": _safe_http(dict(request.headers)),
-        "body": _http_body(request.content),
-    }
-    log.info("[HTTP #%s] → %s %s @ %s", request.extensions["audit_id"],
-             request.method, request.url.path, request.extensions["audit_wall"])
-
-
-async def _http_response_hook(response: httpx.Response):
-    req = response.request
-    await response.aread()
-    elapsed = round((time.perf_counter() - req.extensions["audit_start"]) * 1000, 2)
-    body = _http_body(response.content)
-    entry = {
-        "id": req.extensions["audit_id"], "startedDateTime": req.extensions["audit_wall"],
-        "time_ms": elapsed, "request": req.extensions["audit_request"],
-        "response": {"status": response.status_code, "httpVersion": response.http_version,
-                     "headers": _safe_http(dict(response.headers)), "body": body,
-                     "bodyBytes": len(response.content)},
-    }
-    folder = ROOT / "logs"
-    folder.mkdir(exist_ok=True)
-    try:
-        with _http_lock:
-            with (folder / "http_trace.jsonl").open("a", encoding="utf-8") as f:
-                f.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
-    except OSError as exc:
-        log.warning("[HTTP审计] 写入失败: %s", exc)
-    info = body if isinstance(body, dict) else {}
-    log.info("[HTTP #%s] ← %s %s HTTP %s %.2fms code=%s success=%s msg=%s (详情: logs/http_trace.jsonl)",
-             entry["id"], req.method, req.url.path, response.status_code, elapsed,
-             info.get("code"), info.get("success"), str(info.get("msg", ""))[:250])
-
-
-def get_client() -> httpx.AsyncClient:
-    global _client
-    if _client is None:
-        _client = httpx.AsyncClient(headers=HEADERS, timeout=6.0, trust_env=False,
-                                    event_hooks={"request": [_http_request_hook],
-                                                 "response": [_http_response_hook]})
-    return _client
-
-
-_get_starts = deque()
+_get_starts: deque = deque()
 _get_lock = asyncio.Lock()
 
 
@@ -210,7 +181,7 @@ async def limited_get(url, *, court_name="", **kwargs):
     start = time.monotonic()
     log.debug("[GET %s] → 发送 @ %s", tag, sent)
     try:
-        r = await get_client().get(url, **kwargs)
+        r = await get_cffi_session().get(url, **kwargs)
         info = ""
         try:
             j = r.json()
@@ -225,10 +196,12 @@ async def limited_get(url, *, court_name="", **kwargs):
             info = "non-json/字段异常"
         log.debug("[GET %s] ← 返回 @ %s (+%.0fms) HTTP %d %s",
                  tag, datetime.now().strftime("%H:%M:%S.%f")[:-3],
-                 (time.monotonic()-start)*1000, r.status_code, info)
+                 (time.monotonic() - start) * 1000, r.status_code, info)
         return r
     except Exception as e:
-        log.warning("[GET %s] ✗ 异常 @ %s (+%.0fms): %s", name, datetime.now().strftime("%H:%M:%S.%f")[:-3], (time.monotonic()-start)*1000, e)
+        log.warning("[GET %s] ✗ 异常 @ %s (+%.0fms): %s",
+                    name, datetime.now().strftime("%H:%M:%S.%f")[:-3],
+                    (time.monotonic() - start) * 1000, e)
         raise
 
 
@@ -280,7 +253,7 @@ def slot_covers(avail: dict, start: str, end: str) -> bool:
 
 
 # ══════════════════════════════════════════════════════
-# 验证码 ROTATE 求解（curl_cffi 指纹 + HTTP/1.1）
+# 验证码 ROTATE 求解（curl_cffi，默认 HTTP/2）
 # ══════════════════════════════════════════════════════
 _DB = np.load(ROOT / "fast_db.npz", allow_pickle=False)
 _BG_DESCS    = _DB["bg_descs"]
@@ -301,8 +274,6 @@ class _CaptchaSolver:
 
     async def solve(self) -> str:
         t0 = time.perf_counter()
-        # 整次 generate+check 复用同一个 session → 同一指纹
-        # http_version=v1_1：避免 HTTP/2 RST_STREAM 静默掐断，限流时能看到明确的 429/503
         session = curl_requests.AsyncSession(
             impersonate=self.impersonate,
             timeout=self.timeout,
@@ -312,11 +283,10 @@ class _CaptchaSolver:
             t1 = time.perf_counter()
 
             start, mono = datetime.now(), time.monotonic()
-            move_x = await __import__("asyncio").to_thread(self._recognize, cap)
+            move_x = await asyncio.to_thread(self._recognize, cap)
             t2 = time.perf_counter()
 
-            track = await __import__("asyncio").to_thread(
-                self._make_track_sync, move_x, mono)
+            track = await asyncio.to_thread(self._make_track_sync, move_x, mono)
             t3 = time.perf_counter()
 
             stop = datetime.now()
@@ -464,7 +434,7 @@ async def get_vid_once(timeout: float = 2.0,
 
 
 # ══════════════════════════════════════════════════════
-# 预约 API
+# 预约 API（走 cffi 全局 session，HTTP/2 + 连接复用）
 # ══════════════════════════════════════════════════════
 async def get_order_once(court: Court, date: str, token: str, user_id: str,
                          timeout: float = 4.0) -> dict:
@@ -542,7 +512,7 @@ async def save_order_once(
     log.info("→ 下单 %s 发送 @ %s (vid=%s…)", court.name, send_hms, vid[:8])
 
     try:
-        r = await get_client().post(
+        r = await get_cffi_session().post(
             URL_SAVE, params={"userid": user_id, "token": token},
             json=payload, timeout=6.0,
         )
@@ -774,6 +744,8 @@ def refresh_window(
 # ══════════════════════════════════════════════════════
 _last_token_seen = ""
 _last_token_seen_at = 0.0
+
+
 def capture_token_from_flow(
     flow,
     host: str = RESERVATION_HOST,
@@ -792,7 +764,6 @@ def capture_token_from_flow(
         return
 
     now = time.monotonic()
-
     if token == _last_token_seen and now - _last_token_seen_at < 1.0:
         return
 
@@ -801,39 +772,26 @@ def capture_token_from_flow(
 
     try:
         text = config_path.read_text(encoding="utf-8")
-
-        m = re.search(
-            r'(?m)^\s*token\s*=\s*"([^"]*)"',
-            text,
-        )
+        m = re.search(r'(?m)^\s*token\s*=\s*"([^"]*)"', text)
         current = m.group(1) if m else ""
 
         path = flow.request.path.split("?", 1)[0]
         ts = time.strftime("%H:%M:%S")
 
         if token == current:
-            print(
-                f"[{ts}] [TOKEN] 捕获成功 SAME "
-                f"{token[:8]}... {path}"
-            )
+            print(f"[{ts}] [TOKEN] 捕获成功 SAME {token[:8]}... {path}")
             return
 
         new, n = re.subn(
             r'(?m)^(\s*token\s*=\s*)"[^"]*"',
             rf'\1"{token}"',
-            text,
-            count=1,
+            text, count=1,
         )
-
         if n:
             config_path.write_text(new, encoding="utf-8")
-            print(
-                f"[{ts}] [TOKEN] 更新成功 "
-                f"{current[:8]}... -> {token[:8]}..."
-            )
+            print(f"[{ts}] [TOKEN] 更新成功 {current[:8]}... -> {token[:8]}...")
         else:
             print("[TOKEN] config.toml 未找到 token 字段")
-
     except Exception as e:
         print(f"[TOKEN] 写入失败: {e}")
 

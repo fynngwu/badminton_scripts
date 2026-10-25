@@ -163,6 +163,21 @@ button:disabled {
 ::-webkit-scrollbar-thumb:hover { background: #3c4552; background-clip: content-box; }
 #vid-count, #cur-date { color: var(--text); font-weight: 600; }
 
+/* ── 候选场地选择器 ── */
+.court-pick {
+  padding: 9px 16px; border-radius: 8px; font-size: 13px; cursor: pointer;
+  text-align: center; min-width: 66px; user-select: none;
+  border: 1px solid var(--border); background: var(--bg-input); color: var(--text-mute);
+  transition: background .15s, border-color .15s, color .15s, box-shadow .15s, filter .15s;
+}
+.court-pick:hover { border-color: var(--border-strong); color: var(--text-dim); }
+.court-pick.on {
+  background: linear-gradient(180deg, #3588f8, #1f6feb); color: #fff;
+  border-color: rgba(255,255,255,.10);
+  box-shadow: 0 1px 2px rgba(0,0,0,.45), 0 6px 16px -8px rgba(47,129,247,.7);
+}
+.court-pick.on:hover { filter: brightness(1.1); }
+
 #toast{
   position: fixed; top: 18px; right: 18px; z-index: 999;
   display: flex; flex-direction: column; gap: 8px; pointer-events: none;
@@ -206,16 +221,30 @@ button:disabled {
   <span class="mini" id="last-solve">最近 solve：-</span>
 </div>
 
-<div class="card row">
-  <label style="font-weight:700;">全自动</label>
-  <label>时段</label>
-  <select id="auto-ss"></select>
-  <span style="color:#a371f7;">—</span>
-  <select id="auto-se"></select>
-  <label>触发</label><input id="auto-rt" style="width:85px">
-  <label><input type="checkbox" id="auto-gate"> 下单门槛 20:00:04.600</label>
-  <label><input type="checkbox" id="auto-pair" checked onchange="saveAutoPlan()"> 双场并发下单（关闭则单场串行）</label>
-  <button class="auto" id="btn-auto">启动全自动</button>
+<div class="card">
+  <div class="row" style="margin-bottom:10px;">
+    <label style="font-weight:700;">全自动</label>
+    <label>时段</label>
+    <select id="auto-ss"></select>
+    <span style="color:#a371f7;">—</span>
+    <select id="auto-se"></select>
+    <label>Save Order At</label>
+    <input id="auto-rt" style="width:105px" placeholder="20:00:05">
+    <button class="auto" id="btn-auto">启动全自动</button>
+  </div>
+  <div class="mini" style="margin:4px 0 8px;">
+    候选场地（点击点亮 / 熄灭；启动全自动时写入 config，并作为并发抢场目标）
+  </div>
+  <div id="court-picker" class="grid"></div>
+</div>
+
+<div class="card" style="padding:10px 16px;">
+  <div class="mini" style="display:flex;gap:18px;flex-wrap:wrap;line-height:1.9;">
+    <span>📅 目标日期 <b id="p-date">-</b></span>
+    <span>⏰ 时段 <b id="p-slot">-</b></span>
+    <span>🚀 Save Order At <b id="p-refresh">-</b></span>
+    <span>🏸 候选场 <b id="p-courts">-</b></span>
+  </div>
 </div>
 
 <div class="card" id="auto-status" style="display:none">
@@ -245,6 +274,10 @@ button:disabled {
 
 <script>
 const $ = id => document.getElementById(id);
+
+// ── 全局状态 ──
+let pickedCourts = new Set();
+let allCourtNos = [];
 
 function toast(msg, kind="ok", ms=3200) {
   const box = $("toast");
@@ -358,7 +391,6 @@ function groupByName(spans) {
     a.name.localeCompare(b.name, "zh-Hans-CN"));
 }
 
-// 可抢场地：时长优先 → 同长按起始时间倒序 → 场地号升序
 function renderFree() {
   const box = $("free");
   const starts = Object.keys(freeByStart);
@@ -551,7 +583,28 @@ async function pollLogs() {
   } catch {}
 }
 
-// 从 config.toml 派生的配置同步到 UI（auto 段必填，缺失即报错）
+// ── 候选场地选择器 ──
+function renderCourtPicker() {
+  const box = $("court-picker");
+  box.innerHTML = "";
+  if (!allCourtNos.length) {
+    box.innerHTML = `<div class="hint">未从 config 读取到场地</div>`;
+    return;
+  }
+  for (const no of allCourtNos) {
+    const el = document.createElement("div");
+    el.className = "court-pick" + (pickedCourts.has(no) ? " on" : "");
+    el.textContent = `${no}号场`;
+    el.addEventListener("click", () => {
+      if (pickedCourts.has(no)) pickedCourts.delete(no);
+      else pickedCourts.add(no);
+      el.classList.toggle("on");
+    });
+    box.appendChild(el);
+  }
+}
+
+// 从 config.toml 派生的配置同步到 UI
 function applyConfig(cfg) {
   const o = cfg.order || {};
   const sel = $("date-offset");
@@ -567,8 +620,19 @@ function applyConfig(cfg) {
   const a = cfg.auto;
   $("auto-ss").value = a.slot_start;
   $("auto-se").value = a.slot_end;
-  $("auto-rt").value = a.refresh_at;
-  $("auto-gate").checked = !!a.order_time_gate; $("auto-pair").checked = a.pair_order !== false;
+  $("auto-rt").value = a.save_order_at;
+
+  // 候选场：由 config + 场地清单驱动
+  const courtsCfg = cfg.courts || {};
+  allCourtNos = Object.keys(courtsCfg).map(Number).sort((x, y) => x - y);
+  pickedCourts = new Set((a.court_order || []).map(Number));
+  renderCourtPicker();
+
+  // 只读参数展示
+  if (o.target_date) $("p-date").textContent = o.target_date;
+  $("p-slot").textContent = `${a.slot_start} - ${a.slot_end}`;
+  $("p-refresh").textContent = a.save_order_at;
+  $("p-courts").textContent = (a.court_order || []).join(", ") || "未配置";
 }
 
 async function loadConfig() {
@@ -619,14 +683,18 @@ async function saveAutoPlan() {
     body: JSON.stringify({
       slot_start: $("auto-ss").value,
       slot_end:   $("auto-se").value,
-      refresh_at: $("auto-rt").value.trim(),
-      order_time_gate: $("auto-gate").checked, pair_order: $("auto-pair").checked,
+      save_order_at: $("auto-rt").value.trim(),
+      court_order: [...pickedCourts].sort((a, b) => a - b),
     }),
   });
   const j = await r.json();
-  if (!j.ok) toast("全自动参数保存失败：" + (j.msg || ""), "err", 3000);
+  if (!j.ok) {
+    toast("全自动参数保存失败：" + (j.msg || ""), "err", 3000);
+    return false;
+  }
+  return true;
 }
-["auto-ss", "auto-se", "auto-rt", "auto-gate"].forEach(id =>
+["auto-ss", "auto-se", "auto-rt"].forEach(id =>
   $(id).addEventListener("change", saveAutoPlan));
 
 // ── 日期切换：自动保存 ──
@@ -712,6 +780,12 @@ $("btn-auto").onclick = async () => {
     await fetch("/api/auto/stop", {method: "POST"});
     return;
   }
+  if (pickedCourts.size === 0) {
+    toast("请先点亮至少一个候选场地", "err");
+    return;
+  }
+  const ok = await saveAutoPlan();
+  if (!ok) return;
   const d = await (await fetch("/api/auto/start", {method: "POST"})).json();
   if (!d.ok) { toast(d.msg, "err"); return; }
   toast("全自动已启动", "ok");
