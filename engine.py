@@ -991,15 +991,6 @@ class Engine:
             else:
                 log.info("自动模式: VID 池已在运行，跳过启动")
 
-            # ── ③ 触发前 2s 预热连接（不等待返回）──
-            warmup_dt = save_dt - timedelta(seconds=2)
-            if datetime.now() < warmup_dt:
-                await self._sleep_until(warmup_dt)
-            self.auto.phase = "warmup"
-            self.auto.msg = "预热连接中…"
-            if self._auto_warmup_task and not self._auto_warmup_task.done():
-                self._auto_warmup_task.cancel()
-            self._auto_warmup_task = asyncio.create_task(self._warmup_get_order())
 
             # ── ④ 等到 Save Order At ──
             self.auto.phase = "waiting"
