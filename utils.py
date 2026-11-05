@@ -647,7 +647,11 @@ def refresh_window(
     fg_timeout: float = 0.6,
     double_click: bool = True,
 ) -> bool:
-    """找到 reservation 窗口 → 上前台 → 点击 → Ctrl+R。"""
+    """找到 reservation 窗口 → 上前台 → 点击 → Ctrl+R。
+
+    只有 Ctrl+R 确实发送到目标窗口时才返回 True；
+    找不到窗口 / 无法置前 / 前台不是目标窗口，均返回 False。
+    """
     global _cached_hwnd
 
     try:
@@ -713,14 +717,17 @@ def refresh_window(
         if post_click_delay > 0:
             time.sleep(post_click_delay)
 
+        # 发送 Ctrl+R 前，必须确认目标窗口在前台。
+        # 否则 win32api.keybd_event 的全局按键会落到别的窗口。
         if not _ensure_foreground(hwnd, timeout=0.4):
-            print("[refresh] ⚠ 发送 Ctrl+R 前窗口不在前台，仍尝试发送…")
-            if cx is not None and cy is not None:
-                try:
-                    _mouse_click(cx, cy)
-                    time.sleep(0.08)
-                except Exception:
-                    pass
+            print("[refresh] ❌ Ctrl+R 前窗口仍不在前台，放弃发送")
+            return False
+        try:
+            if win32gui.GetForegroundWindow() != hwnd:
+                print("[refresh] ❌ Ctrl+R 前前台窗口不是目标窗口，放弃发送")
+                return False
+        except Exception:
+            pass
 
         _send_ctrl_r()
         ok = True

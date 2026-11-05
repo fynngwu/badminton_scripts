@@ -45,6 +45,8 @@ class Tuning:
     probe_max_tries:          int   = 6
     auth_refresh_timeout:     float = 4.0
     token_refresh_lead_sec:   int   = 120
+    token_refresh_wait_sec:   float = 5.0    # 每次刷新后等待 token 变化
+    token_refresh_max_tries:  int   = 3      # 最多刷新 3 次
 
     # ── VID ──
     vid_timeout:              float = 2.0
@@ -483,7 +485,17 @@ class Engine:
     # ══════════════════════════════════════════════════
     # Token 抓取
     # ══════════════════════════════════════════════════
+    # ══════════════════════════════════════════════════════
+# Token 抓取
+# ══════════════════════════════════════════════════════
     async def fetch_token(self) -> dict:
+        """刷新预约窗口并等待 mitmproxy 写入新 token。
+
+        - 每次刷新后最多等 ``token_refresh_wait_sec`` 秒；
+        - 若 token 未变，重新刷新，最多 ``token_refresh_max_tries`` 次；
+        - 全部失败返回 ``ok=False``；
+        - ``refresh_window`` 返回 False（找不到窗口 / 无法置前）时立即失败，不重试。
+        """
         if self._token_fetch_busy:
             return {"ok": False, "msg": "刷新正在进行，请稍候"}
 
@@ -494,24 +506,61 @@ class Engine:
                 log.error("❌ mitmdump 未就绪")
                 return {"ok": False, "msg": "mitmdump 未就绪，请查看日志"}
 
-            log.info("🪟 触发预约窗口刷新（Ctrl+R）…")
-            ok = await asyncio.to_thread(
-                refresh_window,
-                pre_click_delay=self.tuning.refresh_pre_click_delay,
-                post_click_delay=self.tuning.refresh_post_click_delay,
-            )
-            if not ok:
-                msg = "未找到预约窗口"
-                log.warning("❌ %s", msg)
-                return {"ok": False, "msg": msg}
+            old_token = self.token
+            wait_sec = max(0.5, float(self.tuning.token_refresh_wait_sec))
+            max_tries = max(1, int(self.tuning.token_refresh_max_tries))
+            last_msg = ""
 
-            log.info("✓ 已发送 Ctrl+R，等待 mitmproxy 自动捕获 Token")
-            return {
-                "ok": True,
-                "msg": "已刷新窗口，Token 将由 mitmproxy 自动同步",
-            }
+            for attempt in range(1, max_tries + 1):
+                log.info("🪟 [%d/%d] 触发预约窗口刷新（Ctrl+R）…", attempt, max_tries)
+                ok = await asyncio.to_thread(
+                    refresh_window,
+                    pre_click_delay=self.tuning.refresh_pre_click_delay,
+                    post_click_delay=self.tuning.refresh_post_click_delay,
+                )
+                if not ok:
+                    last_msg = "未找到预约窗口或窗口无法置前"
+                    log.warning("❌ %s（重试也不会成功，直接返回）", last_msg)
+                    return {"ok": False, "msg": last_msg}
+
+                log.info("✓ 已发送 Ctrl+R，等待 mitmproxy 捕获新 Token（最多 %.0fs）…", wait_sec)
+                new_token = await self._wait_token_change(old_token, timeout=wait_sec)
+                if new_token and new_token != old_token:
+                    preview = new_token[:8] + "..."
+                    log.info("✅ Token 已更新：%s → %s（第 %d 次尝试）",
+                            (old_token[:8] + "...") if old_token else "(空)",
+                            preview, attempt)
+                    return {
+                        "ok": True,
+                        "msg": f"Token 已更新（第 {attempt} 次尝试）",
+                        "token_preview": preview,
+                        "attempts": attempt,
+                    }
+
+                last_msg = f"第 {attempt} 次刷新后 {wait_sec:.0f}s 内未捕获到新 Token"
+                log.warning("⚠ %s", last_msg)
+
+            log.error("❌ Token 刷新失败：%d 次尝试均未捕获到新 Token", max_tries)
+            return {"ok": False, "msg": f"{max_tries} 次尝试均失败：{last_msg}"}
         finally:
             self._token_fetch_busy = False
+
+    async def _wait_token_change(self, old_token: str, timeout: float = 5.0) -> str:
+        """轮询等待 config.toml 中的 token 变化。
+
+        返回新 token；超时返回空串。
+        期间任何 config 变化都会广播 config.updated（与 _watch_config 行为一致），
+        并更新 self.token，保证后续抢场用新值。
+        """
+        deadline = time.monotonic() + max(0.1, timeout)
+        while True:
+            if self.reload_config():
+                await self.bus.publish("config.updated", self.public_config())
+            if self.token and self.token != old_token:
+                return self.token
+            if time.monotonic() >= deadline:
+                return ""
+            await asyncio.sleep(0.2)
 
     # ══════════════════════════════════════════════════
     # VID 池
@@ -966,8 +1015,8 @@ class Engine:
                 try:
                     r = await self.fetch_token()
                     if r.get("ok"):
-                        log.info("自动模式: ✅ 已触发 Token 刷新（异步等待写入配置）")
-                        self.auto.msg = "Token 刷新已触发"
+                        log.info("自动模式: ✅ Token 已刷新 (%s)", r.get("token_preview", ""))
+                        self.auto.msg = f"Token 已刷新（{r.get('token_preview', '')}）"
                     else:
                         log.warning("自动模式: ⚠ Token 刷新失败: %s", r.get("msg"))
                         self.auto.msg = f"Token 刷新失败: {r.get('msg')}"
