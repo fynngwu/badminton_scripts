@@ -51,10 +51,10 @@ class Tuning:
     # ── VID ──
     vid_timeout:              float = 2.0
     vid_max_age:              float = 7.9
-    vid_pool_size:            int   = 4
-    vid_pool_stagger:         float = 1.0
-    vid_pool_interval_min:    float = 3.0
-    vid_pool_interval_max:    float = 5.0
+    vid_pool_size:            int   = 7
+    vid_pool_stagger:         float = 1.3
+    vid_pool_interval_min:    float = 9.0
+    vid_pool_interval_max:    float = 11.0
     vid_pool_lead_sec:        int   = 30
 
     # ── mitm ──
@@ -155,10 +155,10 @@ def get_logs(since: int = 0):
 # ══════════════════════════════════════════════════════
 class Engine:
     IMPERSONATE_ROTATION = (
-        "chrome", "safari17_0", "firefox133",
-        "edge101", "safari15_5", "chrome124",
-    )
-
+    "chrome", "safari17_0", "firefox133",
+    "edge101", "safari15_5", "chrome124",
+    "chrome152",  # 新增：明确的现代 Chrome 指纹
+)
     def __init__(self):
         # ── 配置快照 ──
         self.config_data: dict[str, Any] = {}
@@ -184,7 +184,7 @@ class Engine:
         self.bus = EventBus()
         self.auto = AutoState()
 
-        self._vid_queue: asyncio.Queue = asyncio.Queue(maxsize=4)
+        self._vid_queue: asyncio.Queue = asyncio.Queue(maxsize=6)
         self._vid_tasks: list[asyncio.Task] = []
         self._vid_stats: deque = deque(maxlen=30)
 
