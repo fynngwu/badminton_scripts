@@ -233,7 +233,7 @@ button:disabled {
     <button class="auto" id="btn-auto">启动全自动</button>
   </div>
   <div class="mini" style="margin:4px 0 8px;">
-    候选场地（点击点亮 / 熄灭；启动全自动时写入 config，并作为并发抢场目标）
+    候选场地（按点击顺序编号；逐场查询，有空才下单；成功即停止）
   </div>
   <div id="court-picker" class="grid"></div>
 </div>
@@ -594,11 +594,13 @@ function renderCourtPicker() {
   for (const no of allCourtNos) {
     const el = document.createElement("div");
     el.className = "court-pick" + (pickedCourts.has(no) ? " on" : "");
-    el.textContent = `${no}号场`;
+    const order = [...pickedCourts].indexOf(no);
+    el.textContent = order < 0 ? `${no}号场` : `${order + 1}. ${no}号场`;
     el.addEventListener("click", () => {
       if (pickedCourts.has(no)) pickedCourts.delete(no);
       else pickedCourts.add(no);
-      el.classList.toggle("on");
+      renderCourtPicker();
+      $("p-courts").textContent = [...pickedCourts].map(x => `${x}号`).join(" → ") || "未配置";
     });
     box.appendChild(el);
   }
@@ -632,7 +634,7 @@ function applyConfig(cfg) {
   if (o.target_date) $("p-date").textContent = o.target_date;
   $("p-slot").textContent = `${a.slot_start} - ${a.slot_end}`;
   $("p-refresh").textContent = a.save_order_at;
-  $("p-courts").textContent = (a.court_order || []).join(", ") || "未配置";
+  $("p-courts").textContent = (a.court_order || []).map(x => `${x}号`).join(" → ") || "未配置";
 }
 
 async function loadConfig() {
@@ -684,7 +686,7 @@ async function saveAutoPlan() {
       slot_start: $("auto-ss").value,
       slot_end:   $("auto-se").value,
       save_order_at: $("auto-rt").value.trim(),
-      court_order: [...pickedCourts].sort((a, b) => a - b),
+      court_order: [...pickedCourts],
     }),
   });
   const j = await r.json();

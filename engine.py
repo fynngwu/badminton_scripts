@@ -25,7 +25,7 @@ from utils import (
     write_config_string_renamed, write_config_int_list,
     get_vid_once, get_order_once, save_order_once,
     refresh_window,
-    classify_order_reply,
+    slot_covers, classify_order_reply,
     port_listening, kill_port_holder, spawn_mitmdump,
     close_cffi_session,
 )
@@ -995,7 +995,7 @@ class Engine:
             slot_start = a.get("slot_start", "19:30")
             slot_end   = a.get("slot_end",   "21:30")
             save_order_at = a.get("save_order_at") or a.get("refresh_at", "20:00:02")
-            save_dt = self._parse_hms(save_order_at) + timedelta(milliseconds=50)
+            save_dt = self._parse_hms(save_order_at)
 
             # ── ① Token 自动刷新 ──
             if datetime.now() < save_dt:
@@ -1059,27 +1059,54 @@ class Engine:
                         a.get("slot_start"), a.get("slot_end"),
                         slot_start, slot_end)
 
-            # ── ⑤ 并发抢候选场 ──
+            # ── ⑤ 按选择顺序逐场查询，有空才下单 ──
             courts_to_grab: list[Court] = []
             for court_no in self.auto_court_order:
-                c = self.court_by_no.get(court_no)
-                if c:
-                    courts_to_grab.append(c)
+                court = self.court_by_no.get(court_no)
+                if court:
+                    courts_to_grab.append(court)
                 else:
-                    log.warning("自动模式: 场地 %d 未配置，跳过", court_no)
+                    log.warning("自动模式: %d号场未配置，跳过", court_no)
 
-            if not courts_to_grab:
-                log.warning("自动模式: 没有可抢的场地")
-            else:
-                log.info("自动模式: 并发抢 %s（时段 %s-%s，VID 队列 %d）",
-                        ", ".join(c.name for c in courts_to_grab),
-                        slot_start, slot_end, self.vid_count())
-                await asyncio.gather(
-                    *[_grab_one(c, slot_start, slot_end) for c in courts_to_grab]
-                )
+            log.info("自动模式: 顺序扫描 %s（时段 %s-%s）",
+                     " → ".join(c.name for c in courts_to_grab), slot_start, slot_end)
 
-            log.info("自动模式: 并发结束 | 已尝试下单 %d 次 | 成功 %s",
-                    len(applied), "是" if has_success() else "否")
+            for idx, court in enumerate(courts_to_grab, 1):
+                self.auto.phase = "scanning"
+                self.auto.msg = f"查询 {court.name}（{idx}/{len(courts_to_grab)}）"
+                try:
+                    res = await get_order_once(court, self.target_date,
+                                               self.token, self.user_id)
+                except Exception as e:
+                    res = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+                if not res.get("ok") and res.get("auth_fail"):
+                    log.warning("自动模式: %s 鉴权失败，刷新 Token 后重试", court.name)
+                    token_result = await self.fetch_token()
+                    if token_result.get("ok"):
+                        res = await get_order_once(court, self.target_date,
+                                                   self.token, self.user_id)
+
+                await self._publish_refresh(court, res)
+                if not res.get("ok"):
+                    log.warning("自动模式: %s 查询失败：%s，继续下一场",
+                                court.name, res.get("error", "未知错误"))
+                    continue
+
+                if not slot_covers(res["avail"], slot_start, slot_end):
+                    log.info("自动模式: %s 目标时段无空位，继续下一场", court.name)
+                    continue
+
+                self.auto.phase = "ordering"
+                self.auto.msg = f"下单 {court.name}（{idx}/{len(courts_to_grab)}）"
+                log.info("自动模式: %s 查询有空位，开始 saveOrder", court.name)
+                await _grab_one(court, slot_start, slot_end)
+                if has_success():
+                    log.info("自动模式: %s 预约成功，停止后续扫描", court.name)
+                    break
+
+            log.info("自动模式: 顺序扫描结束 | 下单尝试 %d 次 | 成功 %s",
+                     len(applied), "是" if has_success() else "否")
 
         except asyncio.CancelledError:
             log.info("自动模式: 被取消")
@@ -1102,14 +1129,10 @@ class Engine:
     # ══════════════════════════════════════════════════
     @staticmethod
     def _parse_hms(t: str) -> datetime:
-        parts = [int(x) for x in t.split(":")]
-        while len(parts) < 3:
-            parts.append(0)
+        parsed = datetime.strptime(t, "%H:%M:%S.%f" if "." in t else "%H:%M:%S")
         return datetime.now().replace(
-            hour=parts[0],
-            minute=parts[1],
-            second=parts[2],
-            microsecond=0,
+            hour=parsed.hour, minute=parsed.minute,
+            second=parsed.second, microsecond=parsed.microsecond,
         )
 
     @staticmethod
