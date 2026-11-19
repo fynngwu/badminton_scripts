@@ -995,7 +995,7 @@ class Engine:
             slot_start = a.get("slot_start", "19:30")
             slot_end   = a.get("slot_end",   "21:30")
             save_order_at = a.get("save_order_at") or a.get("refresh_at", "20:00:02")
-            save_dt = self._parse_hms(save_order_at) + timedelta(milliseconds=50)
+            save_dt = self._parse_hms(save_order_at)
 
             # ── ① Token 自动刷新 ──
             if datetime.now() < save_dt:
@@ -1041,42 +1041,68 @@ class Engine:
                 log.info("自动模式: VID 池已在运行，跳过启动")
 
 
-            # ── ④ 等到 Save Order At ──
+            # ── ③ 触发前 2s，同时查询所选的前三个场地 ──
+            query_dt = save_dt - timedelta(seconds=1.4)
             self.auto.phase = "waiting"
-            self.auto.msg = f"等待 {save_order_at}"
-            log.info("自动模式: 等待触发 %s", save_dt.strftime("%H:%M:%S.%f")[:-3])
-            await self._sleep_until(save_dt - timedelta(seconds=1))
-            if self.vid_running:
-                await self.stop_vid_pool()
-            await self._sleep_until(save_dt)
+            self.auto.msg = f"等待并发查询（{query_dt.strftime('%H:%M:%S.%f')[:-3]}）"
+            log.info("自动模式: 等待并发查询 %s", query_dt.strftime("%H:%M:%S.%f")[:-3])
+            await self._sleep_until(query_dt)
 
-            # 抢场前重新读取最新配置，支持中途修改
+            # 查询前读取最新时段和场地顺序
             a2 = self.config_data.get("auto", {}) or {}
             slot_start = a2.get("slot_start", slot_start)
-            slot_end   = a2.get("slot_end",   slot_end)
-            if (slot_start, slot_end) != (a.get("slot_start"), a.get("slot_end")):
-                log.info("自动模式: 检测到时段变更 %s-%s → %s-%s",
-                        a.get("slot_start"), a.get("slot_end"),
-                        slot_start, slot_end)
-
-            # ── ⑤ 并发抢候选场 ──
-            courts_to_grab: list[Court] = []
-            for court_no in self.auto_court_order:
-                c = self.court_by_no.get(court_no)
-                if c:
-                    courts_to_grab.append(c)
-                else:
-                    log.warning("自动模式: 场地 %d 未配置，跳过", court_no)
-
-            if not courts_to_grab:
-                log.warning("自动模式: 没有可抢的场地")
+            slot_end = a2.get("slot_end", slot_end)
+            courts = [self.court_by_no[n] for n in self.auto_court_order[:3]
+                      if n in self.court_by_no]
+            if not courts:
+                log.warning("自动模式: 前三个候选场地均未配置")
             else:
-                log.info("自动模式: 并发抢 %s（时段 %s-%s，VID 队列 %d）",
-                        ", ".join(c.name for c in courts_to_grab),
-                        slot_start, slot_end, self.vid_count())
-                await asyncio.gather(
-                    *[_grab_one(c, slot_start, slot_end) for c in courts_to_grab]
-                )
+                log.info("自动模式: 并发查询 %s（目标 %s-%s）",
+                         ", ".join(c.name for c in courts), slot_start, slot_end)
+                self.auto.phase = "querying"
+                self.auto.msg = "并发查询前三个候选场地"
+
+                async def query_one(court):
+                    return await self._refresh_one(court, timeout=4.0)
+
+                tasks = [asyncio.create_task(query_one(c)) for c in courts]
+                try:
+                    start_dt = datetime.strptime(slot_start, "%H:%M")
+                    end_dt = datetime.strptime(slot_end, "%H:%M")
+                    slots = []
+                    while start_dt < end_dt:
+                        slots.append(start_dt.strftime("%H:%M"))
+                        start_dt += timedelta(minutes=30)
+
+                    for completed in asyncio.as_completed(tasks):
+                        court, res = await completed
+                        if not res.get("ok"):
+                            log.warning("自动模式: %s 查询失败: %s",
+                                        court.name, res.get("error", "未知错误"))
+                            continue
+                        avail = res.get("avail", {})
+                        if not slots or not all(str(avail.get(t)) == "1" for t in slots):
+                            log.info("自动模式: %s 目标时段无完整空位", court.name)
+                            continue
+
+                        log.info("自动模式: %s 首个返回完整空位，等待触发时间 %s",
+                                 court.name, save_dt.strftime("%H:%M:%S.%f")[:-3])
+                        for task in tasks:
+                            if not task.done():
+                                task.cancel()
+                        self.auto.phase = "waiting_order"
+                        self.auto.msg = f"{court.name} 有空位，等待触发时刻"
+                        await self._sleep_until(save_dt)
+                        self.auto.phase = "ordering"
+                        self.auto.msg = f"{court.name} 有空位，正在下单"
+                        log.info("自动模式: 已到触发时刻，开始下单 %s", court.name)
+                        await _grab_one(court, slot_start, slot_end)
+                        break
+                finally:
+                    for task in tasks:
+                        if not task.done():
+                            task.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
 
             log.info("自动模式: 并发结束 | 已尝试下单 %d 次 | 成功 %s",
                     len(applied), "是" if has_success() else "否")
