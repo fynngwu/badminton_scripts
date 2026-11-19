@@ -1102,14 +1102,10 @@ class Engine:
     # ══════════════════════════════════════════════════
     @staticmethod
     def _parse_hms(t: str) -> datetime:
-        parts = [int(x) for x in t.split(":")]
-        while len(parts) < 3:
-            parts.append(0)
+        parsed = datetime.strptime(t, "%H:%M:%S.%f" if "." in t else "%H:%M:%S")
         return datetime.now().replace(
-            hour=parts[0],
-            minute=parts[1],
-            second=parts[2],
-            microsecond=0,
+            hour=parsed.hour, minute=parsed.minute,
+            second=parsed.second, microsecond=parsed.microsecond,
         )
 
     @staticmethod
