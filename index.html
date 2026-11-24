@@ -215,7 +215,7 @@ button:disabled {
 
 <div class="card row">
   <span>VID 缓存：<b id="vid-count">0</b></span>
-  <span class="mini"><span class="dot" id="sse-dot"></span>SSE</span>
+  <span class="mini"><span class="dot" id="sse-dot"></span> <span id="sse-status" role="status">SSE 连接中</span></span>
   <button class="primary" id="btn-vid">启动 VID</button>
   <button class="primary" id="btn-refresh">刷新场地</button>
   <span class="mini" id="last-solve">最近 solve：-</span>
@@ -253,7 +253,10 @@ button:disabled {
     <button class="auto" id="btn-leak">启动检漏</button>
     <span class="mini">周二 / 周四 · 18:00–22:00 · 每轮间隔10秒 · 每日19:55–20:05暂停</span>
   </div>
-  <div class="mini" id="leak-status" style="margin-top:8px;">未启动</div>
+  <div class="row" style="margin-top:10px;">
+    <span class="pill" id="leak-indicator" role="status" aria-live="polite">等待连接</span>
+    <span class="mini" id="leak-status">等待后端状态</span>
+  </div>
   <div id="leak-found" class="row" style="margin-top:8px;"></div>
 </div>
 
@@ -316,6 +319,9 @@ const SCAN_END   = 22 * 60;
 const MAX_SLOTS  = 4;
 
 let sse = null;
+let streamReady = false;
+let snapshotReady = false;
+const pendingJobs = new Set();
 const state = {jobs: {}, courts: new Map(), lastLog: 0};
 
 const escHtml = s => String(s).replace(/[&<>"']/g, c =>
@@ -626,11 +632,19 @@ function applyConfig(cfg) {
   $("p-courts").textContent = (a.court_order || []).join(", ") || "未配置";
 }
 
+async function readState() {
+  const r = await fetch("/api/state", {cache: "no-store"});
+  if (!r.ok) throw new Error(`状态读取失败：HTTP ${r.status}`);
+  const d = await r.json();
+  if (!d.config || !d.jobs || !Array.isArray(d.courts) || !Array.isArray(d.logs)) {
+    throw new Error("状态接口格式不正确，请检查前后端版本");
+  }
+  return d;
+}
+
 async function loadConfig() {
-  try {
-    const d = await (await fetch("/api/state")).json();
-    applyConfig(d.config);
-  } catch {}
+  try { applyConfig((await readState()).config); }
+  catch (e) { toast(e.message, "err"); }
 }
 
 // ══════════════════════════════════════════════════════
@@ -643,7 +657,7 @@ function renderJobs(jobs) {
   $("btn-vid").textContent = vid.running ? "停止 VID" : "启动 VID";
   const last = vid.stats.at(-1);
   $("last-solve").textContent = last ? `最近 solve：${last.ok ? last.total_ms + "ms" : "失败"}` : "最近 solve：-";
-  $("btn-refresh").disabled = refresh.running;
+  renderControls();
   $("btn-refresh").textContent = refresh.running ? "刷新中…" : "刷新场地";
   $("btn-auto").textContent = auto.running ? "停止全自动" : "启动全自动";
   $("auto-status").style.display = auto.phase === "idle" ? "none" : "";
@@ -651,6 +665,12 @@ function renderJobs(jobs) {
   $("auto-msg").textContent = auto.msg;
   $("auto-applied").textContent = (auto.applied || []).map(a => `${a.name}${a.ok ? "✓" : "✗"}`).join(" / ") || "无";
   $("btn-leak").textContent = leak.running ? "停止检漏" : "启动检漏";
+  const indicator = $("leak-indicator");
+  indicator.textContent = !streamReady ? "○ 状态未实时同步" : leak.running
+    ? (leak.paused ? "● 定时暂停" : "● 运行中")
+    : "○ 已停止";
+  indicator.style.color = !streamReady ? "#ffa657" : leak.running
+    ? (leak.paused ? "#ffa657" : "#7ee787") : "var(--text-dim)";
   $("leak-status").textContent = `${leak.msg} | 目标：${leak.dates.join(" / ") || "无"}`;
 }
 
@@ -664,26 +684,50 @@ function renderLeak(d) {
   $("leak-found").append(b);
 }
 
+function renderControls() {
+  for (const name of ["vid", "refresh", "auto", "leak"]) {
+    $("btn-" + name).disabled = pendingJobs.has(name) ||
+      (name === "refresh" && streamReady && !!state.jobs.refresh?.running);
+  }
+}
+
+function applySnapshot(d) {
+  applyConfig(d.config);
+  state.courts = new Map(d.courts.map(r => [`${r.date}/${r.court}`, r]));
+  $("log").replaceChildren();
+  state.lastLog = 0;
+  d.logs.forEach(addLog);
+  renderJobs(d.jobs);
+  renderLeak(d.leak_found);
+  render();
+  snapshotReady = true;
+}
+
 function connectSSE() {
   sse = new EventSource("/api/stream");
-  const buttons = ["btn-vid", "btn-refresh", "btn-auto", "btn-leak"];
-  for (const id of buttons) $(id).disabled = true;
   sse.onerror = () => {
+    streamReady = false;
     $("sse-dot").classList.remove("on");
-    for (const id of buttons) $(id).disabled = true;
+    $("sse-status").textContent = "SSE 断开，正在重连";
+    $("leak-indicator").textContent = "○ 连接断开";
+    $("leak-indicator").style.color = "#ffa657";
+    $("leak-status").textContent = "等待重连，当前任务状态未知";
+    renderControls();
   };
   sse.addEventListener("snapshot", ev => {
-    const d = JSON.parse(ev.data);
-    $("sse-dot").classList.add("on");
-    for (const id of buttons) $(id).disabled = false;
-    applyConfig(d.config);
-    state.courts = new Map(d.courts.map(r => [`${r.date}/${r.court}`, r]));
-    $("log").replaceChildren();
-    state.lastLog = 0;
-    d.logs.forEach(addLog);
-    renderJobs(d.jobs);
-    renderLeak(d.leak_found);
-    render();
+    try {
+      streamReady = true;
+      applySnapshot(JSON.parse(ev.data));
+      $("sse-dot").classList.add("on");
+      $("sse-status").textContent = "SSE 已连接";
+    } catch (e) {
+      streamReady = false;
+      $("sse-dot").classList.remove("on");
+      $("sse-status").textContent = "SSE 状态解析失败";
+      renderControls();
+      toast("状态解析失败：" + e.message, "err");
+      console.error(e);
+    }
   });
   sse.addEventListener("jobs", ev => renderJobs(JSON.parse(ev.data).data));
   sse.addEventListener("log", ev => addLog(JSON.parse(ev.data).data));
@@ -799,25 +843,59 @@ $("btn-fetch-token").onclick = async () => {
   }
 };
 
-async function setJob(name, running, extra = {}) {
+async function setJob(name, running) {
+  if (pendingJobs.has(name)) return;
+  pendingJobs.add(name);
+  renderControls();
+  const label = {vid: "VID", refresh: "刷新场地", auto: "全自动", leak: "检漏"}[name];
   try {
+    // HTTP commands do not depend on the SSE connection.
+    // Read current state before toggling when real-time data is unavailable.
+    if (!snapshotReady || !streamReady) {
+      const d = await readState();
+      if (!snapshotReady) applySnapshot(d);
+      else if (!streamReady) renderJobs(d.jobs);
+    }
+    running ??= !state.jobs[name]?.running;
+    if (name === "refresh" && state.jobs.refresh?.running) {
+      toast("刷新任务正在运行", "warn");
+      return;
+    }
+    if (name === "auto" && running) {
+      if (!pickedCourts.size) return toast("请先选择候选场地", "err");
+      if (!await saveAutoPlan()) return;
+    }
+    const body = {running};
+    if (name === "refresh") body.date = $("cur-date").textContent;
+    toast(`${label}：正在提交请求…`, "ok", 1500);
     const r = await fetch(`/api/jobs/${name}`, {
       method: "PUT", headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({running, ...extra}),
+      body: JSON.stringify(body),
     });
-    const d = await r.json();
-    if (!r.ok || !d.ok) toast(d.msg || d.detail || "操作失败", "err");
-    return d.ok;
-  } catch (e) { toast(String(e), "err"); return false; }
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok || !d.ok) {
+      const detail = d.msg || (typeof d.detail === "string" ? d.detail : JSON.stringify(d.detail || ""));
+      throw new Error(`${label}失败${r.ok ? "" : `（HTTP ${r.status}）`}：${detail || "后端未确认操作"}`);
+    }
+    toast(`${label}：${running ? "启动" : "停止"}请求已确认`, "ok");
+    if (!streamReady) {
+      const snapshot = await readState();
+      if (!streamReady) applySnapshot(snapshot);
+    }
+    return true;
+  } catch (e) {
+    toast(e.message || String(e), "err", 5000);
+    console.error(e);
+    return false;
+  } finally {
+    pendingJobs.delete(name);
+    renderControls();
+  }
 }
-$("btn-vid").onclick = () => setJob("vid", !state.jobs.vid?.running);
-$("btn-refresh").onclick = () => setJob("refresh", true, {date: $("cur-date").textContent});
-$("btn-auto").onclick = async () => {
-  if (state.jobs.auto?.running) return setJob("auto", false);
-  if (!pickedCourts.size) return toast("请先选择候选场地", "err");
-  if (await saveAutoPlan()) await setJob("auto", true);
-};
-$("btn-leak").onclick = () => setJob("leak", !state.jobs.leak?.running);
+$("btn-vid").onclick = () => setJob("vid");
+$("btn-refresh").onclick = () => setJob("refresh", true);
+$("btn-auto").onclick = () => setJob("auto");
+$("btn-leak").onclick = () => setJob("leak");
 
 // ── 点击场地：立即 ack，结果走 SSE ──
 document.addEventListener("click", async ev => {
@@ -849,7 +927,15 @@ document.addEventListener("click", async ev => {
   }
 });
 
-window.addEventListener("DOMContentLoaded", connectSSE);
+window.addEventListener("DOMContentLoaded", async () => {
+  connectSSE();
+  try {
+    const d = await readState();
+    if (!streamReady) applySnapshot(d);
+  } catch (e) {
+    if (!snapshotReady) toast(e.message + "，请确认已启动新版 app.py", "err", 6000);
+  }
+});
 </script>
 </body>
 </html>
