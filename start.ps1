@@ -19,7 +19,7 @@ function Test-AppReady {
     # Unlike Get-NetTCPConnection, this call has a strict 400 ms timeout.
     $Response = $null
     try {
-        $Request = [System.Net.HttpWebRequest]::Create($Url + 'api/auto/state')
+        $Request = [System.Net.HttpWebRequest]::Create($Url + 'api/state')
         $Request.Proxy = $null
         $Request.Timeout = 400
         $Request.ReadWriteTimeout = 400
