@@ -10,12 +10,15 @@ import logging
 import random
 import subprocess
 import time
+import threading
+import json
 from collections import deque
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
-from dataclasses import dataclass, field
+from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta
-from typing import Any
+
+from state import AutoState, EventBus, Config, AutoConfig, AutoPlan, Session, Jobs
 
 from utils import (
     Court,
@@ -71,66 +74,25 @@ class Tuning:
 # ══════════════════════════════════════════════════════
 # 自动模式状态
 # ══════════════════════════════════════════════════════
-@dataclass
-class AutoState:
-    running: bool = False
-    phase: str = "idle"
-    msg: str = ""
-    applied: list = field(default_factory=list)
-    started_at: str = ""
-    finished_at: str = ""
-    plan: dict = field(default_factory=dict)
-
-
-# ══════════════════════════════════════════════════════
-# 事件总线
-# ══════════════════════════════════════════════════════
-class EventBus:
-    def __init__(self, history: int = 500):
-        self._subs: set[asyncio.Queue] = set()
-        self._hist: deque = deque(maxlen=history)
-        self._seq = 0
-
-    @property
-    def seq(self) -> int:
-        return self._seq
-
-    async def publish(self, topic: str, data: dict):
-        self._seq += 1
-        evt = {"_seq": self._seq, "_topic": topic, "data": data}
-        self._hist.append(evt)
-        for q in list(self._subs):
-            try:
-                q.put_nowait(evt)
-            except asyncio.QueueFull:
-                pass
-
-    def subscribe(self, since: int = 0) -> tuple[asyncio.Queue, list]:
-        q: asyncio.Queue = asyncio.Queue(maxsize=2000)
-        self._subs.add(q)
-        return q, [e for e in self._hist if e["_seq"] > since]
-
-    def unsubscribe(self, q):
-        self._subs.discard(q)
-
-
 # ══════════════════════════════════════════════════════
 # 日志缓冲
 # ══════════════════════════════════════════════════════
 _log_buf: deque = deque(maxlen=800)
 _log_seq = 0
+_log_lock = threading.Lock()
 
 
 class _BufHandler(logging.Handler):
     def emit(self, record):
         global _log_seq
-        _log_seq += 1
-        _log_buf.append({
-            "seq": _log_seq,
-            "ts": datetime.now().strftime("%H:%M:%S.%f")[:-3],
-            "level": record.levelname,
-            "msg": record.getMessage(),
-        })
+        with _log_lock:
+            _log_seq += 1
+            _log_buf.append({
+                "seq": _log_seq,
+                "ts": datetime.now().strftime("%H:%M:%S.%f")[:-3],
+                "level": record.levelname,
+                "msg": record.getMessage(),
+            })
 
 
 def setup_logging():
@@ -153,7 +115,8 @@ def setup_logging():
 
 
 def get_logs(since: int = 0):
-    return [e for e in _log_buf if e["seq"] > since]
+    with _log_lock:
+        return [e for e in _log_buf if e["seq"] > since]
 
 
 # ══════════════════════════════════════════════════════
@@ -166,46 +129,25 @@ class Engine:
     "chrome152",  # 新增：明确的现代 Chrome 指纹
 )
     def __init__(self):
-        # ── 配置快照 ──
-        self.config_data: dict[str, Any] = {}
-        self.config_mtime: float = 0.0
+        self.config = Config()
+        self.session = Session()
+        self.config_mtime = 0
         self.tuning = Tuning()
-
-        # ── 派生字段 ──
-        self.user_id = ""
-        self.customer_id = ""
-        self.customer_name = ""
-        self.customer_tel = ""
-        self.gym_id = ""
-        self.gym_name = ""
-        self.courts: list[Court] = []
-        self.court_by_no: dict[int, Court] = {}
-
-        # ── session ──
-        self.token = ""
-        self.offset_days = 1
-        self.auto_court_order: list[int] = [3, 4, 10]
-
+        self.jobs = Jobs()
+        self.schedules = {}
+        self.leak_found = None
         # ── runtime ──
         self.bus = EventBus()
         self.auto = AutoState()
-        self._leak_task: asyncio.Task | None = None
         self._leak_scanning = False
         self._leak_msg = "未启动"
         self._leak_dates_done: set[str] = set()
         self._leak_cursor = 0
 
         self._vid_queue: asyncio.Queue = asyncio.Queue(maxsize=6)
-        self._vid_tasks: list[asyncio.Task] = []
         self._vid_stats: deque = deque(maxlen=30)
 
-        self._refresh_probe_task: asyncio.Task | None = None
-        self._refresh_tasks: list[asyncio.Task] = []
 
-        self._auto_task: asyncio.Task | None = None
-        self._auto_warmup_task: asyncio.Task | None = None
-
-        self._reserve_inflight: set = set()
         self._solve_sem = asyncio.Semaphore(3)
 
         self._mitm_proc: subprocess.Popen | None = None
@@ -213,8 +155,6 @@ class Engine:
 
         self._token_fetch_busy = False
 
-        self._watch_task: asyncio.Task | None = None
-        self._boot_task: asyncio.Task | None = None
 
         # 首帧加载
         self.reload_config(force=True)
@@ -224,7 +164,7 @@ class Engine:
     # ══════════════════════════════════════════════════
     @property
     def target_date(self) -> str:
-        d = datetime.now() + timedelta(days=self.offset_days)
+        d = datetime.now() + timedelta(days=self.config.offset_days)
         return d.strftime("%Y-%m-%d")
 
     def reload_config(self, force: bool = False) -> bool:
@@ -241,68 +181,60 @@ class Engine:
             log.warning("config.toml 读取失败: %s", e)
             return False
 
-        self.config_data = data
-        self.config_mtime = mtime
-
-        u = data.get("user", {}) or {}
-        g = data.get("gym", {}) or {}
-        o = data.get("order", {}) or {}
-
-        self.user_id       = str(u.get("id", "") or "")
-        self.customer_id   = str(u.get("customer_id", "") or "")
-        self.customer_name = str(u.get("name", "") or "")
-        self.customer_tel  = str(u.get("tel", "") or "")
-        self.gym_id        = str(g.get("id", "") or "")
-        self.gym_name      = str(g.get("name", "") or "")
-
-        courts_map = {int(k): str(v) for k, v in (data.get("courts", {}) or {}).items()}
-        self.courts = [Court(no, cid, f"{no}号场")
-                       for no, cid in sorted(courts_map.items())]
-        self.court_by_no = {c.no: c for c in self.courts}
-
-        self.token = str(o.get("token", "") or "")
         try:
-            self.offset_days = int(o.get("offset_days", 1))
-        except Exception:
-            self.offset_days = 1
-        self.offset_days = max(0, min(2, self.offset_days))
-
-        a = data.get("auto", {}) or {}
-        co = a.get("court_order", [3, 4, 10])
-        if isinstance(co, (list, tuple)):
-            try:
-                self.auto_court_order = [int(x) for x in co if int(x) > 0]
-            except (TypeError, ValueError):
-                self.auto_court_order = [3, 4, 10]
-        else:
-            self.auto_court_order = [3, 4, 10]
-
-        self._load_tuning()
+            u, g, o, a = (data.get(k, {}) or {} for k in ("user", "gym", "order", "auto"))
+            courts = tuple(Court(int(k), str(v), f"{int(k)}号场")
+                           for k, v in sorted(data.get("courts", {}).items(), key=lambda x: int(x[0])))
+            auto = AutoConfig(str(a.get("slot_start", "19:30")),
+                              str(a.get("slot_end", "21:30")),
+                              str(a.get("save_order_at") or a.get("refresh_at", "20:00:04")),
+                              tuple(int(n) for n in a.get("court_order", [3, 4, 10]) if int(n) > 0))
+            config = Config(*(str(v or "") for v in (u.get("id"), u.get("customer_id"),
+                            u.get("name"), u.get("tel"), g.get("id"), g.get("name"))),
+                            courts=courts, offset_days=max(0, min(2, int(o.get("offset_days", 1)))), auto=auto)
+            session = Session(str(o.get("token", "") or ""))
+        except (ValueError, TypeError, AttributeError) as e:
+            log.warning("配置无效: %s", e)
+            return False
+        self.config, self.session, self.config_mtime = config, session, mtime
         return True
 
-    def _load_tuning(self):
-        self.tuning = Tuning()
-
     def public_config(self) -> dict:
-        tok = self.token or ""
-        a = self.config_data.get("auto", {}) or {}
         return {
-            "user": self.config_data.get("user", {}),
-            "gym":  self.config_data.get("gym", {}),
-            "order": {
-                "offset_days": self.offset_days,
-                "token_set": bool(tok),
-                "token_preview": (tok[:8] + "...") if tok else "",
-                "target_date": self.target_date,
-            },
-            "courts": {str(c.no): c.id for c in self.courts},
-            "auto": {
-                "slot_start": a.get("slot_start", "19:30"),
-                "slot_end":   a.get("slot_end", "21:30"),
-                "save_order_at": a.get("save_order_at") or a.get("refresh_at", "20:00:04"),
-                "court_order": list(self.auto_court_order),
-            },
+            "order": {"offset_days": self.config.offset_days,
+                      "token_set": bool(self.session.token),
+                      "target_date": self.target_date},
+            "courts": {str(c.no): c.id for c in self.config.courts},
+            "auto": asdict(self.config.auto),
         }
+
+    def job_states(self):
+        return {"auto": self.auto_state(), "leak": self.leak_state(),
+                "vid": self.vid_state(), "refresh": {"running": self.refresh_running}}
+
+    def snapshot(self):
+        return {"config": self.public_config(), "jobs": self.job_states(),
+                "courts": list(self.schedules.values()), "logs": get_logs(),
+                "leak_found": self.leak_found}
+
+    async def _publish_state_changes(self):
+        """One shared sampler, independent of the number of connected browsers."""
+        previous = None
+        last_log = 0
+        while True:
+            jobs = self.job_states()
+            current = json.dumps(jobs, sort_keys=True, ensure_ascii=False)
+            if current != previous:
+                previous = current
+                await self.bus.publish("jobs", jobs)
+            for entry in get_logs(last_log):
+                last_log = entry["seq"]
+                await self.bus.publish("log", entry)
+            await asyncio.sleep(1)
+
+    @property
+    def reserve_inflight(self):
+        return any(isinstance(k, tuple) and self.jobs.running(k) for k in self.jobs.tasks)
 
     def update_offset_days(self, offset: int) -> None:
         offset = max(0, min(2, int(offset)))
@@ -331,22 +263,15 @@ class Engine:
     # ══════════════════════════════════════════════════
     async def start(self):
         log.info("服务已启动")
-        self._boot_task = asyncio.create_task(self._boot_mitm())
-        self._watch_task = asyncio.create_task(self._watch_config())
+        self.jobs.start("boot", self._boot_mitm())
+        self.jobs.start("watch", self._watch_config())
+        self.jobs.start("state", self._publish_state_changes())
 
     async def stop(self):
-        for t in (self._watch_task, self._boot_task):
-            if t is None:
-                continue
-            t.cancel()
-            try:
-                await t
-            except (asyncio.CancelledError, Exception):
-                pass
-        await self.stop_leak()
-        await self.stop_vid_pool()
-        await self.stop_refresh()
+        await self.jobs.stop("watch")
         await self.stop_auto()
+        await self.jobs.stop_all()
+        await self.stop_vid_pool()
         await close_cffi_session()
         self._kill_mitm()
 
@@ -372,7 +297,7 @@ class Engine:
                         "config.updated",
                         self.public_config()
                     )
-                if day_changed and not self.auto.running:
+                if day_changed and not self.jobs.running("auto"):
                     log.info("日期已更新，自动启动新一天的全自动模式")
                     result = await self.start_auto()
 
@@ -518,7 +443,7 @@ class Engine:
                 log.error("❌ mitmdump 未就绪")
                 return {"ok": False, "msg": "mitmdump 未就绪，请查看日志"}
 
-            old_token = self.token
+            old_token = self.session.token
             wait_sec = max(0.5, float(self.tuning.token_refresh_wait_sec))
             max_tries = max(1, int(self.tuning.token_refresh_max_tries))
             last_msg = ""
@@ -562,14 +487,14 @@ class Engine:
 
         返回新 token；超时返回空串。
         期间任何 config 变化都会广播 config.updated（与 _watch_config 行为一致），
-        并更新 self.token，保证后续抢场用新值。
+        并更新 self.session.token，保证后续抢场用新值。
         """
         deadline = time.monotonic() + max(0.1, timeout)
         while True:
             if self.reload_config():
                 await self.bus.publish("config.updated", self.public_config())
-            if self.token and self.token != old_token:
-                return self.token
+            if self.session.token and self.session.token != old_token:
+                return self.session.token
             if time.monotonic() >= deadline:
                 return ""
             await asyncio.sleep(0.2)
@@ -579,7 +504,7 @@ class Engine:
     # ══════════════════════════════════════════════════
     @property
     def vid_running(self) -> bool:
-        return any(not t.done() for t in self._vid_tasks)
+        return self.jobs.running("vid")
 
     def vid_count(self) -> int:
         return self._vid_queue.qsize()
@@ -606,12 +531,7 @@ class Engine:
             except asyncio.QueueEmpty:
                 break
 
-        self._vid_tasks = [
-            asyncio.create_task(
-                self._vid_worker(i + 1, i * stagger, interval_min, interval_max)
-            )
-            for i in range(size)
-        ]
+        self.jobs.start("vid", self._run_vid_pool(size, stagger, interval_min, interval_max))
         log.info(
             "VID 池启动: %d workers / 错峰 %.2fs / 间隔 %.1f-%.1fs / 有效期 %.1fs / 队列上限 %d / 指纹=%s",
             size, stagger, interval_min, interval_max,
@@ -620,12 +540,18 @@ class Engine:
         )
         return {"ok": True, "started": True, "count": self.vid_count()}
 
+    async def _run_vid_pool(self, size, stagger, interval_min, interval_max):
+        tasks = [asyncio.create_task(self._vid_worker(i + 1, i * stagger, interval_min, interval_max))
+                 for i in range(size)]
+        try:
+            await asyncio.gather(*tasks)
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
     async def stop_vid_pool(self):
-        for t in self._vid_tasks:
-            t.cancel()
-        if self._vid_tasks:
-            await asyncio.gather(*self._vid_tasks, return_exceptions=True)
-        self._vid_tasks = []
+        await self.jobs.stop("vid")
         log.info("VID 池已停止")
 
     async def _vid_worker(self, tid: int, initial_delay: float,
@@ -702,36 +628,30 @@ class Engine:
     # ══════════════════════════════════════════════════
     @property
     def refresh_running(self) -> bool:
-        if self._refresh_probe_task and not self._refresh_probe_task.done():
-            return True
-        return any(not t.done() for t in self._refresh_tasks)
+        return self.jobs.running("refresh")
 
     async def start_refresh(self, date: str | None = None) -> dict:
         date = date or self.target_date
         if self._leak_scanning:
             return {"ok": False, "msg": "检漏正在查询，请稍后刷新"}
-        if not self.token:
+        if not self.session.token:
             return {"ok": False, "msg": "未配置 token"}
-        await self.stop_refresh()
-        pool = list(self.courts)
+        if self.refresh_running:
+            return {"ok": True}
+        pool = list(self.config.courts)
         random.shuffle(pool)
         if not pool:
             return {"ok": False, "msg": "config.toml 未配置任何场地"}
         log.info("启动刷新: 探测 %s → 成功后并发剩余 %d 个场地 (退避 %.1fs / 最多 %d 次)",
                  pool[0].name, len(pool) - 1,
                  self.tuning.probe_backoff, self.tuning.probe_max_tries)
-        self._refresh_probe_task = asyncio.create_task(self._refresh_run(pool, date))
+        self.schedules = {k: v for k, v in self.schedules.items() if k[0] != date}
+        await self.bus.publish("refresh.reset", {"date": date})
+        self.jobs.start("refresh", self._refresh_run(pool, date))
         return {"ok": True, "total": len(pool)}
 
     async def stop_refresh(self):
-        tasks = [t for t in ([self._refresh_probe_task] + self._refresh_tasks)
-                 if t is not None]
-        for t in tasks:
-            t.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-        self._refresh_probe_task = None
-        self._refresh_tasks = []
+        await self.jobs.stop("refresh")
 
     async def _refresh_run(self, pool: list[Court], date: str):
         try:
@@ -749,7 +669,7 @@ class Engine:
         for attempt in range(1, max_tries + 1):
             t0 = time.monotonic()
             res = await get_order_once(probe, date,
-                                       self.token, self.user_id)
+                                       self.session.token, self.config.user_id)
             dt = (time.monotonic() - t0) * 1000
 
             if res.get("ok"):
@@ -781,7 +701,7 @@ class Engine:
 
     async def _refresh_one(self, court: Court, date: str, timeout: float | None = None, *, publish: bool = True, quiet: bool = False):
         try:
-            query = get_order_once(court, date, self.token, self.user_id, quiet=quiet)
+            query = get_order_once(court, date, self.session.token, self.config.user_id, quiet=quiet)
             res = await asyncio.wait_for(query, timeout) if timeout else await query
         except asyncio.CancelledError:
             raise
@@ -794,11 +714,7 @@ class Engine:
         return court, res
 
     async def _refresh_courts(self, courts: list[Court], date: str, timeout: float | None = None):
-        self._refresh_tasks = [asyncio.create_task(self._refresh_one(c, date, timeout)) for c in courts]
-        try:
-            return await asyncio.gather(*self._refresh_tasks)
-        finally:
-            self._refresh_tasks = []
+        return await asyncio.gather(*(self._refresh_one(c, date, timeout) for c in courts))
 
     async def _publish_refresh(self, court: Court, res: dict, date: str):
         evt = {
@@ -810,7 +726,10 @@ class Engine:
         }
         if res.get("ok"):
             evt["avail"]  = res["avail"]
-            evt["blocks"] = res["blocks"]
+            evt["blocks"] = [{k: v for k, v in block.items() if k not in ("customerCode", "customerTel")} for block in res["blocks"]]
+            self.schedules[(date, court.no)] = evt
+            if len(self.schedules) > 100:
+                self.schedules.pop(next(iter(self.schedules)))
         else:
             evt["error"] = res.get("error", "查询失败")
         if evt["ok"]:
@@ -825,30 +744,29 @@ class Engine:
     # ══════════════════════════════════════════════════
     async def reserve(self, court_no: int, start: str, end: str, date: str | None = None) -> dict:
         date = date or self.target_date
-        if not self.token:
+        if not self.session.token:
             return {"accepted": False, "kind": "err",
                     "label": "❌ 未配置 Token",
                     "msg": "请先保存或获取 Token"}
 
-        court = self.court_by_no.get(court_no)
+        court = next((c for c in self.config.courts if c.no == court_no), None)
         if not court:
             return {"accepted": False, "kind": "err",
                     "label": "❌ 非法场地",
                     "msg": f"非法场地号 {court_no}"}
 
         key = (date, court.no, start, end)
-        if key in self._reserve_inflight:
+        if self.jobs.running(key):
             return {"accepted": False, "kind": "warn",
                     "label": "⏳ 该时段已在提交",
                     "msg": "同一时段已有请求在飞"}
 
-        self._reserve_inflight.add(key)
-        asyncio.create_task(self._reserve_worker(key, court, start, end, date))
+        self.jobs.start(key, self._reserve_worker(court, start, end, date))
 
         return {"accepted": True, "court": court.no, "name": court.name,
                 "start": start, "end": end, "date": date}
 
-    async def _reserve_worker(self, key, court: Court, start: str, end: str, date: str):
+    async def _reserve_worker(self, court: Court, start: str, end: str, date: str):
         try:
             vid: str | None = None
 
@@ -863,7 +781,7 @@ class Engine:
                                                 impersonate="chrome124")
 
             r = await self._save_order(vid, court, date,
-                                       start, end, self.token)
+                                       start, end, self.session.token)
             await self._publish_order_result(court, r, date)
         except Exception as e:
             log.exception("reserve worker 异常: %s", e)
@@ -873,19 +791,17 @@ class Engine:
                 "msg": str(e),
                 "ts": datetime.now().strftime("%H:%M:%S"),
             })
-        finally:
-            self._reserve_inflight.discard(key)
 
     async def _save_order(self, vid, court: Court, date: str,
                           start: str, end: str, token: str) -> dict:
         return await save_order_once(
             vid=vid, court=court, date=date, start=start, end=end, token=token,
-            user_id=self.user_id,
-            customer_id=self.customer_id,
-            customer_name=self.customer_name,
-            customer_tel=self.customer_tel,
-            gym_id=self.gym_id,
-            gym_name=self.gym_name,
+            user_id=self.config.user_id,
+            customer_id=self.config.customer_id,
+            customer_name=self.config.customer_name,
+            customer_tel=self.config.customer_tel,
+            gym_id=self.config.gym_id,
+            gym_name=self.config.gym_name,
         )
 
     async def _publish_order_result(self, court: Court, result: dict, date: str):
@@ -912,73 +828,37 @@ class Engine:
     def auto_state(self) -> dict:
         s = self.auto
         return {
-            "running": s.running, "phase": s.phase, "msg": s.msg,
+            "running": self.jobs.running("auto"), "phase": s.phase, "msg": s.msg,
             "applied": s.applied,
             "started_at": s.started_at, "finished_at": s.finished_at,
-            "plan": s.plan,
+            "plan": ({"date": s.plan.date, **asdict(s.plan.config)} if s.plan else {}),
         }
 
     async def start_auto(self) -> dict:
-        if not self.token:
+        if not self.session.token:
             return {"ok": False, "msg": "未配置 token"}
-        if self.auto.running:
+        if self.jobs.running("auto"):
             return {"ok": False, "msg": "自动模式已在运行"}
-        if not self.auto_court_order:
+        if not self.config.auto.court_order:
             return {"ok": False, "msg": "未配置候选场地（court_order）"}
 
-        a = self.config_data.get("auto", {}) or {}
-
-        self.auto.running = True
+        a = self.config.auto
         self.auto.phase = "init"
         self.auto.msg = "初始化"
         self.auto.applied = []
         self.auto.started_at = datetime.now().strftime("%H:%M:%S")
         self.auto.finished_at = ""
-        self.auto.plan = {
-            "date": self.target_date,
-            "slot_start": a.get("slot_start", "19:30"),
-            "slot_end":   a.get("slot_end",   "21:30"),
-            "save_order_at": a.get("save_order_at") or a.get("refresh_at", "20:00:04"),
-            "court_order": list(self.auto_court_order),
-        }
-        self._auto_task = asyncio.create_task(self._auto_loop())
+        self.auto.plan = AutoPlan(self.target_date, a, self.config.courts)
+        self.jobs.start("auto", self._auto_loop())
         return {"ok": True}
 
     async def stop_auto(self):
-        if self._auto_task and not self._auto_task.done():
-            self._auto_task.cancel()
-            try:
-                await self._auto_task
-            except asyncio.CancelledError:
-                pass
-        if self._auto_warmup_task and not self._auto_warmup_task.done():
-            self._auto_warmup_task.cancel()
-            try:
-                await self._auto_warmup_task
-            except (asyncio.CancelledError, Exception):
-                pass
-        self._auto_warmup_task = None
-        self.auto.running = False
+        if not self.jobs.running("auto"):
+            return
+        await self.jobs.stop("auto")
         self.auto.phase = "stopped"
         self.auto.msg = "已手动停止"
         self.auto.finished_at = datetime.now().strftime("%H:%M:%S")
-
-    async def _warmup_get_order(self):
-        """下单前预热 curl_cffi 连接：查当天 6 号场，不等结果，失败/超时忽略。
-        走 get_cffi_session() 全局池，连接留在池里，2s 后 saveOrder 复用同一条 TCP+TLS+H2。
-        """
-        court = self.court_by_no.get(6) or (self.courts[0] if self.courts else None)
-        if not court:
-            return
-        today = datetime.now().strftime("%Y-%m-%d")
-        try:
-            log.info("自动模式: 预热连接 → getOrderOnce %s @ %s", court.name, today)
-            await get_order_once(court, today, self.token, self.user_id, timeout=1.5)
-            log.info("自动模式: 预热完成 %s", court.name)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            log.info("自动模式: 预热异常（忽略）: %s", e)
 
     async def _try_auto_order(self, court, start, end, date: str):
         try:
@@ -986,7 +866,7 @@ class Engine:
             if not vid:
                 async with self._solve_sem:
                     vid, _ = await get_vid_once(timeout=self.tuning.vid_timeout)
-            r = await self._save_order(vid, court, date, start, end, self.token)
+            r = await self._save_order(vid, court, date, start, end, self.session.token)
         except Exception as e:
             r = {"success": False, "msg": f"下单异常: {type(e).__name__}: {e}"}
         await self._publish_order_result(court, r, date)
@@ -994,7 +874,9 @@ class Engine:
 
     async def _auto_loop(self):
         applied: list[dict] = []
-        date = self.auto.plan["date"]
+        plan = self.auto.plan
+        assert plan is not None
+        date = plan.date
 
         def has_success() -> bool:
             return any(a["ok"] for a in applied)
@@ -1014,10 +896,9 @@ class Engine:
                     court.name, "成功" if ok else "失败", msg)
 
         try:
-            a = self.config_data.get("auto", {}) or {}
-            slot_start = a.get("slot_start", "19:30")
-            slot_end   = a.get("slot_end",   "21:30")
-            save_order_at = a.get("save_order_at") or a.get("refresh_at", "20:00:02")
+            slot_start = plan.config.slot_start
+            slot_end = plan.config.slot_end
+            save_order_at = plan.config.save_order_at
             save_dt = self._parse_hms(save_order_at)
 
             # ── ① Token 自动刷新 ──
@@ -1071,12 +952,8 @@ class Engine:
             log.info("自动模式: 等待并发查询 %s", query_dt.strftime("%H:%M:%S.%f")[:-3])
             await self._sleep_until(query_dt)
 
-            # 查询前读取最新时段和场地顺序
-            a2 = self.config_data.get("auto", {}) or {}
-            slot_start = a2.get("slot_start", slot_start)
-            slot_end = a2.get("slot_end", slot_end)
-            courts = [self.court_by_no[n] for n in self.auto_court_order[:3]
-                      if n in self.court_by_no]
+            courts = [c for n in plan.config.court_order[:3]
+                      for c in plan.courts if c.no == n]
             if not courts:
                 log.warning("自动模式: 前三个候选场地均未配置")
             else:
@@ -1140,7 +1017,6 @@ class Engine:
                 log.info("自动模式: 结束，停止 VID 池")
                 await self.stop_vid_pool()
 
-            self.auto.running = False
             self.auto.phase = "done"
             self.auto.msg = (f"结束：{'✅ 成功' if has_success() else '❌ 未成功'}"
                             f"（尝试 {len(applied)} 个）")
@@ -1185,7 +1061,7 @@ class Engine:
         return 4.0
 
     def leak_state(self) -> dict:
-        return {"running": self._leak_task is not None and not self._leak_task.done(),
+        return {"running": self.jobs.running("leak"),
                 "msg": self._leak_msg, "dates": self._leak_dates(),
                 "done_dates": sorted(self._leak_dates_done),
                 "paused": self._leak_paused(),
@@ -1195,19 +1071,20 @@ class Engine:
     async def start_leak(self) -> dict:
         if self.leak_state()["running"]:
             return {"ok": True}
-        if not self.token or not self.courts:
+        if not self.session.token or not self.config.courts:
             return {"ok": False, "msg": "请先配置 Token 和场地"}
         self._leak_msg = "等待检查"
         log.info("检漏模式已启动")
-        self._leak_task = asyncio.create_task(self._leak_loop())
+        self.leak_found = None
+        await self.bus.publish("leak.found", None)
+        self.jobs.start("leak", self._leak_loop())
         return {"ok": True}
 
     async def stop_leak(self):
-        if self._leak_task and not self._leak_task.done():
-            self._leak_task.cancel()
-            await asyncio.gather(self._leak_task, return_exceptions=True)
-        self._leak_task = None
+        await self.jobs.stop("leak")
         self._leak_msg = "已停止"
+        self.leak_found = None
+        await self.bus.publish("leak.found", None)
 
     async def _leak_loop(self):
         queries = 0
@@ -1234,8 +1111,8 @@ class Engine:
                 dates = [d for d in self._leak_dates(now)
                          if d not in self._leak_dates_done
                          and datetime.fromisoformat(d + "T20:00") > now]
-                auto_busy = self.auto.running and self.auto.phase != "waiting_token"
-                if not dates or auto_busy or self.refresh_running or self._reserve_inflight:
+                auto_busy = self.jobs.running("auto") and self.auto.phase != "waiting_token"
+                if not dates or auto_busy or self.refresh_running or self.reserve_inflight:
                     self._leak_msg = "等待目标日期或其他任务结束"
                     await asyncio.sleep(self.tuning.leak_interval)
                     continue
@@ -1244,9 +1121,9 @@ class Engine:
                 self._leak_msg = f"正在检查 {date}"
                 self._leak_scanning = True
                 try:
-                    for court in list(self.courts)[:10]:
-                        if ((self.auto.running and self.auto.phase != "waiting_token")
-                                or self.refresh_running or self._reserve_inflight):
+                    for court in list(self.config.courts)[:10]:
+                        if ((self.jobs.running("auto") and self.auto.phase != "waiting_token")
+                                or self.refresh_running or self.reserve_inflight):
                             break
                         now = datetime.now()
                         budget = self._leak_query_budget(now)
@@ -1266,8 +1143,9 @@ class Engine:
                         if slot:
                             self._leak_msg = f"发现 {date} {court.name} {slot[0]}-{slot[1]}，请确认预约"
                             log.info("检漏: %s", self._leak_msg)
-                            await self.bus.publish("leak.found", {"date": date, "court": court.no,
-                                                   "start": slot[0], "end": slot[1]})
+                            self.leak_found = {"date": date, "court": court.no,
+                                               "start": slot[0], "end": slot[1]}
+                            await self.bus.publish("leak.found", self.leak_found)
                             return
                     self._leak_msg = f"{date} 本轮检查结束"
                 finally:

@@ -17,7 +17,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 from datetime import date as Date
 
-from engine import engine, get_logs
+from engine import engine
 from utils import ROOT
 
 
@@ -49,114 +49,70 @@ def index():
 # ══════════════════════════════════════════════════════
 # 配置
 # ══════════════════════════════════════════════════════
-@app.get("/api/config")
-def get_config():
-    return engine.public_config()
+@app.get("/api/state")
+async def get_state():
+    return engine.snapshot()
 
 
 class ConfigIn(BaseModel):
     offset_days: int | None = None
     token: str | None = None
+    slot_start: str | None = None
+    slot_end: str | None = None
+    save_order_at: str | None = None
+    court_order: list[int] | None = None
 
 
-@app.post("/api/config")
+@app.patch("/api/config")
 async def set_config(d: ConfigIn):
     try:
         if d.offset_days is not None:
             engine.update_offset_days(d.offset_days)
         if d.token:
             engine.update_token(d.token)
-    except Exception as e:
-        return {"ok": False, "msg": str(e)}
-    await engine.apply_config_change()
-    return {"ok": True, "target_date": engine.target_date}
+        if any(v is not None for v in (d.slot_start, d.slot_end, d.save_order_at, d.court_order)):
+            a = engine.config.auto
+            await engine.update_auto_config(d.slot_start or a.slot_start,
+                d.slot_end or a.slot_end, d.save_order_at or a.save_order_at, d.court_order)
+        await engine.apply_config_change()
+        return {"ok": True, "target_date": engine.target_date}
+    except Exception as exc:
+        return {"ok": False, "msg": str(exc)}
 
 
-class AutoConfigIn(BaseModel):
-    slot_start: str
-    slot_end: str
-    save_order_at: str
-    court_order: list[int] | None = None
+class JobIn(BaseModel):
+    running: bool
+    date: Date | None = None
 
 
-@app.post("/api/auto/config")
-async def set_auto_config(d: AutoConfigIn):
-    try:
-        await engine.update_auto_config(
-            d.slot_start, d.slot_end, d.save_order_at, d.court_order,
-        )
-    except Exception as e:
-        return {"ok": False, "msg": str(e)}
-    await engine.apply_config_change()
-    return {"ok": True}
-
-
-# ══════════════════════════════════════════════════════
-# Token / mitm
-# ══════════════════════════════════════════════════════
-class TokenFetchIn(BaseModel):
-    timeout: float | None = None
+@app.put("/api/jobs/{name}")
+async def control_job(name: str, d: JobIn):
+    jobs = {"auto": (engine.start_auto, engine.stop_auto),
+            "leak": (engine.start_leak, engine.stop_leak),
+            "vid": (engine.start_vid_pool, engine.stop_vid_pool),
+            "refresh": (engine.start_refresh, engine.stop_refresh)}
+    if name not in jobs:
+        from fastapi import HTTPException
+        raise HTTPException(404, "Unknown job")
+    start, stop = jobs[name]
+    if not d.running:
+        await stop()
+        return {"ok": True}
+    if name == "refresh":
+        return await start(d.date.isoformat() if d.date else None)
+    return await start()
 
 
 @app.post("/api/token/fetch")
-async def token_fetch(d: TokenFetchIn):
+async def token_fetch():
     return await engine.fetch_token()
-
-
-@app.get("/api/mitm/state")
-def mitm_state_ep():
-    return engine.mitm_state()
 
 
 @app.post("/api/mitm/restart")
 async def mitm_restart_ep():
-    ok = await engine.restart_mitm()
-    return {"ok": ok}
+    return {"ok": await engine.restart_mitm()}
 
 
-# ══════════════════════════════════════════════════════
-# 日志
-# ══════════════════════════════════════════════════════
-@app.get("/api/logs")
-def logs_ep(since: int = 0):
-    return {"logs": get_logs(since)}
-
-
-# ══════════════════════════════════════════════════════
-# VID 池
-# ══════════════════════════════════════════════════════
-@app.post("/api/vid/start")
-async def vid_start():
-    return await engine.start_vid_pool()
-
-
-@app.post("/api/vid/stop")
-async def vid_stop():
-    await engine.stop_vid_pool()
-    return {"ok": True}
-
-
-@app.get("/api/vid/state")
-def vid_state():
-    return engine.vid_state()
-
-
-# ══════════════════════════════════════════════════════
-# 刷新
-# ══════════════════════════════════════════════════════
-@app.post("/api/refresh")
-async def refresh_ep(date: Date | None = None):
-    return await engine.start_refresh(date.isoformat() if date else None)
-
-
-@app.get("/api/refresh/seq")
-def refresh_seq():
-    return {"seq": engine.bus.seq}
-
-
-# ══════════════════════════════════════════════════════
-# 手动预约
-# ══════════════════════════════════════════════════════
 class ReserveIn(BaseModel):
     court_no: int
     start: str
@@ -169,74 +125,34 @@ async def reserve_ep(d: ReserveIn):
     return await engine.reserve(d.court_no, d.start, d.end, d.date.isoformat() if d.date else None)
 
 
-# ══════════════════════════════════════════════════════
-# 全自动
-# ══════════════════════════════════════════════════════
-@app.post("/api/auto/start")
-async def auto_start_ep():
-    return await engine.start_auto()
-
-
-@app.post("/api/auto/stop")
-async def auto_stop_ep():
-    await engine.stop_auto()
-    return {"ok": True}
-
-
-@app.get("/api/auto/state")
-def auto_state_ep():
-    return engine.auto_state()
-
-
-# ══════════════════════════════════════════════════════
-# SSE
-# ══════════════════════════════════════════════════════
-@app.post("/api/leak/start")
-async def leak_start():
-    return await engine.start_leak()
-
-
-@app.post("/api/leak/stop")
-async def leak_stop():
-    await engine.stop_leak()
-    return {"ok": True}
-
-
-@app.get("/api/leak/state")
-def leak_state():
-    return engine.leak_state()
-
-
 @app.get("/api/stream")
-async def stream_ep(since: int = 0):
-    q, hist = engine.bus.subscribe(since)
+async def stream_ep():
+    def frame(topic, data, seq=None):
+        prefix = f"id: {seq}\n" if seq is not None else ""
+        return prefix + f"event: {topic}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
     async def gen():
-        last = since
+        q = engine.bus.subscribe()
         try:
-            for e in hist:
-                yield f"event: {e['_topic']}\ndata: {json.dumps(e, ensure_ascii=False)}\n\n"
-                last = e["_seq"]
+            last = engine.bus.seq
+            yield frame("snapshot", engine.snapshot(), last)
             while True:
                 try:
-                    e = await asyncio.wait_for(q.get(), timeout=20)
+                    event = await asyncio.wait_for(q.get(), timeout=20)
                 except asyncio.TimeoutError:
                     yield ": ping\n\n"
                     continue
-                if e["_seq"] <= last:
-                    continue
-                last = e["_seq"]
-                yield (f"event: {e['_topic']}\n"
-                       f"data: {json.dumps(e, ensure_ascii=False)}\n\n")
-        except asyncio.CancelledError:
-            pass
+                if event is None:
+                    last = engine.bus.seq
+                    yield frame("snapshot", engine.snapshot(), last)
+                elif event["_seq"] > last:
+                    last = event["_seq"]
+                    yield frame(event["_topic"], event, last)
         finally:
             engine.bus.unsubscribe(q)
 
-    return StreamingResponse(
-        gen(), media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-    )
+    return StreamingResponse(gen(), media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 if __name__ == "__main__":

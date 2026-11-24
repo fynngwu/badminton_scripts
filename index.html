@@ -315,10 +315,8 @@ const SCAN_START = 8 * 60;
 const SCAN_END   = 22 * 60;
 const MAX_SLOTS  = 4;
 
-let lastLog = 0, sse = null;
-let vidRunning = false, autoRunning = false, refreshRunning = false;
-let freeByStart = {};
-let occByCourt  = {};
+let sse = null;
+const state = {jobs: {}, courts: new Map(), lastLog: 0};
 
 const escHtml = s => String(s).replace(/[&<>"']/g, c =>
   ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" }[c]));
@@ -402,6 +400,13 @@ function groupByName(spans) {
 }
 
 function renderFree() {
+  const freeByStart = {};
+  for (const r of state.courts.values()) {
+    if (r.date !== $("cur-date").textContent) continue;
+    for (const run of computeRuns(r.avail)) {
+      (freeByStart[run.start] ||= []).push({court: r.court, ...run});
+    }
+  }
   const box = $("free");
   const starts = Object.keys(freeByStart);
   if (!starts.length) { box.innerHTML = `<div class="hint">暂无空闲场地</div>`; return; }
@@ -436,8 +441,10 @@ function renderFree() {
 
 function renderOccupied() {
   const allSpans = [];
-  for (const cno in occByCourt) {
-    for (const sp of occByCourt[cno]) allSpans.push({ ...sp, court: +cno });
+  for (const r of state.courts.values()) {
+    if (r.date !== $("cur-date").textContent) continue;
+    const blocks = (r.blocks || []).filter(b => b && b.time && b.time < "22:00");
+    for (const sp of mergeBlocks(blocks)) allSpans.push({...sp, court: r.court});
   }
 
   const box = $("occupied");
@@ -550,47 +557,21 @@ function renderOccupied() {
 }
 
 function render() { renderFree(); renderOccupied(); }
-function reset() { freeByStart = {}; occByCourt = {}; render(); }
-
 function onResult(r) {
-  if (!r || !r.ok || r.date !== $("cur-date").textContent) return;
-  const c = r.court;
-
-  for (const st in freeByStart) {
-    freeByStart[st] = freeByStart[st].filter(x => x.court !== c);
-    if (!freeByStart[st].length) delete freeByStart[st];
-  }
-
-  if (Array.isArray(r.blocks)) {
-    const trimmed = r.blocks.filter(b => b && b.time && b.time < "22:00");
-    occByCourt[c] = mergeBlocks(trimmed);
-  }
-
-  const a = r.avail;
-  if (a) {
-    for (const run of computeRuns(a)) {
-      if (!freeByStart[run.start]) freeByStart[run.start] = [];
-      freeByStart[run.start].push({ court: c, start: run.start, end: run.end });
-    }
-  }
+  if (!r || !r.ok) return;
+  state.courts.set(`${r.date}/${r.court}`, r);
   render();
 }
 
 function addLog(e) {
+  if (e.seq <= state.lastLog) return;
+  state.lastLog = e.seq;
   const el = $("log");
   const div = document.createElement("div");
   div.className = "l-" + e.level;
   div.textContent = `[${e.ts}] [${e.level}] ${e.msg}`;
   el.insertBefore(div, el.firstChild);
   while (el.childNodes.length > 400) el.removeChild(el.lastChild);
-}
-
-async function pollLogs() {
-  try {
-    const r = await fetch("/api/logs?since=" + lastLog);
-    const d = await r.json();
-    for (const e of d.logs) { lastLog = e.seq; addLog(e); }
-  } catch {}
 }
 
 // ── 候选场地选择器 ──
@@ -624,7 +605,7 @@ function applyConfig(cfg) {
   if (o.target_date) $("cur-date").textContent = o.target_date;
   const tok = $("token");
   tok.placeholder = o.token_set
-    ? `已配置 ${o.token_preview}（粘贴新 token 覆盖）`
+    ? "已配置（粘贴新 token 覆盖）"
     : "粘贴 token";
 
   const a = cfg.auto;
@@ -647,39 +628,75 @@ function applyConfig(cfg) {
 
 async function loadConfig() {
   try {
-    const d = await (await fetch("/api/config")).json();
-    applyConfig(d);
+    const d = await (await fetch("/api/state")).json();
+    applyConfig(d.config);
   } catch {}
 }
 
 // ══════════════════════════════════════════════════════
 // SSE
 // ══════════════════════════════════════════════════════
-function connectSSE(since) {
-  if (sse) sse.close();
-  sse = new EventSource("/api/stream?since=" + since);
-  sse.onopen  = () => $("sse-dot").classList.add("on");
-  sse.onerror = () => $("sse-dot").classList.remove("on");
+function renderJobs(jobs) {
+  state.jobs = jobs;
+  const {vid, auto, refresh, leak} = jobs;
+  $("vid-count").textContent = vid.count;
+  $("btn-vid").textContent = vid.running ? "停止 VID" : "启动 VID";
+  const last = vid.stats.at(-1);
+  $("last-solve").textContent = last ? `最近 solve：${last.ok ? last.total_ms + "ms" : "失败"}` : "最近 solve：-";
+  $("btn-refresh").disabled = refresh.running;
+  $("btn-refresh").textContent = refresh.running ? "刷新中…" : "刷新场地";
+  $("btn-auto").textContent = auto.running ? "停止全自动" : "启动全自动";
+  $("auto-status").style.display = auto.phase === "idle" ? "none" : "";
+  $("auto-phase").textContent = auto.phase;
+  $("auto-msg").textContent = auto.msg;
+  $("auto-applied").textContent = (auto.applied || []).map(a => `${a.name}${a.ok ? "✓" : "✗"}`).join(" / ") || "无";
+  $("btn-leak").textContent = leak.running ? "停止检漏" : "启动检漏";
+  $("leak-status").textContent = `${leak.msg} | 目标：${leak.dates.join(" / ") || "无"}`;
+}
 
-  sse.addEventListener("leak.found", ev => {
-    const d = JSON.parse(ev.data).data;
-    const b = document.createElement("button");
-    b.className = "avail-btn";
-    Object.assign(b.dataset, {court: d.court, date: d.date, start: d.start, end: d.end});
-    b.textContent = `预约 ${d.date} ${d.court}号场 ${d.start}-${d.end}`;
-    $("leak-found").replaceChildren(b);
-    toast(b.textContent, "ok", 10000);
+function renderLeak(d) {
+  $("leak-found").replaceChildren();
+  if (!d) return;
+  const b = document.createElement("button");
+  b.className = "avail-btn";
+  Object.assign(b.dataset, {court: d.court, date: d.date, start: d.start, end: d.end});
+  b.textContent = `预约 ${d.date} ${d.court}号场 ${d.start}-${d.end}`;
+  $("leak-found").append(b);
+}
+
+function connectSSE() {
+  sse = new EventSource("/api/stream");
+  const buttons = ["btn-vid", "btn-refresh", "btn-auto", "btn-leak"];
+  for (const id of buttons) $(id).disabled = true;
+  sse.onerror = () => {
+    $("sse-dot").classList.remove("on");
+    for (const id of buttons) $(id).disabled = true;
+  };
+  sse.addEventListener("snapshot", ev => {
+    const d = JSON.parse(ev.data);
+    $("sse-dot").classList.add("on");
+    for (const id of buttons) $(id).disabled = false;
+    applyConfig(d.config);
+    state.courts = new Map(d.courts.map(r => [`${r.date}/${r.court}`, r]));
+    $("log").replaceChildren();
+    state.lastLog = 0;
+    d.logs.forEach(addLog);
+    renderJobs(d.jobs);
+    renderLeak(d.leak_found);
+    render();
   });
+  sse.addEventListener("jobs", ev => renderJobs(JSON.parse(ev.data).data));
+  sse.addEventListener("log", ev => addLog(JSON.parse(ev.data).data));
+  sse.addEventListener("leak.found", ev => renderLeak(JSON.parse(ev.data).data));
   sse.addEventListener("refresh.result", ev => onResult(JSON.parse(ev.data).data));
-  sse.addEventListener("refresh.done", () => {
-    refreshRunning = false;
-    const b = $("btn-refresh"); b.disabled = false; b.textContent = "刷新场地";
+  sse.addEventListener("refresh.reset", ev => {
+    const date = JSON.parse(ev.data).data.date;
+    for (const [key, r] of state.courts) if (r.date === date) state.courts.delete(key);
+    render();
   });
   sse.addEventListener("config.updated", ev => {
-    const d = JSON.parse(ev.data).data;
-    const old = $("cur-date").textContent;
-    applyConfig(d);
-    if (old && old !== "-" && d.order && d.order.target_date !== old) reset();
+    applyConfig(JSON.parse(ev.data).data);
+    render();
   });
 
   sse.addEventListener("order.result", ev => {
@@ -697,8 +714,8 @@ function connectSSE(since) {
 
 // ── 全自动参数：变更即写回 config.toml，多设备共享 ──
 async function saveAutoPlan() {
-  const r = await fetch("/api/auto/config", {
-    method: "POST", headers: {"Content-Type": "application/json"},
+  const r = await fetch("/api/config", {
+    method: "PATCH", headers: {"Content-Type": "application/json"},
     body: JSON.stringify({
       slot_start: $("auto-ss").value,
       slot_end:   $("auto-se").value,
@@ -723,7 +740,7 @@ $("date-offset").onchange = async () => {
   sel.disabled = true;
   try {
     const r = await fetch("/api/config", {
-      method: "POST", headers: {"Content-Type": "application/json"},
+      method: "PATCH", headers: {"Content-Type": "application/json"},
       body: JSON.stringify({ offset_days: +sel.value }),
     });
     const j = await r.json();
@@ -746,7 +763,7 @@ $("btn-save").onclick = async () => {
   const tok = $("token").value.trim();
   if (!tok) { toast("Token 为空，无需保存", "err"); return; }
   const r = await fetch("/api/config", {
-    method: "POST", headers: {"Content-Type": "application/json"},
+    method: "PATCH", headers: {"Content-Type": "application/json"},
     body: JSON.stringify({ token: tok }),
   });
   const j = await r.json();
@@ -782,33 +799,25 @@ $("btn-fetch-token").onclick = async () => {
   }
 };
 
-$("btn-vid").onclick = () =>
-  fetch(vidRunning ? "/api/vid/stop" : "/api/vid/start", {method: "POST"});
-
-$("btn-refresh").onclick = async () => {
-  if (refreshRunning) return;
-  reset();
-  const d = await (await fetch("/api/refresh?date=" + encodeURIComponent($("cur-date").textContent), {method: "POST"})).json();
-  if (!d.ok) { toast(d.msg, "err"); return; }
-  refreshRunning = true;
-  const b = $("btn-refresh"); b.disabled = true; b.textContent = "刷新中…";
-};
-
+async function setJob(name, running, extra = {}) {
+  try {
+    const r = await fetch(`/api/jobs/${name}`, {
+      method: "PUT", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({running, ...extra}),
+    });
+    const d = await r.json();
+    if (!r.ok || !d.ok) toast(d.msg || d.detail || "操作失败", "err");
+    return d.ok;
+  } catch (e) { toast(String(e), "err"); return false; }
+}
+$("btn-vid").onclick = () => setJob("vid", !state.jobs.vid?.running);
+$("btn-refresh").onclick = () => setJob("refresh", true, {date: $("cur-date").textContent});
 $("btn-auto").onclick = async () => {
-  if (autoRunning) {
-    await fetch("/api/auto/stop", {method: "POST"});
-    return;
-  }
-  if (pickedCourts.size === 0) {
-    toast("请先点亮至少一个候选场地", "err");
-    return;
-  }
-  const ok = await saveAutoPlan();
-  if (!ok) return;
-  const d = await (await fetch("/api/auto/start", {method: "POST"})).json();
-  if (!d.ok) { toast(d.msg, "err"); return; }
-  toast("全自动已启动", "ok");
+  if (state.jobs.auto?.running) return setJob("auto", false);
+  if (!pickedCourts.size) return toast("请先选择候选场地", "err");
+  if (await saveAutoPlan()) await setJob("auto", true);
 };
+$("btn-leak").onclick = () => setJob("leak", !state.jobs.leak?.running);
 
 // ── 点击场地：立即 ack，结果走 SSE ──
 document.addEventListener("click", async ev => {
@@ -840,62 +849,7 @@ document.addEventListener("click", async ev => {
   }
 });
 
-let leakRunning = false;
-async function pollLeak() {
-  try {
-    const d = await (await fetch("/api/leak/state")).json();
-    leakRunning = d.running;
-    $("btn-leak").textContent = leakRunning ? "停止检漏" : "启动检漏";
-    $("leak-status").textContent = `${d.msg} | 目标：${d.dates.join(" / ") || "无"}`;
-  } catch {}
-}
-$("btn-leak").onclick = async () => {
-  const b = $("btn-leak");
-  b.disabled = true;
-  try {
-    const d = await (await fetch(leakRunning ? "/api/leak/stop" : "/api/leak/start", {method: "POST"})).json();
-    if (!d.ok) toast(d.msg || "操作失败", "err");
-    await pollLeak();
-  } catch (e) { toast(String(e), "err"); }
-  finally { b.disabled = false; }
-};
-pollLeak();
-setInterval(pollLeak, 1000);
-
-setInterval(async () => {
-  try {
-    const d = await (await fetch("/api/vid/state")).json();
-    $("vid-count").textContent = d.count;
-    vidRunning = d.running;
-    $("btn-vid").textContent = vidRunning ? "停止 VID" : "启动 VID";
-    const s = d.stats[d.stats.length - 1];
-    $("last-solve").textContent = s
-      ? `最近 solve：${s.ok ? s.total_ms + "ms" : "失败"}`
-      : "最近 solve：-";
-  } catch {}
-  try {
-    const d = await (await fetch("/api/auto/state")).json();
-    autoRunning = d.running;
-    $("btn-auto").textContent = autoRunning ? "停止全自动" : "启动全自动";
-    if (autoRunning || d.phase === "done") {
-      $("auto-status").style.display = "";
-      $("auto-phase").textContent = d.phase;
-      $("auto-msg").textContent = d.msg;
-      $("auto-applied").textContent =
-        (d.applied || []).map(a => `${a.name}${a.ok ? "✓" : "✗"}`).join(" / ") || "无";
-    }
-  } catch {}
-}, 1000);
-
-window.addEventListener("DOMContentLoaded", async () => {
-  reset();
-  await loadConfig();
-  pollLogs(); setInterval(pollLogs, 1000);
-  try {
-    const d = await (await fetch("/api/refresh/seq")).json();
-    connectSSE(d.seq);
-  } catch { connectSSE(0); }
-});
+window.addEventListener("DOMContentLoaded", connectSSE);
 </script>
 </body>
 </html>
