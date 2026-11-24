@@ -162,7 +162,7 @@ _get_starts: deque = deque()
 _get_lock = asyncio.Lock()
 
 
-async def limited_get(url, *, court_name="", **kwargs):
+async def limited_get(url, *, court_name="", quiet: bool = False, **kwargs):
     """同进程所有 GET 共用限流：任意 8.7 秒内最多 14 次起发。"""
     async with _get_lock:
         while True:
@@ -179,24 +179,26 @@ async def limited_get(url, *, court_name="", **kwargs):
     tag = f"{name} {court_name}" if court_name else name
     sent = datetime.now().strftime("%H:%M:%S.%f")[:-3]
     start = time.monotonic()
-    log.debug("[GET %s] → 发送 @ %s", tag, sent)
+    if not quiet:
+        log.debug("[GET %s] → 发送 @ %s", tag, sent)
     try:
         r = await get_cffi_session().get(url, **kwargs)
-        info = ""
-        try:
-            j = r.json()
-            data = j.get("data") or {}
-            if name == "getGroundDetailByParam":
-                info = f"maxDay={data.get('canOrderMaxDay')}"
-            elif name != "getOrderTimeConfigList":
-                info = f"success={j.get('success')}"
-            if j.get("success") is False:
-                info += f" code={j.get('code')} msg={str(j.get('msg') or '')[:60]}"
-        except (ValueError, TypeError, AttributeError, KeyError):
-            info = "non-json/字段异常"
-        log.debug("[GET %s] ← 返回 @ %s (+%.0fms) HTTP %d %s",
-                 tag, datetime.now().strftime("%H:%M:%S.%f")[:-3],
-                 (time.monotonic() - start) * 1000, r.status_code, info)
+        if not quiet:
+            info = ""
+            try:
+                j = r.json()
+                data = j.get("data") or {}
+                if name == "getGroundDetailByParam":
+                    info = f"maxDay={data.get('canOrderMaxDay')}"
+                elif name != "getOrderTimeConfigList":
+                    info = f"success={j.get('success')}"
+                if j.get("success") is False:
+                    info += f" code={j.get('code')} msg={str(j.get('msg') or '')[:60]}"
+            except (ValueError, TypeError, AttributeError, KeyError):
+                info = "non-json/字段异常"
+            log.debug("[GET %s] ← 返回 @ %s (+%.0fms) HTTP %d %s",
+                     tag, datetime.now().strftime("%H:%M:%S.%f")[:-3],
+                     (time.monotonic() - start) * 1000, r.status_code, info)
         return r
     except Exception as e:
         log.warning("[GET %s] ✗ 异常 @ %s (+%.0fms): %s",
@@ -437,10 +439,10 @@ async def get_vid_once(timeout: float = 2.0,
 # 预约 API（走 cffi 全局 session，HTTP/2 + 连接复用）
 # ══════════════════════════════════════════════════════
 async def get_order_once(court: Court, date: str, token: str, user_id: str,
-                         timeout: float = 4.0) -> dict:
-    """单次查询某个场地的时段配置。"""
+                         timeout: float = 4.0, *, quiet: bool = False) -> dict:
+    """单次查询某个场地的时段配置；quiet 仅关闭常规 DEBUG 日志。"""
     try:
-        r = await limited_get(URL_QUERY, court_name=court.name, params={
+        r = await limited_get(URL_QUERY, court_name=court.name, quiet=quiet, params={
             "groundId": court.id, "startDate": date, "endDate": date,
             "userid": user_id, "token": token,
         }, timeout=timeout)

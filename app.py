@@ -15,6 +15,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
+from datetime import date as Date
 
 from engine import engine, get_logs
 from utils import ROOT
@@ -144,8 +145,8 @@ def vid_state():
 # 刷新
 # ══════════════════════════════════════════════════════
 @app.post("/api/refresh")
-async def refresh_ep():
-    return await engine.start_refresh()
+async def refresh_ep(date: Date | None = None):
+    return await engine.start_refresh(date.isoformat() if date else None)
 
 
 @app.get("/api/refresh/seq")
@@ -160,11 +161,12 @@ class ReserveIn(BaseModel):
     court_no: int
     start: str
     end: str
+    date: Date | None = None
 
 
 @app.post("/api/reserve")
 async def reserve_ep(d: ReserveIn):
-    return await engine.reserve(d.court_no, d.start, d.end)
+    return await engine.reserve(d.court_no, d.start, d.end, d.date.isoformat() if d.date else None)
 
 
 # ══════════════════════════════════════════════════════
@@ -189,6 +191,22 @@ def auto_state_ep():
 # ══════════════════════════════════════════════════════
 # SSE
 # ══════════════════════════════════════════════════════
+@app.post("/api/leak/start")
+async def leak_start():
+    return await engine.start_leak()
+
+
+@app.post("/api/leak/stop")
+async def leak_stop():
+    await engine.stop_leak()
+    return {"ok": True}
+
+
+@app.get("/api/leak/state")
+def leak_state():
+    return engine.leak_state()
+
+
 @app.get("/api/stream")
 async def stream_ep(since: int = 0):
     q, hist = engine.bus.subscribe(since)

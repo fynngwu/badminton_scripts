@@ -48,6 +48,12 @@ class Tuning:
     token_refresh_wait_sec:   float = 5.0    # 每次刷新后等待 token 变化
     token_refresh_max_tries:  int   = 3      # 最多刷新 3 次
 
+    # ── 检漏 ──
+    leak_interval:            float = 10.0
+    leak_pause_start:         str = "19:55"
+    leak_pause_end:           str = "20:05"
+    leak_summary_interval:    float = 600.0
+
     # ── VID ──
     vid_timeout:              float = 2.0
     vid_max_age:              float = 7.9
@@ -139,7 +145,7 @@ def setup_logging():
     log.addHandler(console)
     folder = Path(__file__).resolve().parent / "logs"
     folder.mkdir(exist_ok=True)
-    archive = TimedRotatingFileHandler(folder / "debug.log", when="midnight", backupCount=0, encoding="utf-8")
+    archive = TimedRotatingFileHandler(folder / "debug.log", when="midnight", backupCount=7, encoding="utf-8")
     archive.suffix = "%Y-%m-%d"
     archive.setLevel(logging.DEBUG)
     archive.setFormatter(logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
@@ -183,6 +189,11 @@ class Engine:
         # ── runtime ──
         self.bus = EventBus()
         self.auto = AutoState()
+        self._leak_task: asyncio.Task | None = None
+        self._leak_scanning = False
+        self._leak_msg = "未启动"
+        self._leak_dates_done: set[str] = set()
+        self._leak_cursor = 0
 
         self._vid_queue: asyncio.Queue = asyncio.Queue(maxsize=6)
         self._vid_tasks: list[asyncio.Task] = []
@@ -332,6 +343,7 @@ class Engine:
                 await t
             except (asyncio.CancelledError, Exception):
                 pass
+        await self.stop_leak()
         await self.stop_vid_pool()
         await self.stop_refresh()
         await self.stop_auto()
@@ -694,7 +706,10 @@ class Engine:
             return True
         return any(not t.done() for t in self._refresh_tasks)
 
-    async def start_refresh(self) -> dict:
+    async def start_refresh(self, date: str | None = None) -> dict:
+        date = date or self.target_date
+        if self._leak_scanning:
+            return {"ok": False, "msg": "检漏正在查询，请稍后刷新"}
         if not self.token:
             return {"ok": False, "msg": "未配置 token"}
         await self.stop_refresh()
@@ -705,7 +720,7 @@ class Engine:
         log.info("启动刷新: 探测 %s → 成功后并发剩余 %d 个场地 (退避 %.1fs / 最多 %d 次)",
                  pool[0].name, len(pool) - 1,
                  self.tuning.probe_backoff, self.tuning.probe_max_tries)
-        self._refresh_probe_task = asyncio.create_task(self._refresh_run(pool))
+        self._refresh_probe_task = asyncio.create_task(self._refresh_run(pool, date))
         return {"ok": True, "total": len(pool)}
 
     async def stop_refresh(self):
@@ -718,14 +733,14 @@ class Engine:
         self._refresh_probe_task = None
         self._refresh_tasks = []
 
-    async def _refresh_run(self, pool: list[Court]):
+    async def _refresh_run(self, pool: list[Court], date: str):
         try:
-            await self._refresh_probe_then_fanout(pool)
+            await self._refresh_probe_then_fanout(pool, date)
         finally:
             await self.bus.publish("refresh.done",
-                                   {"ts": datetime.now().strftime("%H:%M:%S")})
+                                   {"date": date, "ts": datetime.now().strftime("%H:%M:%S")})
 
-    async def _refresh_probe_then_fanout(self, pool: list[Court]):
+    async def _refresh_probe_then_fanout(self, pool: list[Court], date: str):
         probe, rest = pool[0], pool[1:]
         max_tries = max(1, int(self.tuning.probe_max_tries))
         backoff   = max(0.0, float(self.tuning.probe_backoff))
@@ -733,12 +748,12 @@ class Engine:
         ok = False
         for attempt in range(1, max_tries + 1):
             t0 = time.monotonic()
-            res = await get_order_once(probe, self.target_date,
+            res = await get_order_once(probe, date,
                                        self.token, self.user_id)
             dt = (time.monotonic() - t0) * 1000
 
             if res.get("ok"):
-                await self._publish_refresh(probe, res)
+                await self._publish_refresh(probe, res, date)
                 ok = True
                 break
 
@@ -759,32 +774,35 @@ class Engine:
             await self._publish_refresh(probe, {
                 "ok": False,
                 "error": f"探测 {max_tries} 次全部失败",
-            })
+            }, date)
             return
 
-        await self._refresh_courts(rest)
+        await self._refresh_courts(rest, date)
 
-    async def _refresh_one(self, court: Court, timeout: float | None = None):
+    async def _refresh_one(self, court: Court, date: str, timeout: float | None = None, *, publish: bool = True, quiet: bool = False):
         try:
-            query = get_order_once(court, self.target_date, self.token, self.user_id)
+            query = get_order_once(court, date, self.token, self.user_id, quiet=quiet)
             res = await asyncio.wait_for(query, timeout) if timeout else await query
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            log.warning("刷新 %s 失败: %s", court.name, exc)
+            if not quiet:
+                log.warning("刷新 %s 失败: %s", court.name, exc)
             res = {"ok": False, "error": str(exc)}
-        await self._publish_refresh(court, res)
+        if publish:
+            await self._publish_refresh(court, res, date)
         return court, res
 
-    async def _refresh_courts(self, courts: list[Court], timeout: float | None = None):
-        self._refresh_tasks = [asyncio.create_task(self._refresh_one(c, timeout)) for c in courts]
+    async def _refresh_courts(self, courts: list[Court], date: str, timeout: float | None = None):
+        self._refresh_tasks = [asyncio.create_task(self._refresh_one(c, date, timeout)) for c in courts]
         try:
             return await asyncio.gather(*self._refresh_tasks)
         finally:
             self._refresh_tasks = []
 
-    async def _publish_refresh(self, court: Court, res: dict):
+    async def _publish_refresh(self, court: Court, res: dict, date: str):
         evt = {
+            "date": date,
             "court": court.no,
             "name":  court.name,
             "ok":    bool(res.get("ok")),
@@ -805,7 +823,8 @@ class Engine:
     # ══════════════════════════════════════════════════
     # 手动下单
     # ══════════════════════════════════════════════════
-    async def reserve(self, court_no: int, start: str, end: str) -> dict:
+    async def reserve(self, court_no: int, start: str, end: str, date: str | None = None) -> dict:
+        date = date or self.target_date
         if not self.token:
             return {"accepted": False, "kind": "err",
                     "label": "❌ 未配置 Token",
@@ -817,19 +836,19 @@ class Engine:
                     "label": "❌ 非法场地",
                     "msg": f"非法场地号 {court_no}"}
 
-        key = (court.no, start, end)
+        key = (date, court.no, start, end)
         if key in self._reserve_inflight:
             return {"accepted": False, "kind": "warn",
                     "label": "⏳ 该时段已在提交",
                     "msg": "同一时段已有请求在飞"}
 
         self._reserve_inflight.add(key)
-        asyncio.create_task(self._reserve_worker(key, court, start, end))
+        asyncio.create_task(self._reserve_worker(key, court, start, end, date))
 
         return {"accepted": True, "court": court.no, "name": court.name,
-                "start": start, "end": end}
+                "start": start, "end": end, "date": date}
 
-    async def _reserve_worker(self, key, court: Court, start: str, end: str):
+    async def _reserve_worker(self, key, court: Court, start: str, end: str, date: str):
         try:
             vid: str | None = None
 
@@ -843,13 +862,13 @@ class Engine:
                     vid, _ = await get_vid_once(timeout=self.tuning.vid_timeout,
                                                 impersonate="chrome124")
 
-            r = await self._save_order(vid, court, self.target_date,
+            r = await self._save_order(vid, court, date,
                                        start, end, self.token)
-            await self._publish_order_result(court, r)
+            await self._publish_order_result(court, r, date)
         except Exception as e:
             log.exception("reserve worker 异常: %s", e)
             await self.bus.publish("order.result", {
-                "court": court.no, "name": court.name,
+                "court": court.no, "name": court.name, "date": date,
                 "kind": "error", "label": "❌ 下单异常",
                 "msg": str(e),
                 "ts": datetime.now().strftime("%H:%M:%S"),
@@ -869,10 +888,13 @@ class Engine:
             gym_name=self.gym_name,
         )
 
-    async def _publish_order_result(self, court: Court, result: dict):
+    async def _publish_order_result(self, court: Court, result: dict, date: str):
+        if result.get("success"):
+            self._leak_dates_done.add(date)
         kind, label = classify_order_reply(result)
         try:
             await self.bus.publish("order.result", {
+                "date": date,
                 "court": court.no,
                 "name":  court.name,
                 "kind":  kind,
@@ -958,20 +980,21 @@ class Engine:
         except Exception as e:
             log.info("自动模式: 预热异常（忽略）: %s", e)
 
-    async def _try_auto_order(self, court, start, end):
+    async def _try_auto_order(self, court, start, end, date: str):
         try:
             vid = await self.take_vid(timeout=2.0)
             if not vid:
                 async with self._solve_sem:
                     vid, _ = await get_vid_once(timeout=self.tuning.vid_timeout)
-            r = await self._save_order(vid, court, self.target_date, start, end, self.token)
+            r = await self._save_order(vid, court, date, start, end, self.token)
         except Exception as e:
             r = {"success": False, "msg": f"下单异常: {type(e).__name__}: {e}"}
-        await self._publish_order_result(court, r)
+        await self._publish_order_result(court, r, date)
         return bool(r.get("success")), str(r.get("msg", "") or "")
 
     async def _auto_loop(self):
         applied: list[dict] = []
+        date = self.auto.plan["date"]
 
         def has_success() -> bool:
             return any(a["ok"] for a in applied)
@@ -983,7 +1006,7 @@ class Engine:
 
         async def _grab_one(court: Court, start: str, end: str) -> None:
             try:
-                ok, msg = await self._try_auto_order(court, start, end)
+                ok, msg = await self._try_auto_order(court, start, end, date)
             except Exception as e:
                 ok, msg = False, f"异常: {type(e).__name__}: {e}"
             record(court, ok, msg)
@@ -1063,7 +1086,7 @@ class Engine:
                 self.auto.msg = "并发查询前三个候选场地"
 
                 async def query_one(court):
-                    return await self._refresh_one(court, timeout=4.0)
+                    return await self._refresh_one(court, date, timeout=4.0)
 
                 tasks = [asyncio.create_task(query_one(c)) for c in courts]
                 try:
@@ -1122,6 +1145,139 @@ class Engine:
             self.auto.msg = (f"结束：{'✅ 成功' if has_success() else '❌ 未成功'}"
                             f"（尝试 {len(applied)} 个）")
             self.auto.finished_at = datetime.now().strftime("%H:%M:%S")
+
+    # ══════════════════════════════════════════════════
+    # 常驻检漏：独立日期、单轮最多一个日期、发现空位后提示预约
+    # ══════════════════════════════════════════════════
+    @staticmethod
+    def _leak_dates(now: datetime | None = None) -> list[str]:
+        now = now or datetime.now()
+        days = 2 if now.hour >= 20 else 1
+        return [d.isoformat() for i in range(days + 1)
+                if (d := now.date() + timedelta(days=i)).weekday() in (1, 3)]
+
+    @staticmethod
+    def _leak_slot(date: str, avail: dict, now: datetime | None = None):
+        now = now or datetime.now()
+        for minute in range(18 * 60, 20 * 60 + 1, 30):
+            start = f"{minute // 60:02d}:{minute % 60:02d}"
+            dt = datetime.fromisoformat(f"{date}T{start}")
+            if dt <= now:
+                continue
+            slots = [(dt + timedelta(minutes=30 * i)).strftime("%H:%M")
+                     for i in range(4)]
+            if all(str(avail.get(t)) == "1" for t in slots):
+                return start, (dt + timedelta(hours=2)).strftime("%H:%M")
+        return None
+
+    def _leak_paused(self, now: datetime | None = None) -> bool:
+        hm = (now or datetime.now()).strftime("%H:%M")
+        return self.tuning.leak_pause_start <= hm < self.tuning.leak_pause_end
+
+    def _leak_query_budget(self, now: datetime) -> float:
+        """避免等待限流的检漏请求跨过暂停起点。"""
+        if self._leak_paused(now):
+            return 0.0
+        pause_start = datetime.fromisoformat(
+            f"{now.date()}T{self.tuning.leak_pause_start}")
+        if now < pause_start:
+            return min(4.0, max(0.0, (pause_start - now).total_seconds() - 0.1))
+        return 4.0
+
+    def leak_state(self) -> dict:
+        return {"running": self._leak_task is not None and not self._leak_task.done(),
+                "msg": self._leak_msg, "dates": self._leak_dates(),
+                "done_dates": sorted(self._leak_dates_done),
+                "paused": self._leak_paused(),
+                "pause_start": self.tuning.leak_pause_start,
+                "pause_end": self.tuning.leak_pause_end}
+
+    async def start_leak(self) -> dict:
+        if self.leak_state()["running"]:
+            return {"ok": True}
+        if not self.token or not self.courts:
+            return {"ok": False, "msg": "请先配置 Token 和场地"}
+        self._leak_msg = "等待检查"
+        log.info("检漏模式已启动")
+        self._leak_task = asyncio.create_task(self._leak_loop())
+        return {"ok": True}
+
+    async def stop_leak(self):
+        if self._leak_task and not self._leak_task.done():
+            self._leak_task.cancel()
+            await asyncio.gather(self._leak_task, return_exceptions=True)
+        self._leak_task = None
+        self._leak_msg = "已停止"
+
+    async def _leak_loop(self):
+        queries = 0
+        last_summary = time.monotonic()
+        paused = False
+        try:
+            while True:
+                now = datetime.now()
+                if self._leak_paused(now):
+                    self._leak_msg = (f"每日暂停 {self.tuning.leak_pause_start}–"
+                                      f"{self.tuning.leak_pause_end}")
+                    if not paused:
+                        log.info("检漏: %s", self._leak_msg)
+                    paused = True
+                    await asyncio.sleep(self.tuning.leak_interval)
+                    continue
+                if paused:
+                    log.info("检漏: 每日暂停结束，恢复检查")
+                    paused = False
+                if time.monotonic() - last_summary >= self.tuning.leak_summary_interval:
+                    log.info("检漏运行正常，累计查询 %d 次", queries)
+                    last_summary = time.monotonic()
+                self._leak_dates_done.intersection_update(self._leak_dates(now))
+                dates = [d for d in self._leak_dates(now)
+                         if d not in self._leak_dates_done
+                         and datetime.fromisoformat(d + "T20:00") > now]
+                auto_busy = self.auto.running and self.auto.phase != "waiting_token"
+                if not dates or auto_busy or self.refresh_running or self._reserve_inflight:
+                    self._leak_msg = "等待目标日期或其他任务结束"
+                    await asyncio.sleep(self.tuning.leak_interval)
+                    continue
+                date = dates[self._leak_cursor % len(dates)]
+                self._leak_cursor += 1
+                self._leak_msg = f"正在检查 {date}"
+                self._leak_scanning = True
+                try:
+                    for court in list(self.courts)[:10]:
+                        if ((self.auto.running and self.auto.phase != "waiting_token")
+                                or self.refresh_running or self._reserve_inflight):
+                            break
+                        now = datetime.now()
+                        budget = self._leak_query_budget(now)
+                        if budget < 4.0:
+                            # 临近暂停起点时不再开始新查询。
+                            break
+                        _, res = await self._refresh_one(
+                            court, date, timeout=budget, publish=False, quiet=True)
+                        queries += 1
+                        if self._leak_paused():
+                            break
+                        if not res.get("ok"):
+                            self._leak_msg = f"查询失败，已暂停：{res.get('error', '未知错误')}"
+                            log.warning("检漏 %s %s", date, self._leak_msg)
+                            return
+                        slot = self._leak_slot(date, res.get("avail", {}))
+                        if slot:
+                            self._leak_msg = f"发现 {date} {court.name} {slot[0]}-{slot[1]}，请确认预约"
+                            log.info("检漏: %s", self._leak_msg)
+                            await self.bus.publish("leak.found", {"date": date, "court": court.no,
+                                                   "start": slot[0], "end": slot[1]})
+                            return
+                    self._leak_msg = f"{date} 本轮检查结束"
+                finally:
+                    self._leak_scanning = False
+                await asyncio.sleep(self.tuning.leak_interval)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._leak_msg = f"检漏异常：{exc}"
+            log.exception("检漏异常")
 
     # ══════════════════════════════════════════════════
     # 时间小工具

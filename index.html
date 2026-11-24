@@ -247,6 +247,16 @@ button:disabled {
   </div>
 </div>
 
+<div class="card">
+  <div class="row">
+    <label style="font-weight:700;">常驻检漏</label>
+    <button class="auto" id="btn-leak">启动检漏</button>
+    <span class="mini">周二 / 周四 · 18:00–22:00 · 每轮间隔10秒 · 每日19:55–20:05暂停</span>
+  </div>
+  <div class="mini" id="leak-status" style="margin-top:8px;">未启动</div>
+  <div id="leak-found" class="row" style="margin-top:8px;"></div>
+</div>
+
 <div class="card" id="auto-status" style="display:none">
   <span class="pill" id="auto-phase">idle</span>
   <span class="mini" id="auto-msg" style="margin-left:10px;"></span>
@@ -411,7 +421,7 @@ function renderFree() {
   box.innerHTML = groups.map(({ st, items }) => {
     const rows = items.map(i =>
       `<button class="avail-btn"
-        data-court="${i.court}" data-start="${i.start}" data-end="${i.end}">
+        data-date="${escHtml($("cur-date").textContent)}" data-court="${i.court}" data-start="${i.start}" data-end="${i.end}">
         ${i.court}号场 · ${i.start}-${i.end}
       </button>`).join("");
     return `<div class="occ-group" style="border-left-color:#2ea043;">
@@ -543,7 +553,7 @@ function render() { renderFree(); renderOccupied(); }
 function reset() { freeByStart = {}; occByCourt = {}; render(); }
 
 function onResult(r) {
-  if (!r || !r.ok) return;
+  if (!r || !r.ok || r.date !== $("cur-date").textContent) return;
   const c = r.court;
 
   for (const st in freeByStart) {
@@ -651,6 +661,15 @@ function connectSSE(since) {
   sse.onopen  = () => $("sse-dot").classList.add("on");
   sse.onerror = () => $("sse-dot").classList.remove("on");
 
+  sse.addEventListener("leak.found", ev => {
+    const d = JSON.parse(ev.data).data;
+    const b = document.createElement("button");
+    b.className = "avail-btn";
+    Object.assign(b.dataset, {court: d.court, date: d.date, start: d.start, end: d.end});
+    b.textContent = `预约 ${d.date} ${d.court}号场 ${d.start}-${d.end}`;
+    $("leak-found").replaceChildren(b);
+    toast(b.textContent, "ok", 10000);
+  });
   sse.addEventListener("refresh.result", ev => onResult(JSON.parse(ev.data).data));
   sse.addEventListener("refresh.done", () => {
     refreshRunning = false;
@@ -672,7 +691,7 @@ function connectSSE(since) {
     const name  = d.name || (d.court ? `${d.court}号场` : "");
     const msg   = d.msg ? `  —  ${d.msg}` : "";
     const code  = (d.code != null && d.code !== "") ? `  [code=${d.code}]` : "";
-    toast(`${label} · ${name}${code}${msg}`, kind, 5000);
+    toast(`${label} · ${d.date || ""} ${name}${code}${msg}`, kind, 5000);
   });
 }
 
@@ -769,7 +788,7 @@ $("btn-vid").onclick = () =>
 $("btn-refresh").onclick = async () => {
   if (refreshRunning) return;
   reset();
-  const d = await (await fetch("/api/refresh", {method: "POST"})).json();
+  const d = await (await fetch("/api/refresh?date=" + encodeURIComponent($("cur-date").textContent), {method: "POST"})).json();
   if (!d.ok) { toast(d.msg, "err"); return; }
   refreshRunning = true;
   const b = $("btn-refresh"); b.disabled = true; b.textContent = "刷新中…";
@@ -805,7 +824,7 @@ document.addEventListener("click", async ev => {
     const r = await fetch("/api/reserve", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({ court_no: courtNo, start, end }),
+      body: JSON.stringify({ court_no: courtNo, start, end, date: el.dataset.date }),
     });
     const d = await r.json();
 
@@ -820,6 +839,28 @@ document.addEventListener("click", async ev => {
     toast(`❌ 请求失败：${e}`, "err", 4000);
   }
 });
+
+let leakRunning = false;
+async function pollLeak() {
+  try {
+    const d = await (await fetch("/api/leak/state")).json();
+    leakRunning = d.running;
+    $("btn-leak").textContent = leakRunning ? "停止检漏" : "启动检漏";
+    $("leak-status").textContent = `${d.msg} | 目标：${d.dates.join(" / ") || "无"}`;
+  } catch {}
+}
+$("btn-leak").onclick = async () => {
+  const b = $("btn-leak");
+  b.disabled = true;
+  try {
+    const d = await (await fetch(leakRunning ? "/api/leak/stop" : "/api/leak/start", {method: "POST"})).json();
+    if (!d.ok) toast(d.msg || "操作失败", "err");
+    await pollLeak();
+  } catch (e) { toast(String(e), "err"); }
+  finally { b.disabled = false; }
+};
+pollLeak();
+setInterval(pollLeak, 1000);
 
 setInterval(async () => {
   try {
