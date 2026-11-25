@@ -66,16 +66,19 @@ class ConfigIn(BaseModel):
 @app.patch("/api/config")
 async def set_config(d: ConfigIn):
     try:
+        token_result = {}
+        if d.token is not None:
+            token_result = engine.update_token(d.token)
+            if not token_result["ok"]:
+                return token_result
         if d.offset_days is not None:
             engine.update_offset_days(d.offset_days)
-        if d.token:
-            engine.update_token(d.token)
         if any(v is not None for v in (d.slot_start, d.slot_end, d.save_order_at, d.court_order)):
             a = engine.config.auto
             await engine.update_auto_config(d.slot_start or a.slot_start,
                 d.slot_end or a.slot_end, d.save_order_at or a.save_order_at, d.court_order)
         await engine.apply_config_change()
-        return {"ok": True, "target_date": engine.target_date}
+        return {"ok": True, "target_date": engine.target_date, **token_result}
     except Exception as exc:
         return {"ok": False, "msg": str(exc)}
 
@@ -103,9 +106,9 @@ async def control_job(name: str, d: JobIn):
     return await start()
 
 
-@app.post("/api/token/fetch")
-async def token_fetch():
-    return await engine.fetch_token()
+@app.post("/api/window/refresh")
+async def refresh_window_ep():
+    return await engine.refresh_reservation_window()
 
 
 @app.post("/api/mitm/restart")

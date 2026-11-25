@@ -243,7 +243,7 @@ reservation.sustech.edu.cn
 
 对应的羽毛球预约页面。
 
-自动抓 Token 时，这个窗口必须存在。程序会寻找标题包含 `reservation` 的窗口，切到前台并发送 `Ctrl + R`。
+点击“刷新预约窗口”会让程序将已打开的预约窗口切到前台并发送 Ctrl+R。
 
 注意：
 
@@ -277,12 +277,12 @@ http://127.0.0.1:8000
 
 网页中按需操作：
 
-1. 自动获取 Token
+1. 保存平台提供的 Token
 2. 刷新场地
 3. 启动 VID
 4. 按需开启全自动模式
 
-Token 会自动写入 `config.toml`。
+“保存 Token”会写入 config.toml。保存相同值时提示“Token 未变化”。
 
 ---
 
@@ -339,7 +339,7 @@ python app.py
 2. 打开预约页面
 3. 打开 Clash
 4. 浏览器打开 `http://127.0.0.1:8000`
-5. 点击“自动获取 Token”
+5. 按需点击“刷新预约窗口”，保存平台提供的 Token
 6. 点击“刷新场地”
 7. 按需启动 VID / 全自动模式
 
@@ -376,6 +376,6 @@ uv pip install pywin32
 [ ] Clash 只把 reservation.sustech.edu.cn 转发到 127.0.0.1:8080
 [ ] 企业微信已登录，预约页面已打开
 [ ] python app.py 能启动，http://127.0.0.1:8000 能打开
-[ ] 自动获取 Token、刷新场地、VID 正常
+[ ] 刷新预约窗口、保存 Token、刷新场地和 VID 正常
 [ ] 如需手机访问，再配置 Tailscale 和防火墙
 ```

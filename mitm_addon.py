@@ -1,11 +1,6 @@
 """mitm_addon.py — mitmproxy 入口。
 
-正常运行：
-- request: 捕获并更新 token。
-
-首次部署：
-- response: 捕获 getUserInfoByUserid 返回值，
-  自动写入 user.id / customer_id / name / tel / token。
+首次部署：自动写入 user.id / customer_id / name / tel。
 
 手工测试窗口刷新：
     python mitm_addon.py refresh
@@ -17,15 +12,11 @@ import re
 import sys
 import time
 
-from utils import CONFIG_PATH, capture_token_from_flow
+from utils import CONFIG_PATH
 
 
 PROFILE_API = "/api/blade-app/qywx/getUserInfoByUserid"
 PROFILE_HOST = "reservation.sustech.edu.cn"
-
-
-def request(flow) -> None:  # type: ignore[no-untyped-def]
-    capture_token_from_flow(flow)
 
 
 def _replace_in_section(text: str, section: str, key: str, value: str) -> str:
@@ -89,19 +80,11 @@ def response(flow) -> None:  # type: ignore[no-untyped-def]
         for (section, key), value in values.items():
             text = _replace_in_section(text, section, key, str(value))
 
-        token = data.get("token")
-        if token:
-            text = _replace_in_section(text, "order", "token", str(token))
-
         tmp = CONFIG_PATH.with_suffix(".toml.tmp")
         tmp.write_text(text, encoding="utf-8")
         tmp.replace(CONFIG_PATH)
 
-        preview = f"{str(token)[:8]}..." if token else "none"
-        print(
-            f"[{time.strftime('%H:%M:%S')}] [PROFILE] "
-            f"自动配置成功 id={data['code']} token={preview}"
-        )
+        print(f"[{time.strftime('%H:%M:%S')}] [PROFILE] 自动配置成功")
 
     except Exception as e:
         print(f"[PROFILE] 自动配置失败: {e}", file=sys.stderr)

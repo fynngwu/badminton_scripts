@@ -209,7 +209,7 @@ button:disabled {
     <option value="2">后天</option>
   </select>
   <button class="primary" id="btn-save">保存 Token</button>
-  <button class="auto" id="btn-fetch-token">🔑 自动获取 Token</button>
+  <button class="auto" id="btn-refresh-window">刷新预约窗口</button>
   <span class="mini">目标：<b id="cur-date">-</b></span>
 </div>
 
@@ -814,7 +814,7 @@ function connectSSE() {
   sse.addEventListener("order.result", ev => {
     const d = JSON.parse(ev.data).data || {};
     if (d.kind === "ok") { renderLeak(null); refreshOrders(); }
-    const kind  = d.kind === "ok" ? "ok" : (d.kind === "busy" ? "warn" : "err");
+    const kind  = d.kind === "ok" ? "ok" : (["busy", "timeout", "unknown"].includes(d.kind) ? "warn" : "err");
     const label = d.label || (d.kind === "ok" ? "✅ 预约成功"
                              : d.kind === "busy" ? "⚠ 系统繁忙"
                              : "❌ 下单失败");
@@ -882,33 +882,22 @@ $("btn-save").onclick = async () => {
   const j = await r.json();
   if (!j.ok) { toast(j.msg || "保存失败", "err"); return; }
   $("token").value = "";
-  toast("Token 已保存", "ok");
+  toast(j.msg || "Token 已保存", "ok");
 };
 
-$("btn-fetch-token").onclick = async () => {
-  const b = $("btn-fetch-token");
-  b.disabled = true;
-  const old = b.textContent;
-  b.textContent = "🔑 抓取中…";
-  toast("正在刷新预约窗口，请稍等…", "ok", 1600);
+$("btn-refresh-window").onclick = async () => {
+  const button = $("btn-refresh-window");
+  button.disabled = true;
+  button.textContent = "正在刷新预约窗口…";
   try {
-    const d = await (await fetch("/api/token/fetch", {
-      method: "POST", headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({}),
-    })).json();
-
-    if (d.ok) {
-      b.textContent = `✅ ${d.token_preview}`;
-      toast(`Token 获取成功：${d.token_preview}`, "ok", 3600);
-    } else {
-      toast(d.msg || "获取失败", "err", 3000);
-      b.textContent = old;
-    }
+    const response = await fetch("/api/window/refresh", {method: "POST"});
+    const result = await response.json();
+    toast(result.msg || "刷新预约窗口失败", result.ok ? "ok" : "err", 3600);
   } catch (e) {
     toast("请求失败：" + e, "err", 3000);
-    b.textContent = old;
   } finally {
-    setTimeout(() => { b.disabled = false; b.textContent = old; }, 1200);
+    button.disabled = false;
+    button.textContent = "刷新预约窗口";
   }
 };
 

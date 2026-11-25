@@ -3,10 +3,10 @@
 # token 字段由 mitm_addon.py 自动写入，也可以手工粘贴。
 
 [user]
-id = "YOUR_USER_ID"
-customer_id = "YOUR_CUSTOMER_ID"
-name = "YOUR_NAME"
-tel = "YOUR_PHONE"
+id = ""
+customer_id = ""
+name = ""
+tel = ""
 
 [gym]
 id   = "1297443858304540673"
@@ -15,7 +15,7 @@ name = "润杨羽毛球馆"
 [order]
 # 0=今天  1=明天  2=后天
 offset_days = 1
-token = "612fb16f-8692-4a1d-a22b-a262ccc405a2"
+token = ""
 
 [auto]
 # 全自动抢场参数（前端修改后写回本段，多设备共享）
@@ -42,17 +42,13 @@ refresh_at = "20:00:06"
 # ═══════════════════════════════════════════════════════════════
 [tuning]
 
-# ── 抓 Token ──
+# ── 刷新预约窗口 ──
 refresh_pre_click_delay   = 0.05    # 点击窗口前的等待（秒）
 refresh_post_click_delay  = 0.05    # 点击后到按 Ctrl+R 之间的等待（秒）
 
 # ── 刷新场地 ──
 probe_backoff             = 3.0     # 探测场地失败后的退避（秒）
 probe_max_tries           = 6       # 探测场地最多重试次数
-auth_refresh_timeout      = 4.0     # 遇到「鉴权失败」时自动抓 token 的超时
-
-# ── 自动模式 ──
-token_refresh_lead_sec    = 120     # 触发前多少秒自动刷新 token
 
 # ── VID 池 ──
 vid_timeout               = 3.5     # 单次验证码求解超时

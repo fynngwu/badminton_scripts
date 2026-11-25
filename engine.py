@@ -8,7 +8,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
-import re
 import subprocess
 import time
 import threading
@@ -31,7 +30,7 @@ from utils import (
     refresh_window,
     classify_order_reply,
     port_listening, kill_port_holder, spawn_mitmdump,
-    close_cffi_session, limited_get, get_cffi_session, is_auth_fail, BASE_URL,
+    close_cffi_session, limited_get, order_post_once, access_error, response_body, BASE_URL,
 )
 
 
@@ -47,9 +46,7 @@ class Tuning:
     refresh_post_click_delay: float = 0.05
     probe_backoff:            float = 1.0
     probe_max_tries:          int   = 6
-    auth_refresh_timeout:     float = 4.0
-    token_refresh_lead_sec:   int   = 120
-    token_refresh_wait_sec:   float = 5.0    # 等待本轮 Token 捕获事件
+    window_refresh_timeout:   float = 20.0
 
     # ── 检漏 ──
     leak_interval:            float = 10.0
@@ -155,9 +152,7 @@ class Engine:
         self._mitm_proc: subprocess.Popen | None = None
         self._mitm_lock: asyncio.Lock | None = None
 
-        self._token_fetch_busy = False
-        self._token_fetch_ok = False
-
+        self._window_refresh: asyncio.Task | None = None
 
         # 首帧加载
         self.reload_config(force=True)
@@ -243,10 +238,20 @@ class Engine:
         offset = max(0, min(2, int(offset)))
         write_config_int("offset_days", offset)
 
-    def update_token(self, token: str) -> None:
+    def update_token(self, token: str) -> dict:
         token = token.strip()
-        if token:
+        if not token or any(ord(char) < 32 or ord(char) == 127 for char in token):
+            return {"ok": False, "status": "FAILED", "msg": "Token 为空或包含控制字符"}
+        self.reload_config()
+        if token == self.session.token:
+            return {"ok": False, "status": "SAME", "msg": "Token 未变化"}
+        try:
             write_config_string("token", token)
+        except (OSError, RuntimeError):
+            return {"ok": False, "status": "FAILED", "msg": "保存 Token 失败"}
+        if not self.reload_config(force=True) or self.session.token != token:
+            return {"ok": False, "status": "FAILED", "msg": "未能读取已保存的 Token"}
+        return {"ok": True, "status": "NEW", "msg": "已保存新 Token"}
 
     async def update_auto_config(self, slot_start: str, slot_end: str,
                                  save_order_at: str,
@@ -403,7 +408,7 @@ class Engine:
         try:
             ok = await self._ensure_mitm()
             if not ok:
-                log.warning("⚠ mitmdump 未能就绪；点击「自动获取 Token」时会重试")
+                log.warning("⚠ mitmdump 未能就绪")
         except Exception as e:
             log.warning("mitmdump 预启动异常: %s", e)
 
@@ -423,76 +428,24 @@ class Engine:
         return await self._ensure_mitm()
 
     # ══════════════════════════════════════════════════
-    # Token 抓取
+    # 预约窗口操作
     # ══════════════════════════════════════════════════
-    async def fetch_token(self) -> dict:
-        """刷新网页并同步本轮捕获的 Token；不在此处判断鉴权。"""
-        if self._token_fetch_busy:
-            return {"ok": False, "msg": "刷新正在进行，请稍候"}
-
-        self._token_fetch_busy = True
-        self._token_fetch_ok = False
-        try:
-            if not await self._ensure_mitm():
-                return {"ok": False, "msg": "mitmdump 未就绪，请查看日志"}
-
-            self.reload_config()
-            old_token = self.session.token
-            # 在刷新之前记录日志序号，避免漏掉刷新过程中到达的捕获事件。
-            with _log_lock:
-                since = _log_seq
-
-            log.info("触发预约窗口刷新（Ctrl+R）…")
-            refresh_sent = await asyncio.to_thread(
+    async def refresh_reservation_window(self) -> dict:
+        if self._window_refresh is None or self._window_refresh.done():
+            self._window_refresh = asyncio.create_task(asyncio.to_thread(
                 refresh_window,
                 pre_click_delay=self.tuning.refresh_pre_click_delay,
                 post_click_delay=self.tuning.refresh_post_click_delay,
-            )
-            if not refresh_sent:
-                log.warning("预约窗口未确认发送 Ctrl+R，仍检查本轮是否已捕获 Token")
-
-            wait_sec = max(0.5, float(self.tuning.token_refresh_wait_sec))
-            log.info("等待本轮 Token 捕获（最多 %.1fs）…", wait_sec)
-            token = await self._wait_token_capture(since, timeout=wait_sec)
-            if not token:
-                msg = f"{wait_sec:.1f}s 内未确认本轮 Token 捕获"
-                if not refresh_sent:
-                    msg = "预约窗口刷新失败；" + msg
-                log.warning("%s", msg)
-                return {"ok": False, "msg": msg}
-
-            msg = "Token 捕获成功（NEW）" if token != old_token else "Token 捕获成功（SAME）"
-            self._token_fetch_ok = True
-            log.info("✅ %s；鉴权由后续业务请求确认", msg)
-            return {"ok": True, "msg": msg, "token_preview": token[:8] + "...", "attempts": 1}
-        finally:
-            self._token_fetch_busy = False
-
-    async def _wait_token_capture(self, since: int, timeout: float = 5.0) -> str:
-        """等待本轮 mitm 捕获日志，并确认配置中存在对应的 Token。"""
-        pattern = re.compile(
-            r"^\[mitm\] \[\d{2}:\d{2}:\d{2}\] \[TOKEN\] "
-            r"(?:捕获成功 SAME (.{1,8})\.\.\. \S+|更新成功 .*? -> (.{1,8})\.\.\.)$"
-        )
-        deadline = time.monotonic() + max(0.1, timeout)
-        prefix = None
-        while True:
-            for event in get_logs(since):
-                since = event["seq"]
-                match = pattern.fullmatch(event["msg"])
-                if match:
-                    prefix = match.group(1) or match.group(2)
-
-            if prefix is not None:
-                if self.reload_config(force=True):
-                    await self.bus.publish("config.updated", self.public_config())
-                    token = self.session.token
-                    if token and token[:8] == prefix:
-                        return token
-
-            if time.monotonic() >= deadline:
-                return ""
-            await asyncio.sleep(0.1)
+            ))
+        try:
+            sent = await asyncio.wait_for(asyncio.shield(self._window_refresh),
+                                          self.tuning.window_refresh_timeout)
+        except TimeoutError:
+            return {"ok": False, "msg": "等待预约窗口刷新超时"}
+        except Exception as exc:
+            log.warning("预约窗口刷新异常: %s", type(exc).__name__)
+            return {"ok": False, "msg": "预约窗口刷新失败"}
+        return {"ok": sent, "msg": "已向预约窗口发送刷新" if sent else "预约窗口刷新失败"}
 
     # ══════════════════════════════════════════════════
     # VID 池
@@ -662,24 +615,16 @@ class Engine:
 
         ok = False
         for attempt in range(1, max_tries + 1):
-            t0 = time.monotonic()
-            res = await get_order_once(probe, date,
-                                       self.session.token, self.config.user_id)
-            dt = (time.monotonic() - t0) * 1000
+            _, res = await self._refresh_one(probe, date, publish=False)
 
             if res.get("ok"):
                 await self._publish_refresh(probe, res, date)
                 ok = True
                 break
 
-            if res.get("auth_fail"):
-                log.warning("探测 %s 鉴权失败 (%.0fms, %d/%d): %s，自动获取 Token…",
-                            probe.name, dt, attempt, max_tries,
-                            res.get("error", ""))
-                try:
-                    await self.fetch_token()
-                except Exception as e:
-                    log.warning("自动获取 Token 异常: %s", e)
+            if res.get("kind") in {"auth", "restricted", "rate_limited"}:
+                await self._publish_refresh(probe, res, date)
+                return
 
             if backoff > 0:
                 await asyncio.sleep(backoff)
@@ -742,7 +687,7 @@ class Engine:
         if not self.session.token:
             return {"accepted": False, "kind": "err",
                     "label": "❌ 未配置 Token",
-                    "msg": "请先保存或获取 Token"}
+                    "msg": "请先保存平台提供的 Token"}
 
         court = next((c for c in self.config.courts if c.no == court_no), None)
         if not court:
@@ -894,40 +839,12 @@ class Engine:
             save_order_at = plan.config.save_order_at
             save_dt = self._parse_hms(save_order_at)
 
-            # ── ① Token 自动刷新 ──
-            if datetime.now() < save_dt:
-                lead = max(0, int(self.tuning.token_refresh_lead_sec))
-                tr_dt = save_dt - timedelta(seconds=lead)
-                if datetime.now() < tr_dt:
-                    self.auto.phase = "waiting_token"
-                    self.auto.msg = (f"等待自动刷新 Token"
-                                    f"（{tr_dt.strftime('%H:%M:%S')}）")
-                    log.info("自动模式: Token 将在 %s 自动刷新",
-                            tr_dt.strftime('%H:%M:%S'))
-                    await self._sleep_until(tr_dt)
-
-                self.auto.phase = "fetching_token"
-                self.auto.msg = "自动获取 Token 中…"
-                log.info("自动模式: 触发前 %ds，开始自动获取 Token", lead)
-                try:
-                    r = await self.fetch_token()
-                    if r.get("ok"):
-                        log.info("自动模式: ✅ Token 已捕获 (%s)", r.get("token_preview", ""))
-                        self.auto.msg = f"Token 已捕获（{r.get('token_preview', '')}）"
-                    else:
-                        log.warning("自动模式: ⚠ Token 刷新失败: %s", r.get("msg"))
-                        self.auto.msg = f"Token 刷新失败: {r.get('msg')}"
-                except Exception as e:
-                    log.warning("自动模式: Token 刷新异常: %s", e)
-                    self.auto.msg = f"Token 刷新异常: {e}"
-            else:
-                log.info("自动模式: 已过触发时间，跳过自动刷新 Token")
-
-            # ── ② 提前 30s 启动 VID 池，让整点零新建连接 ──
+            # 提前启动 VID 池。
             if not self.vid_running:
                 lead_sec = max(1, int(self.tuning.vid_pool_lead_sec))
                 vid_dt = save_dt - timedelta(seconds=lead_sec)
                 if datetime.now() < vid_dt:
+                    self.auto.phase = "waiting_vid"
                     self.auto.msg = f"等待启动 VID（{vid_dt.strftime('%H:%M:%S')}）"
                     log.info("自动模式: 等待 %s 启动 VID（提前 %ds）",
                             vid_dt.strftime('%H:%M:%S'), lead_sec)
@@ -938,7 +855,7 @@ class Engine:
                 log.info("自动模式: VID 池已在运行，跳过启动")
 
 
-            # ── ③ 触发前 2s，同时查询所选的前三个场地 ──
+            # 触发前同时查询所选的前三个场地。
             query_dt = save_dt - timedelta(seconds=1.4)
             self.auto.phase = "waiting"
             self.auto.msg = f"等待并发查询（{query_dt.strftime('%H:%M:%S.%f')[:-3]}）"
@@ -1028,53 +945,25 @@ class Engine:
         return {o["date"] for o in self._orders
                 if o["gym_id"] == str(self.config.gym_id)}
 
-    async def _recover_token(self, old_token):
-        self.reload_config()
-        if self.session.token and self.session.token != old_token:
-            return True
-        if self._token_fetch_busy:
-            deadline = time.monotonic() + 30
-            while self._token_fetch_busy and time.monotonic() < deadline:
-                await asyncio.sleep(0.2)
-            return not self._token_fetch_busy and self._token_fetch_ok
-        try:
-            result = await self.fetch_token()
-            return bool(result.get("ok"))
-        except Exception as exc:
-            log.warning("Token 恢复异常: %s", type(exc).__name__)
-            return False
-
-    async def _order_api(self, endpoint, *, method="GET", params=None,
-                         payload=None, recover=True):
+    async def _order_api(self, endpoint, *, method="GET", params=None, payload=None):
+        if not self.session.token:
+            raise RuntimeError("未配置 Token")
         url = BASE_URL + "/api/blade-app/qywx/" + endpoint
-        for attempt in range(2 if recover else 1):
-            token = self.session.token
-            if not token:
-                if recover and attempt == 0 and await self._recover_token(token):
-                    continue
-                raise RuntimeError("未取得有效 Token")
-            query = {**(params or {}), "userid": self.config.user_id, "token": token}
-            if method == "GET":
-                response = await limited_get(url, params=query, quiet=True)
-            else:
-                kwargs = {"params": query}
-                if payload is not None:
-                    kwargs["json"] = payload
-                response = await get_cffi_session().post(url, **kwargs)
-            try:
-                result = response.json()
-            except ValueError:
-                result = {}
-            if not isinstance(result, dict):
-                raise RuntimeError("订单接口响应格式异常")
-            if response.status_code in (401, 403) or is_auth_fail(result):
-                if recover and attempt == 0 and await self._recover_token(token):
-                    continue
-                raise RuntimeError("订单接口鉴权失败")
-            if response.status_code != 200 or result.get("success") is not True:
-                raise RuntimeError(f"订单接口失败（HTTP {response.status_code}）：{result.get('msg', '未知错误')}")
+        query = {**(params or {}), "userid": self.config.user_id, "token": self.session.token}
+        if method == "POST":
+            result = await order_post_once(url, params=query, json=payload)
+            if result["success"] is not True:
+                raise RuntimeError(result["msg"])
             return result.get("data")
-        raise RuntimeError("Token 恢复后仍无法查询订单")
+
+        response = await limited_get(url, params=query, quiet=True)
+        result = response_body(response)
+        error = access_error(response.status_code, result)
+        if error:
+            raise RuntimeError(error[1])
+        if response.status_code != 200 or result.get("success") is not True:
+            raise RuntimeError(f"订单查询失败（HTTP {response.status_code}）：{result.get('msg') or '响应异常'}")
+        return result.get("data")
 
     @staticmethod
     def _active_order(row):
@@ -1128,7 +1017,7 @@ class Engine:
                 payload = {**detail, "status": 6,
                            "appointmentTime": f"{order['date'].replace('-', '/')} {order['start']}-{order['end']}"}
                 # 取消是写操作：不自动重发，避免响应丢失时重复提交。
-                await self._order_api("operatOrder", method="POST", payload=payload, recover=False)
+                await self._order_api("operatOrder", method="POST", payload=payload)
             except Exception as exc:
                 return {"ok": False, "msg": f"取消未确认：{exc}；请刷新订单核对"}
             try:
@@ -1226,7 +1115,7 @@ class Engine:
                     last_summary = time.monotonic()
                 dates = [d for d in self._leak_dates(now)
                          if datetime.fromisoformat(d + "T20:00") > now]
-                auto_busy = self.jobs.running("auto") and self.auto.phase != "waiting_token"
+                auto_busy = self.jobs.running("auto") and self.auto.phase != "waiting_vid"
                 if not dates or auto_busy or self.refresh_running or self.reserve_inflight:
                     self._leak_msg = "等待目标日期或其他任务结束"
                     await asyncio.sleep(self.tuning.leak_interval)
@@ -1254,7 +1143,7 @@ class Engine:
                 delay = self.tuning.leak_interval
                 try:
                     for court in list(self.config.courts)[:10]:
-                        if ((self.jobs.running("auto") and self.auto.phase != "waiting_token")
+                        if ((self.jobs.running("auto") and self.auto.phase != "waiting_vid")
                                 or self.refresh_running or self.reserve_inflight):
                             break
                         now = datetime.now()
@@ -1262,7 +1151,6 @@ class Engine:
                         if budget < 4.0:
                             # 临近暂停起点时不再开始新查询。
                             break
-                        request_token = self.session.token
                         _, res = await self._refresh_one(
                             court, date, timeout=budget, publish=False, quiet=True)
                         queries += 1
@@ -1271,11 +1159,6 @@ class Engine:
                         if not res.get("ok"):
                             self._leak_msg = f"查询失败，等待重试：{res.get('error', '未知错误')}"
                             log.warning("检漏 %s %s", date, self._leak_msg)
-                            if res.get("auth_fail") or "鉴权失败" in str(res.get("error", "")):
-                                self._leak_msg = "鉴权失败，正在自动获取 Token"
-                                recovered = await self._recover_token(request_token)
-                                self._leak_msg = ("已取得 Token，下一轮重新鉴权" if recovered
-                                                  else "Token 恢复失败，等待重新登录")
                             delay = 30
                             break
                         slot = self._leak_slot(date, res.get("avail", {}))

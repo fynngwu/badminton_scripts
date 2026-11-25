@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import io
+import json
 import logging
 import os
 import re
@@ -78,8 +79,9 @@ def read_config_dict(path: Path = CONFIG_PATH) -> dict:
 
 def write_config_string(key: str, value: str, path: Path = CONFIG_PATH) -> None:
     text = path.read_text(encoding="utf-8")
-    pattern = rf'(?m)^(\s*{re.escape(key)}\s*=\s*)"[^"]*"'
-    new_text, n = re.subn(pattern, rf'\1"{value}"', text, count=1)
+    pattern = rf'(?m)^([ \t]*{re.escape(key)}[ \t]*=[ \t]*)"(?:[^"\\\n]|\\.)*"'
+    encoded = json.dumps(value, ensure_ascii=False)
+    new_text, n = re.subn(pattern, lambda match: match[1] + encoded, text, count=1)
     if n == 0:
         raise RuntimeError(f"config.toml 未找到字符串字段 {key!r}")
     path.write_text(new_text, encoding="utf-8")
@@ -216,22 +218,66 @@ def norm_hm(t: str) -> str:
     return f"{h.zfill(2)}:{m}" if h.isdigit() else t
 
 
-def is_auth_fail(j: dict) -> bool:
-    msg = str(j.get("msg", "") or "")
-    if "鉴权失败" in msg:
-        return True
-    low = msg.lower()
-    if "token" in low and ("失效" in msg or "无效" in msg or "过期" in msg):
-        return True
-    if j.get("code") in (401, 403):
-        return True
-    return False
+def response_body(response) -> dict:
+    try:
+        body = response.json()
+    except ValueError:
+        return {}
+    return body if isinstance(body, dict) else {}
+
+
+def access_error(status: int, body: dict) -> tuple[str, str] | None:
+    code = str(body.get("code", ""))
+    msg = str(body.get("msg") or "").lower()
+    if status == 429 or code == "429" or any(
+        term in msg for term in ("请求过于频繁", "请求频繁", "too many requests")
+    ):
+        return "rate_limited", "服务端限流，请按平台提示稍后重试"
+    if status == 403 or code == "403":
+        return "restricted", "服务端拒绝访问（403）"
+    if (status == 401 or code == "401" or "鉴权失败" in msg
+            or ("token" in msg and any(word in msg for word in ("失效", "无效", "过期")))):
+        return "auth", "鉴权失败，请在预约平台检查当前登录会话"
+    return None
+
+
+async def order_post_once(url: str, **kwargs) -> dict:
+    """写入和订单详情均只发送一次，保留结果不明与明确拒绝的区别。"""
+    try:
+        response = await get_cffi_session().post(url, timeout=6.0, allow_redirects=False, **kwargs)
+    except (TimeoutError, curl_requests.exceptions.Timeout):
+        return {"success": False, "kind": "timeout", "msg": "请求超时，执行结果未知"}
+    except curl_requests.exceptions.RequestException:
+        return {"success": False, "kind": "unknown", "msg": "网络异常，执行结果未知"}
+
+    body = response_body(response)
+    status = response.status_code
+    error = access_error(status, body)
+    if error:
+        kind, msg = error
+    elif status == 408 or status >= 500:
+        kind, msg = "unknown", f"HTTP {status}，执行结果未知"
+    elif str(body.get("code", "")) in {"408", "500", "502", "503", "504"}:
+        kind, msg = "unknown", "服务端异常，执行结果未知"
+    elif 400 <= status < 500:
+        kind, msg = "rejected", str(body.get("msg") or f"服务端拒绝（HTTP {status}）")
+    elif 200 <= status < 300 and body.get("success") is True:
+        return body
+    elif 200 <= status < 300 and body.get("success") is False:
+        kind, msg = "rejected", str(body.get("msg") or "服务端拒绝")
+    else:
+        kind, msg = "unknown", "未收到可确认的响应，执行结果未知"
+    return {"success": False, "kind": kind, "msg": msg, "code": body.get("code", status)}
 
 
 def classify_order_reply(r: dict) -> tuple[str, str]:
-    """saveOrder 返回分类：ok / busy / error"""
+    """将下单结果转换成界面状态和标签。"""
     if r.get("success"):
         return "ok", "✅ 预约成功"
+    if r.get("kind") == "timeout":
+        return "timeout", "⚠ 下单请求超时"
+    if r.get("kind") == "unknown":
+        return "unknown", "⚠ 下单结果未知"
     msg = str(r.get("msg", "") or "")
     for kw in ("繁忙", "稍后", "系统忙", "请求过于", "频繁",
                "frequent", "too many", "try again", "busy"):
@@ -446,21 +492,17 @@ async def get_order_once(court: Court, date: str, token: str, user_id: str,
             "userid": user_id, "token": token,
         }, timeout=timeout)
     except Exception as e:
-        return {"ok": False, "auth_fail": False, "error": f"网络异常: {e}"}
+        return {"ok": False, "error": f"网络异常: {type(e).__name__}"}
 
+    j = response_body(r)
+    error = access_error(r.status_code, j)
+    if error:
+        kind, msg = error
+        return {"ok": False, "kind": kind, "error": msg}
     if r.status_code != 200:
-        return {"ok": False, "auth_fail": False, "error": f"HTTP {r.status_code}"}
-
-    try:
-        j = r.json()
-    except Exception:
-        return {"ok": False, "auth_fail": False, "error": "non-json"}
-
-    if not j.get("success"):
-        msg = str(j.get("msg", "") or "")
-        auth = is_auth_fail(j)
-        return {"ok": False, "auth_fail": auth,
-                "error": msg or f"success=false (code={j.get('code')})"}
+        return {"ok": False, "error": f"HTTP {r.status_code}"}
+    if j.get("success") is not True:
+        return {"ok": False, "error": str(j.get("msg") or f"场地响应异常（code={j.get('code')}）")}
 
     avail: dict[str, str] = {}
     blocks: list[dict] = []
@@ -480,7 +522,7 @@ async def get_order_once(court: Court, date: str, token: str, user_id: str,
                 "type":         blk.get("type"),
             })
     blocks.sort(key=lambda b: b["time"])
-    return {"ok": True, "auth_fail": False, "avail": avail, "blocks": blocks}
+    return {"ok": True, "avail": avail, "blocks": blocks}
 
 
 async def save_order_once(
@@ -489,7 +531,7 @@ async def save_order_once(
     user_id: str, customer_id: str, customer_name: str, customer_tel: str,
     gym_id: str, gym_name: str,
 ) -> dict:
-    """单次 POST saveOrder。只返回原始响应 dict，不发事件、不落盘。"""
+    """单次 POST saveOrder，返回订单结果。"""
     st = f"{date} {start}:00"
     et = f"{date} {end}:00"
     now = datetime.now()
@@ -512,23 +554,13 @@ async def save_order_once(
     t0 = time.monotonic()
     log.info("→ 下单 %s 发送 @ %s (vid=%s…)", court.name, send_hms, vid[:8])
 
-    try:
-        r = await get_cffi_session().post(
-            URL_SAVE, params={"userid": user_id, "token": token},
-            json=payload, timeout=6.0,
-        )
-        dt_ms = (time.monotonic() - t0) * 1000
-        recv_hms = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-        log.info("← 下单 %s 返回 @ %s (+%.0fms): HTTP %d | %s",
-                 court.name, recv_hms, dt_ms, r.status_code, r.text[:180])
-        try:
-            result = r.json()
-        except Exception:
-            result = {"success": False, "msg": "non-json"}
-    except Exception as e:
-        dt_ms = (time.monotonic() - t0) * 1000
-        log.warning("✗ 下单 %s 异常 (+%.0fms): %s", court.name, dt_ms, e)
-        result = {"success": False, "msg": str(e)}
+    result = await order_post_once(URL_SAVE, params={"userid": user_id, "token": token},
+                                   json=payload)
+    if result.get("kind") in {"timeout", "unknown"}:
+        result["msg"] += "；请先查询订单再决定是否重试"
+    recv_hms = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    log.info("← 下单 %s 返回 @ %s (+%.0fms): %s (code=%s)", court.name, recv_hms,
+             (time.monotonic() - t0) * 1000, result.get("kind") or "success", result.get("code"))
 
     return result
 
@@ -682,62 +714,8 @@ def refresh_window(
             comtypes.CoUninitialize()
 
 # ══════════════════════════════════════════════════════
-# mitmproxy 抓 token（供 mitm_addon.py 调用）
+# 代理进程工具
 # ══════════════════════════════════════════════════════
-_last_token_seen = ""
-_last_token_seen_at = 0.0
-
-
-def capture_token_from_flow(
-    flow,
-    host: str = RESERVATION_HOST,
-    config_path: Path = CONFIG_PATH,
-) -> None:
-    global _last_token_seen, _last_token_seen_at
-
-    try:
-        if flow.request.pretty_host != host:
-            return
-    except Exception:
-        return
-
-    token = flow.request.query.get("token")
-    if not token:
-        return
-
-    now = time.monotonic()
-    if token == _last_token_seen and now - _last_token_seen_at < 1.0:
-        return
-
-    _last_token_seen = token
-    _last_token_seen_at = now
-
-    try:
-        text = config_path.read_text(encoding="utf-8")
-        m = re.search(r'(?m)^\s*token\s*=\s*"([^"]*)"', text)
-        current = m.group(1) if m else ""
-
-        path = flow.request.path.split("?", 1)[0]
-        ts = time.strftime("%H:%M:%S")
-
-        if token == current:
-            print(f"[{ts}] [TOKEN] 捕获成功 SAME {token[:8]}... {path}")
-            return
-
-        new, n = re.subn(
-            r'(?m)^(\s*token\s*=\s*)"[^"]*"',
-            rf'\1"{token}"',
-            text, count=1,
-        )
-        if n:
-            config_path.write_text(new, encoding="utf-8")
-            print(f"[{ts}] [TOKEN] 更新成功 {current[:8]}... -> {token[:8]}...")
-        else:
-            print("[TOKEN] config.toml 未找到 token 字段")
-    except Exception as e:
-        print(f"[TOKEN] 写入失败: {e}")
-
-
 def kill_port_holder(host: str, port: int) -> list[int]:
     """强杀所有监听 host:port 的进程，返回被杀的 PID 列表。"""
     pids: set[int] = set()
