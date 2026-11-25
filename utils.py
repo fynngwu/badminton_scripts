@@ -621,51 +621,36 @@ def refresh_window(
                     return False
                 time.sleep(0.05)
 
-        stage = "定位场馆列表或导航"
+        stage = "置前窗口"
+        if not ensure_foreground("点击"):
+            return False
+
+        # 即使已在场馆列表，也点击导航，让网页获得键盘焦点。
+        stage = "点击场地预约"
         deadline = time.monotonic() + 5.0
         while True:
-            items = controls()
-            if on_gym_page(items):
-                log.info("[refresh] 已在场馆列表，跳过导航")
-                break
-            targets = navigation(items)
+            targets = navigation(controls())
             if len(targets) == 1:
-                stage = "UIA 导航"
-                time.sleep(max(0.0, pre_click_delay))
-                try:
-                    targets[0].iface_invoke.Invoke()
-                    log.info("[refresh] 已通过 Invoke 导航")
-                except Exception as exc:
-                    log.warning("[refresh] Invoke 失败: %r，尝试点击导航", exc)
-                # 给页面一次响应机会，成功时不再重复点击。
-                deadline = time.monotonic() + 1.0
-                while True:
-                    items = controls()
-                    if on_gym_page(items) or time.monotonic() >= deadline:
-                        break
-                    time.sleep(0.05)
-                if not on_gym_page(items):
-                    stage = "点击场地预约"
-                    if not ensure_foreground("点击"):
-                        return False
-                    targets = navigation(controls())
-                    if len(targets) != 1 or win32gui.GetForegroundWindow() != hwnd:
-                        log.warning("[refresh] 导航控件或前台窗口已变化，取消点击")
-                        return False
-                    targets[0].click_input()
-                    log.info("[refresh] 已点击「场地预约」导航控件")
-                    deadline = time.monotonic() + 5.0
-                    while not on_gym_page(controls()):
-                        if time.monotonic() >= deadline:
-                            log.warning("[refresh] 未返回场馆列表，取消刷新")
-                            return False
-                        time.sleep(0.05)
-                time.sleep(max(0.0, post_click_delay))
                 break
             if time.monotonic() >= deadline:
                 log.warning("[refresh] 导航控件数量=%d，无法唯一定位", len(targets))
                 return False
             time.sleep(0.05)
+        time.sleep(max(0.0, pre_click_delay))
+        if win32gui.GetForegroundWindow() != hwnd:
+            log.warning("[refresh] 点击前预约窗口失焦，取消点击")
+            return False
+        targets[0].click_input()
+        log.info("[refresh] 已点击「场地预约」导航控件")
+
+        stage = "确认场馆列表"
+        deadline = time.monotonic() + 5.0
+        while not on_gym_page(controls()):
+            if time.monotonic() >= deadline:
+                log.warning("[refresh] 未返回场馆列表，取消刷新")
+                return False
+            time.sleep(0.05)
+        time.sleep(max(0.0, post_click_delay))
 
         stage = "发送 Ctrl+R"
         # 只有发生失焦、需要重新激活时，才重新读取网页控件。
