@@ -1,11 +1,10 @@
 """mitm_addon.py — mitmproxy 入口。
 
 正常运行：
-- request: 捕获并更新 token。
+- response: 只有平台签发响应能把新凭证写进 config.toml。
 
 首次部署：
-- response: 捕获 getUserInfoByUserid 返回值，
-  自动写入 user.id / customer_id / name / tel / token。
+- response: 捕获 getUserInfoByUserid 返回值，自动写入 user.id / customer_id / name / tel。
 
 手工测试窗口刷新：
     python mitm_addon.py refresh
@@ -17,15 +16,54 @@ import re
 import sys
 import time
 
-from utils import CONFIG_PATH, capture_token_from_flow
+from utils import CONFIG_PATH, RESERVATION_HOST, read_config_dict, write_config_string
 
 
 PROFILE_API = "/api/blade-app/qywx/getUserInfoByUserid"
-PROFILE_HOST = "reservation.sustech.edu.cn"
 
 
-def request(flow) -> None:  # type: ignore[no-untyped-def]
-    capture_token_from_flow(flow)
+def _payload(flow):  # type: ignore[no-untyped-def]
+    try:
+        return flow.response.json()
+    except Exception:
+        try:
+            return json.loads(flow.response.get_text())
+        except Exception:
+            return None
+
+
+def _issued_token(flow) -> str | None:  # type: ignore[no-untyped-def]
+    if not flow.response or flow.response.status_code != 200:
+        return None
+    payload = _payload(flow)
+    if not isinstance(payload, dict) or payload.get("success") is not True:
+        return None
+    data = payload.get("data")
+    token = data.get("token") if isinstance(data, dict) else None
+    return token if isinstance(token, str) and token else None
+
+
+def _capture_issued_token(flow) -> None:  # type: ignore[no-untyped-def]
+    try:
+        if flow.request.pretty_host != RESERVATION_HOST:
+            return
+        token = _issued_token(flow)
+        if not token:
+            return
+
+        path = flow.request.path.split("?", 1)[0]
+        stamp = time.strftime("%H:%M:%S")
+        if flow.request.query.get("token") is not None:
+            print(f"[{stamp}] [TOKEN] 忽略响应凭证 {token[:8]}... {path}")
+            return
+
+        current = str(read_config_dict().get("order", {}).get("token", "") or "")
+        if current == token:
+            return
+        write_config_string("token", token)
+        print(f"[{stamp}] [TOKEN] 签发成功 {token[:8]}... {path}")
+    except Exception as e:
+        print(f"[TOKEN] 写入失败: {e}", file=sys.stderr)
 
 
 def _replace_in_section(text: str, section: str, key: str, value: str) -> str:
@@ -50,27 +88,18 @@ def _replace_in_section(text: str, section: str, key: str, value: str) -> str:
     return text[:m.start()] + new_block + text[m.end():]
 
 
-def response(flow) -> None:  # type: ignore[no-untyped-def]
-    """首次部署时，从当前登录用户资料接口自动填写 config.toml。"""
+def _capture_profile(flow) -> None:  # type: ignore[no-untyped-def]
     try:
-        if flow.request.pretty_host != PROFILE_HOST:
+        if flow.request.pretty_host != RESERVATION_HOST:
             return
-
-        path = flow.request.path.split("?", 1)[0]
-        if path != PROFILE_API:
+        if flow.request.path.split("?", 1)[0] != PROFILE_API:
             return
-
         if not flow.response or flow.response.status_code != 200:
             return
 
-        try:
-            payload = flow.response.json()
-        except Exception:
-            payload = json.loads(flow.response.get_text())
-
+        payload = _payload(flow)
         if not isinstance(payload, dict) or not payload.get("success"):
             return
-
         data = payload.get("data")
         if not isinstance(data, dict):
             return
@@ -89,22 +118,23 @@ def response(flow) -> None:  # type: ignore[no-untyped-def]
         for (section, key), value in values.items():
             text = _replace_in_section(text, section, key, str(value))
 
-        token = data.get("token")
-        if token:
-            text = _replace_in_section(text, "order", "token", str(token))
-
         tmp = CONFIG_PATH.with_suffix(".toml.tmp")
         tmp.write_text(text, encoding="utf-8")
         tmp.replace(CONFIG_PATH)
 
+        token = data.get("token")
         preview = f"{str(token)[:8]}..." if token else "none"
         print(
             f"[{time.strftime('%H:%M:%S')}] [PROFILE] "
             f"自动配置成功 id={data['code']} token={preview}"
         )
-
     except Exception as e:
         print(f"[PROFILE] 自动配置失败: {e}", file=sys.stderr)
+
+
+def response(flow) -> None:  # type: ignore[no-untyped-def]
+    _capture_issued_token(flow)
+    _capture_profile(flow)
 
 
 if __name__ == "__main__":

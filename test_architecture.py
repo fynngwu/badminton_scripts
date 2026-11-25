@@ -23,6 +23,28 @@ def _write_token(path, token):
                     encoding="utf-8")
 
 
+def _flow(path, query, payload, *, status=200):
+    return SimpleNamespace(
+        request=SimpleNamespace(pretty_host='reservation.sustech.edu.cn',
+                                path=path, query=query),
+        response=SimpleNamespace(status_code=status,
+                                 json=lambda: payload,
+                                 get_text=lambda: json.dumps(payload)),
+    )
+
+
+def _count_writes(monkeypatch, module):
+    writes = []
+    real_write = module.write_config_string
+
+    def counted(key, value):
+        writes.append((key, value))
+        real_write(key, value)
+
+    monkeypatch.setattr(module, 'write_config_string', counted)
+    return writes
+
+
 @pytest.fixture
 def runtime(monkeypatch, tmp_path):
     adapter = types.ModuleType('utils')
@@ -43,6 +65,7 @@ def runtime(monkeypatch, tmp_path):
     )
     adapter.CONFIG_PATH = config_path
     adapter.MITM_HOST, adapter.MITM_PORT, adapter.MITM_UPSTREAM = '127.0.0.1', 8080, ''
+    adapter.RESERVATION_HOST = 'reservation.sustech.edu.cn'
     adapter.BASE_URL = 'http://example.invalid'
 
     def read_config_dict():
@@ -69,6 +92,7 @@ def runtime(monkeypatch, tmp_path):
     monkeypatch.setitem(sys.modules, 'utils', adapter)
     monkeypatch.delitem(sys.modules, 'engine', raising=False)
     monkeypatch.delitem(sys.modules, 'app', raising=False)
+    monkeypatch.delitem(sys.modules, 'mitm_addon', raising=False)
     return importlib.import_module('engine')
 
 
@@ -170,9 +194,16 @@ def test_fetch_token_accepts_only_new_value(runtime, monkeypatch):
 
         def refresh(**kwargs):
             refreshes.append(1)
-            # 一轮会话刷新产生 A、A、A、B 四条观察，只有 B 算更新。
+            addon = importlib.import_module('mitm_addon')
             for token in ('private-token', 'private-token', 'private-token', 'new-token-value'):
-                _write_token(runtime.CONFIG_PATH, token)
+                if token == 'private-token':
+                    flow = _flow('/api/blade-app/qywx/getCustomerMessageNOReadCount',
+                                 {'token': token}, {'success': True, 'data': {}})
+                else:
+                    flow = _flow('/api/blade-app/qywx/getUserIdByCode',
+                                 {'code': 'oauth-code'},
+                                 {'success': True, 'data': {'token': token}})
+                addon.response(flow)
                 time.sleep(0.01)
             return True
 
@@ -271,3 +302,49 @@ def test_order_query_recovers_through_fetch_token(runtime, monkeypatch):
         assert result['ok'] is True
         assert seen == ['private-token', 'recovered-token-value']
     asyncio.run(run())
+
+
+def test_issued_token_writes_once(runtime, monkeypatch):
+    addon = importlib.import_module('mitm_addon')
+    writes = _count_writes(monkeypatch, addon)
+    flow = _flow('/api/blade-app/qywx/getUserIdByCode', {'code': 'oauth-code'},
+                 {'success': True, 'data': {'token': 'issued-token-value'}})
+
+    addon.response(flow)
+    addon.response(flow)
+
+    assert writes == [('token', 'issued-token-value')]
+    assert addon.read_config_dict()['order']['token'] == 'issued-token-value'
+
+
+def test_request_side_token_never_writes(runtime, monkeypatch):
+    addon = importlib.import_module('mitm_addon')
+    writes = _count_writes(monkeypatch, addon)
+    payload = {'success': True, 'data': {'token': 'new-token-value'}}
+
+    for token in ('private-token', 'new-token-value') * 50:
+        flow = _flow('/api/blade-app/qywx/getCustomerMessageNOReadCount',
+                     {'token': token}, payload)
+        addon.response(flow)
+
+    assert writes == []
+    assert addon.read_config_dict()['order']['token'] == 'private-token'
+
+
+def test_har_sequence_writes_only_issuance(runtime, monkeypatch):
+    addon = importlib.import_module('mitm_addon')
+    writes = _count_writes(monkeypatch, addon)
+    issued = {'success': True, 'data': {'token': 'new-token-value'}}
+
+    auth_fail = _flow('/api/blade-app/qywx/getCustomerMessageNOReadCount',
+                      {'token': 'private-token'},
+                      {'success': False, 'msg': '鉴权失败2'})
+    issuance = _flow('/api/blade-app/qywx/getUserIdByCode',
+                     {'code': 'oauth-code'}, issued)
+    business = _flow('/api/blade-app/qywx/getUserInfoByUserid',
+                     {'token': 'new-token-value'}, issued)
+    for flow in (auth_fail, issuance, business, business):
+        addon.response(flow)
+
+    assert writes == [('token', 'new-token-value')]
+    assert addon.read_config_dict()['order']['token'] == 'new-token-value'

@@ -681,63 +681,6 @@ def refresh_window(
         if com_initialized:
             comtypes.CoUninitialize()
 
-# ══════════════════════════════════════════════════════
-# mitmproxy 抓 token（供 mitm_addon.py 调用）
-# ══════════════════════════════════════════════════════
-_last_token_seen = ""
-_last_token_seen_at = 0.0
-
-
-def capture_token_from_flow(
-    flow,
-    host: str = RESERVATION_HOST,
-    config_path: Path = CONFIG_PATH,
-) -> None:
-    global _last_token_seen, _last_token_seen_at
-
-    try:
-        if flow.request.pretty_host != host:
-            return
-    except Exception:
-        return
-
-    token = flow.request.query.get("token")
-    if not token:
-        return
-
-    now = time.monotonic()
-    if token == _last_token_seen and now - _last_token_seen_at < 1.0:
-        return
-
-    _last_token_seen = token
-    _last_token_seen_at = now
-
-    try:
-        text = config_path.read_text(encoding="utf-8")
-        m = re.search(r'(?m)^\s*token\s*=\s*"([^"]*)"', text)
-        current = m.group(1) if m else ""
-
-        path = flow.request.path.split("?", 1)[0]
-        ts = time.strftime("%H:%M:%S")
-
-        if token == current:
-            print(f"[{ts}] [TOKEN] 捕获成功 SAME {token[:8]}... {path}")
-            return
-
-        new, n = re.subn(
-            r'(?m)^(\s*token\s*=\s*)"[^"]*"',
-            rf'\1"{token}"',
-            text, count=1,
-        )
-        if n:
-            config_path.write_text(new, encoding="utf-8")
-            print(f"[{ts}] [TOKEN] 更新成功 {current[:8]}... -> {token[:8]}...")
-        else:
-            print("[TOKEN] config.toml 未找到 token 字段")
-    except Exception as e:
-        print(f"[TOKEN] 写入失败: {e}")
-
-
 def kill_port_holder(host: str, port: int) -> list[int]:
     """强杀所有监听 host:port 的进程，返回被杀的 PID 列表。"""
     pids: set[int] = set()
