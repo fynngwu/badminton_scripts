@@ -331,6 +331,7 @@ else {
     Info "未检测到 uv，使用 Astral 官方安装器"
     $UvDir = Join-Path $env:LOCALAPPDATA "uv"
     $env:UV_INSTALL_DIR = $UvDir
+    $env:UV_NO_MODIFY_PATH = "1"
     try { irm https://astral.sh/uv/install.ps1 | iex }
     catch { Fail "uv 官方安装器执行失败" }
 
@@ -340,6 +341,14 @@ else {
 }
 Set-Content -Path (Join-Path $StateDir "uv_path.txt") -Value $Uv -Encoding UTF8
 Ok (& $Uv --version)
+# 将 uv 加入用户 PATH
+$UvDir = Split-Path -Parent $Uv
+$UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
+
+if (($UserPath -split ";") -notcontains $UvDir) {
+    [Environment]::SetEnvironmentVariable("Path", "$UvDir;$UserPath", "User")
+}
+$env:Path = "$UvDir;$env:Path"
 
 # 3. Python 3.11 + .venv
 # 先对 uv-managed Python 目录做快照，只有 setup 真正新增了 3.11 时才记录为“可卸载”。
