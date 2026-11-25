@@ -573,16 +573,7 @@ def refresh_window(
                     return False
                 time.sleep(0.1)
             log.info("[refresh] 最小化窗口已恢复")
-
-        stage = "置前窗口"
-        if not native.has_focus():
-            native.set_focus()
-        deadline = time.monotonic() + max(0.0, fg_timeout)
-        while not native.has_focus():
-            if time.monotonic() >= deadline:
-                log.warning("[refresh] 预约窗口无法获得前台焦点")
-                return False
-            time.sleep(0.03)
+            time.sleep(0.35)
 
         stage = "读取网页控件"
         desktop = Desktop(backend="uia")
@@ -595,9 +586,7 @@ def refresh_window(
                     and any(c.element_info.control_type == "Text"
                             and c.element_info.name == "场地预约" for c in items))
 
-        time.sleep(max(0.0, pre_click_delay))
-        deadline = time.monotonic() + 5.0
-        while True:
+        def navigation():
             targets = []
             for ctrl in controls():
                 if (ctrl.element_info.control_type != "Text"
@@ -609,18 +598,48 @@ def refresh_window(
                         targets.append(ctrl)
                 except NoPatternInterfaceError:
                     continue
-            if len(targets) == 1:
-                break
-            if time.monotonic() >= deadline:
-                log.warning("[refresh] 导航控件数量=%d，无法唯一定位", len(targets))
-                return False
-            time.sleep(0.2)
+            return targets
 
+        def wait_navigation():
+            deadline = time.monotonic() + 5.0
+            while True:
+                targets = navigation()
+                if len(targets) == 1:
+                    return targets[0]
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(f"导航控件数量={len(targets)}，无法唯一定位")
+                time.sleep(0.2)
+
+        stage = "定位场地预约"
+        target = wait_navigation()
+
+        # UIA Invoke 无须发送全局鼠标输入，可先请求应用自身导航。
+        if not native.has_focus():
+            stage = "UIA 导航"
+            target.iface_invoke.Invoke()
+            log.info("[refresh] 已通过 Invoke 导航，等待窗口激活")
+            stage = "置前窗口"
+            deadline = time.monotonic() + max(2.0, fg_timeout)
+            while not native.has_focus():
+                try:
+                    native.set_focus()
+                except Exception as exc:
+                    log.debug("[refresh] 置前尝试失败: %r", exc)
+                if native.has_focus():
+                    break
+                if time.monotonic() >= deadline:
+                    log.warning("[refresh] Windows 未允许预约窗口置前，请手动激活窗口")
+                    return False
+                time.sleep(0.2)
+
+        # Invoke 后页面可能重建，重新定位控件，避免使用失效的 UIA 对象。
         stage = "点击场地预约"
+        time.sleep(max(0.0, pre_click_delay))
+        target = wait_navigation()
         if not native.has_focus():
             log.warning("[refresh] 点击前预约窗口失焦")
             return False
-        targets[0].click_input()
+        target.click_input()
         log.info("[refresh] 已点击「场地预约」导航控件")
 
         stage = "确认场馆列表"
