@@ -549,6 +549,7 @@ def refresh_window(
         from pywinauto import Desktop, keyboard
         from pywinauto.uia_defines import NoPatternInterfaceError
         import comtypes
+        import win32gui
 
         comtypes.CoInitializeEx()
         com_initialized = True
@@ -610,34 +611,47 @@ def refresh_window(
                     raise RuntimeError(f"导航控件数量={len(targets)}，无法唯一定位")
                 time.sleep(0.2)
 
-        stage = "定位场地预约"
-        target = wait_navigation()
-
-        # UIA Invoke 无须发送全局鼠标输入，可先请求应用自身导航。
-        if not native.has_focus():
-            stage = "UIA 导航"
-            target.iface_invoke.Invoke()
-            log.info("[refresh] 已通过 Invoke 导航，等待窗口激活")
-            stage = "置前窗口"
+        def ensure_foreground(action: str) -> bool:
+            # Ctrl+R 和 click_input 都使用全局输入，以实际前台 HWND 为准。
+            foreground = win32gui.GetForegroundWindow()
+            if foreground == hwnd:
+                return True
+            log.info("[refresh] %s前窗口失焦: 目标 HWND=%d, 前台 HWND=%d，尝试置前",
+                     action, hwnd, foreground)
             deadline = time.monotonic() + max(2.0, fg_timeout)
-            while not native.has_focus():
+            while True:
                 try:
                     native.set_focus()
                 except Exception as exc:
                     log.debug("[refresh] 置前尝试失败: %r", exc)
-                if native.has_focus():
-                    break
+                foreground = win32gui.GetForegroundWindow()
+                if foreground == hwnd:
+                    log.info("[refresh] %s前已恢复前台 HWND=%d", action, hwnd)
+                    return True
                 if time.monotonic() >= deadline:
-                    log.warning("[refresh] Windows 未允许预约窗口置前，请手动激活窗口")
+                    log.warning("[refresh] %s前置前失败: 目标 HWND=%d, 前台 HWND=%d",
+                                action, hwnd, foreground)
                     return False
                 time.sleep(0.2)
+
+        stage = "定位场地预约"
+        target = wait_navigation()
+
+        # UIA Invoke 无须发送全局鼠标输入，可先请求应用自身导航。
+        if win32gui.GetForegroundWindow() != hwnd:
+            stage = "UIA 导航"
+            target.iface_invoke.Invoke()
+            log.info("[refresh] 已通过 Invoke 导航")
 
         # Invoke 后页面可能重建，重新定位控件，避免使用失效的 UIA 对象。
         stage = "点击场地预约"
         time.sleep(max(0.0, pre_click_delay))
+        if not ensure_foreground("定位导航"):
+            return False
         target = wait_navigation()
-        if not native.has_focus():
-            log.warning("[refresh] 点击前预约窗口失焦")
+        if win32gui.GetForegroundWindow() != hwnd:
+            log.warning("[refresh] 点击前窗口再次失焦，取消点击: 目标 HWND=%d, 前台 HWND=%d",
+                        hwnd, win32gui.GetForegroundWindow())
             return False
         target.click_input()
         log.info("[refresh] 已点击「场地预约」导航控件")
@@ -651,11 +665,14 @@ def refresh_window(
             time.sleep(0.2)
 
         time.sleep(max(0.2, post_click_delay))
+        if not ensure_foreground("刷新"):
+            return False
         if not on_gym_page(controls()):
             log.warning("[refresh] 刷新前场馆列表已变化")
             return False
-        if not native.has_focus():
-            log.warning("[refresh] 刷新前预约窗口失焦")
+        if win32gui.GetForegroundWindow() != hwnd:
+            log.warning("[refresh] 发送 Ctrl+R 前再次失焦，取消发送: 目标 HWND=%d, 前台 HWND=%d",
+                        hwnd, win32gui.GetForegroundWindow())
             return False
 
         stage = "发送 Ctrl+R"

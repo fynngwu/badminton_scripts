@@ -443,20 +443,21 @@ class Engine:
                 since = _log_seq
 
             log.info("触发预约窗口刷新（Ctrl+R）…")
-            if not await asyncio.to_thread(
+            refresh_sent = await asyncio.to_thread(
                 refresh_window,
                 pre_click_delay=self.tuning.refresh_pre_click_delay,
                 post_click_delay=self.tuning.refresh_post_click_delay,
-            ):
-                msg = "预约窗口刷新失败，具体阶段见 refresh 日志"
-                log.warning("%s", msg)
-                return {"ok": False, "msg": msg}
+            )
+            if not refresh_sent:
+                log.warning("预约窗口未确认发送 Ctrl+R，仍检查本轮是否已捕获 Token")
 
             wait_sec = max(0.5, float(self.tuning.token_refresh_wait_sec))
             log.info("等待本轮 Token 捕获（最多 %.1fs）…", wait_sec)
             token = await self._wait_token_capture(since, timeout=wait_sec)
             if not token:
                 msg = f"{wait_sec:.1f}s 内未确认本轮 Token 捕获"
+                if not refresh_sent:
+                    msg = "预约窗口刷新失败；" + msg
                 log.warning("%s", msg)
                 return {"ok": False, "msg": msg}
 
