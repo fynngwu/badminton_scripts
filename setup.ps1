@@ -331,7 +331,6 @@ else {
     Info "未检测到 uv，使用 Astral 官方安装器"
     $UvDir = Join-Path $env:LOCALAPPDATA "uv"
     $env:UV_INSTALL_DIR = $UvDir
-    $env:UV_NO_MODIFY_PATH = "1"
     try { irm https://astral.sh/uv/install.ps1 | iex }
     catch { Fail "uv 官方安装器执行失败" }
 
