@@ -681,6 +681,36 @@ def refresh_window(
         if com_initialized:
             comtypes.CoUninitialize()
 
+def capture_token_from_flow(
+    flow,
+    host: str = RESERVATION_HOST,
+    config_path: Path = CONFIG_PATH,
+) -> None:
+    """初始化专用：配置还没有凭证时，取业务请求携带的当前凭证。"""
+    try:
+        if flow.request.pretty_host != host:
+            return
+        token = flow.request.query.get("token")
+        if not token:
+            return
+
+        text = config_path.read_text(encoding="utf-8")
+        m = re.search(r'(?m)^\s*token\s*=\s*"([^"]*)"', text)
+        if m and m.group(1):
+            return
+
+        new, n = re.subn(
+            r'(?m)^(\s*token\s*=\s*)"[^"]*"',
+            rf'\1"{token}"',
+            text, count=1,
+        )
+        if n:
+            config_path.write_text(new, encoding="utf-8")
+            print(f"[{time.strftime('%H:%M:%S')}] [TOKEN] 初始凭证 {token[:8]}...")
+    except Exception as e:
+        print(f"[TOKEN] 写入失败: {e}")
+
+
 def kill_port_holder(host: str, port: int) -> list[int]:
     """强杀所有监听 host:port 的进程，返回被杀的 PID 列表。"""
     pids: set[int] = set()

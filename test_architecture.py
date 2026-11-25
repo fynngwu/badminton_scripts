@@ -78,8 +78,22 @@ def runtime(monkeypatch, tmp_path):
         if key == 'token':
             _write_token(config_path, value)
 
+    def capture_token_from_flow(flow, host='reservation.sustech.edu.cn',
+                                config_path=config_path):
+        if flow.request.pretty_host != host:
+            return
+        token = flow.request.query.get('token')
+        if not token:
+            return
+        m = re.search(r'(?m)^\s*token\s*=\s*"([^"]*)"',
+                      config_path.read_text(encoding='utf-8'))
+        if m and m.group(1):
+            return
+        write_config_string('token', token)
+
     adapter.read_config_dict = read_config_dict
     adapter.write_config_string = write_config_string
+    adapter.capture_token_from_flow = capture_token_from_flow
     for name in ('write_config_int', 'write_config_string_renamed', 'write_config_int_list',
                  'refresh_window', 'port_listening', 'kill_port_holder', 'spawn_mitmdump'):
         setattr(adapter, name, lambda *a, **k: None)
@@ -302,6 +316,22 @@ def test_order_query_recovers_through_fetch_token(runtime, monkeypatch):
         assert result['ok'] is True
         assert seen == ['private-token', 'recovered-token-value']
     asyncio.run(run())
+
+
+def test_request_captures_initial_token_only(runtime, monkeypatch):
+    addon = importlib.import_module('mitm_addon')
+    _write_token(runtime.CONFIG_PATH, '')
+    first = _flow('/api/blade-app/qywx/getCustomerMessageNOReadCount',
+                  {'token': 'bootstrap-token-value'},
+                  {'success': True, 'data': {}})
+    later = _flow('/api/blade-app/qywx/getCustomerMessageNOReadCount',
+                  {'token': 'later-token-value'},
+                  {'success': True, 'data': {}})
+
+    addon.request(first)
+    addon.request(later)
+
+    assert addon.read_config_dict()['order']['token'] == 'bootstrap-token-value'
 
 
 def test_issued_token_writes_once(runtime, monkeypatch):

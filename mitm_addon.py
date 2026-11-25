@@ -1,8 +1,5 @@
 """mitm_addon.py — mitmproxy 入口。
 
-正常运行：
-- response: 只有平台签发响应能把新凭证写进 config.toml。
-
 首次部署：
 - response: 捕获 getUserInfoByUserid 返回值，自动写入 user.id / customer_id / name / tel。
 
@@ -16,10 +13,15 @@ import re
 import sys
 import time
 
-from utils import CONFIG_PATH, RESERVATION_HOST, read_config_dict, write_config_string
+from utils import (CONFIG_PATH, RESERVATION_HOST, capture_token_from_flow,
+                   read_config_dict, write_config_string)
 
 
 PROFILE_API = "/api/blade-app/qywx/getUserInfoByUserid"
+
+
+def request(flow) -> None:  # type: ignore[no-untyped-def]
+    capture_token_from_flow(flow)
 
 
 def _payload(flow):  # type: ignore[no-untyped-def]
