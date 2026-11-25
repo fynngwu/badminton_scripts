@@ -548,7 +548,7 @@ def refresh_window(
     """
     com_initialized = False
     try:
-        from pywinauto import Desktop
+        from pywinauto import Desktop, keyboard
         from pywinauto.uia_defines import NoPatternInterfaceError
         import comtypes
 
@@ -580,35 +580,7 @@ def refresh_window(
                         and c.element_info.name == "场地预约" for c in controls)
             )
 
-        if not on_gym_page():
-            time.sleep(max(0.0, pre_click_delay))
-            actions = []
-            window = desktop.window(handle=hwnd).wrapper_object()
-            for ctrl in window.descendants(control_type="Text"):
-                if ctrl.element_info.name != "场地预约" or not ctrl.is_enabled():
-                    continue
-                try:
-                    invoke = ctrl.iface_invoke
-                except NoPatternInterfaceError:
-                    continue
-                if invoke is not None:
-                    actions.append(invoke)
-            if len(actions) != 1:
-                log.warning("[refresh] 可调用的场地预约控件数量=%d，取消刷新", len(actions))
-                return False
-            actions[0].Invoke()
-            log.info("[refresh] 已调用「场地预约」")
-
-            deadline = time.monotonic() + 5.0
-            while not on_gym_page():
-                if time.monotonic() >= deadline:
-                    log.warning("[refresh] 未返回场馆列表，取消刷新")
-                    return False
-                time.sleep(0.2)
-
-        log.info("[refresh] 已确认场馆列表页面")
-
-        time.sleep(max(0.0, post_click_delay))
+        # 先置前，再点击明确识别出的底部导航控件，使网页获得实际输入焦点。
         deadline = time.monotonic() + max(0.0, fg_timeout)
         if not native.has_focus():
             native.set_focus()
@@ -617,10 +589,42 @@ def refresh_window(
                 log.warning("[refresh] 无法确认前台窗口，取消刷新")
                 return False
             time.sleep(0.03)
+
+        time.sleep(max(0.0, pre_click_delay))
+        window = desktop.window(handle=hwnd).wrapper_object()
+        targets = []
+        for ctrl in window.descendants(control_type="Text"):
+            if (ctrl.element_info.name != "场地预约"
+                    or not ctrl.is_enabled() or not ctrl.is_visible()):
+                continue
+            try:
+                invoke = ctrl.iface_invoke
+            except NoPatternInterfaceError:
+                continue
+            if invoke is not None:
+                targets.append(ctrl)
+
+        if len(targets) != 1 or not native.has_focus():
+            log.warning("[refresh] 导航控件数量=%d 或窗口失焦，取消刷新", len(targets))
+            return False
+
+        targets[0].click_input()
+        log.info("[refresh] 已点击「场地预约」导航控件")
+
+        deadline = time.monotonic() + 5.0
+        while not on_gym_page():
+            if time.monotonic() >= deadline:
+                log.warning("[refresh] 未返回场馆列表，取消刷新")
+                return False
+            time.sleep(0.2)
+
+        time.sleep(max(0.2, post_click_delay))
         if not on_gym_page() or not native.has_focus():
             log.warning("[refresh] 页面或前台窗口已变化，取消刷新")
             return False
-        native.type_keys("^r", set_foreground=False, turn_off_numlock=False)
+
+        log.info("[refresh] 场馆列表已确认，发送 Ctrl+R")
+        keyboard.send_keys("^r", pause=0.08, turn_off_numlock=False, vk_packet=False)
         log.info("[refresh] 已发送 Ctrl+R")
         return True
     except ImportError:
