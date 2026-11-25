@@ -4,7 +4,7 @@
     Engine 决定何时调用、调几次、调用后状态怎么变。
 
 依赖：
-    pip install pywin32 curl_cffi opencv-python-headless pillow numpy
+    pip install pywinauto curl_cffi opencv-python-headless pillow numpy
 """
 from __future__ import annotations
 
@@ -57,7 +57,6 @@ MITM_PORT     = 8080
 MITM_UPSTREAM = os.environ.get("MITM_UPSTREAM", "").strip()
 
 RESERVATION_HOST = "reservation.sustech.edu.cn"
-WINDOW_KEYWORDS  = ("reservation.sustech.edu.cn", "reservation")
 
 
 
@@ -537,215 +536,102 @@ async def save_order_once(
 # ══════════════════════════════════════════════════════
 # Windows 窗口操作（refresh reservation 窗口）
 # ══════════════════════════════════════════════════════
-_cached_hwnd: int = 0
-
-
-def _find_hwnd() -> int:
-    import win32gui
-    found: list[int] = []
-
-    def _cb(hwnd, _):
-        if win32gui.IsWindowVisible(hwnd):
-            title = win32gui.GetWindowText(hwnd) or ""
-            if title and any(k in title for k in WINDOW_KEYWORDS):
-                found.append(hwnd)
-        return True
-
-    win32gui.EnumWindows(_cb, None)
-    return found[0] if found else 0
-
-
-def _valid_hwnd(hwnd: int) -> bool:
-    if not hwnd:
-        return False
-    try:
-        import win32gui
-        if not win32gui.IsWindow(hwnd):
-            return False
-        title = win32gui.GetWindowText(hwnd) or ""
-        return any(k in title for k in WINDOW_KEYWORDS)
-    except Exception:
-        return False
-
-
-def _ensure_foreground(hwnd: int, timeout: float = 0.6) -> bool:
-    """轮询直到 hwnd 真正成为前台窗口，或超时。"""
-    import win32gui
-    import win32process
-    import win32api
-
-    deadline = time.monotonic() + max(0.0, timeout)
-    while True:
-        try:
-            if win32gui.GetForegroundWindow() == hwnd:
-                return True
-        except Exception:
-            pass
-
-        try:
-            win32gui.SetForegroundWindow(hwnd)
-        except Exception:
-            pass
-        try:
-            if win32gui.GetForegroundWindow() == hwnd:
-                return True
-        except Exception:
-            pass
-
-        try:
-            fg = win32gui.GetForegroundWindow()
-            if fg and fg != hwnd:
-                fg_tid = win32process.GetWindowThreadProcessId(fg)[0]
-                my_tid = win32api.GetCurrentThreadId()
-                if fg_tid != my_tid:
-                    win32process.AttachThreadInput(fg_tid, my_tid, True)
-                    try:
-                        win32gui.BringWindowToTop(hwnd)
-                        win32gui.SetForegroundWindow(hwnd)
-                    finally:
-                        win32process.AttachThreadInput(fg_tid, my_tid, False)
-        except Exception:
-            pass
-
-        try:
-            if win32gui.GetForegroundWindow() == hwnd:
-                return True
-        except Exception:
-            pass
-
-        if time.monotonic() >= deadline:
-            return False
-        time.sleep(0.03)
-
-
-def _mouse_click(x: int, y: int) -> None:
-    import win32api
-    import win32con
-
-    win32api.SetCursorPos((x, y))
-    time.sleep(0.03)
-    win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
-    time.sleep(0.03)
-    win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
-
-
-def _send_ctrl_r() -> None:
-    import win32api
-    import win32con
-
-    VK_R = 0x52
-    win32api.keybd_event(win32con.VK_CONTROL, 0, 0, 0)
-    time.sleep(0.02)
-    win32api.keybd_event(VK_R, 0, 0, 0)
-    time.sleep(0.02)
-    win32api.keybd_event(VK_R, 0, win32con.KEYEVENTF_KEYUP, 0)
-    time.sleep(0.02)
-    win32api.keybd_event(win32con.VK_CONTROL, 0, win32con.KEYEVENTF_KEYUP, 0)
-
-
 def refresh_window(
     pre_click_delay: float = 0.10,
     post_click_delay: float = 0.10,
     fg_timeout: float = 0.6,
     double_click: bool = True,
 ) -> bool:
-    """找到 reservation 窗口 → 上前台 → 点击 → Ctrl+R。
+    """通过 pywinauto 导航并刷新；True 表示已发送 Ctrl+R。
 
-    只有 Ctrl+R 确实发送到目标窗口时才返回 True；
-    找不到窗口 / 无法置前 / 前台不是目标窗口，均返回 False。
+    double_click 仅为兼容旧调用。需要未锁定的交互桌面。
     """
-    global _cached_hwnd
-
+    com_initialized = False
     try:
-        import win32gui
-        import win32con
-        import win32api
-    except ImportError:
-        print("[refresh] 需要 pywin32：pip install pywin32")
-        return False
+        from pywinauto import Desktop
+        from pywinauto.uia_defines import NoPatternInterfaceError
+        import comtypes
 
-    hwnd = _cached_hwnd if _valid_hwnd(_cached_hwnd) else 0
-    if not hwnd:
-        hwnd = _find_hwnd()
-        if hwnd:
-            _cached_hwnd = hwnd
+        # asyncio.to_thread 的每个工作线程都需要自己的 COM 初始化。
+        comtypes.CoInitializeEx()
+        com_initialized = True
 
-    if not hwnd:
-        print("[refresh] 未找到预约窗口（企业微信是否已打开 reservation？）")
-        _cached_hwnd = 0
-        return False
-
-    try:
-        old_pos = win32api.GetCursorPos()
-    except Exception:
-        old_pos = None
-
-    ok = False
-    try:
-        print(f"[refresh] 找到预约窗口: {win32gui.GetWindowText(hwnd)}")
-
-        try:
-            if win32gui.GetWindowPlacement(hwnd)[1] == win32con.SW_SHOWMINIMIZED:
-                win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-                time.sleep(0.15)
-        except Exception:
-            pass
-
-        if not _ensure_foreground(hwnd, timeout=fg_timeout):
-            print("[refresh] ⚠ 未能在前台锁定窗口，仍然尝试点击…")
-
-        if pre_click_delay > 0:
-            time.sleep(pre_click_delay)
-
-        cx = cy = None
-        try:
-            rect = win32gui.GetWindowRect(hwnd)
-            w = rect[2] - rect[0]
-            h = rect[3] - rect[1]
-            cx = rect[0] + w // 2
-            cy = rect[1] + max(100, int(h * 0.20))
-        except Exception as e:
-            print(f"[refresh] 计算点击坐标失败（忽略）: {e}")
-
-        if cx is not None and cy is not None:
-            try:
-                _mouse_click(cx, cy)
-                if double_click:
-                    time.sleep(0.08)
-                    _mouse_click(cx, cy)
-            except Exception as e:
-                print(f"[refresh] click 失败（忽略）: {e}")
-
-        if post_click_delay > 0:
-            time.sleep(post_click_delay)
-
-        # 发送 Ctrl+R 前，必须确认目标窗口在前台。
-        # 否则 win32api.keybd_event 的全局按键会落到别的窗口。
-        if not _ensure_foreground(hwnd, timeout=0.4):
-            print("[refresh] ❌ Ctrl+R 前窗口仍不在前台，放弃发送")
+        desktop = Desktop(backend="uia")
+        windows = [w for w in desktop.windows()
+                   if w.window_text().startswith((RESERVATION_HOST, f"https://{RESERVATION_HOST}"))]
+        if len(windows) != 1:
+            log.warning("[refresh] 预约窗口数量=%d，需要唯一窗口", len(windows))
             return False
-        try:
-            if win32gui.GetForegroundWindow() != hwnd:
-                print("[refresh] ❌ Ctrl+R 前前台窗口不是目标窗口，放弃发送")
+
+        hwnd = windows[0].handle
+        native = Desktop(backend="win32").window(handle=hwnd).wrapper_object()
+        log.info("[refresh] 找到预约窗口: HWND=%d", hwnd)
+        if native.is_minimized():
+            native.restore()
+            time.sleep(0.2)
+
+        def on_gym_page() -> bool:
+            page = desktop.window(handle=hwnd).wrapper_object()
+            controls = page.descendants()
+            return (
+                any(c.element_info.control_type == "Edit"
+                    and c.element_info.name == "请输入搜索的场馆" for c in controls)
+                and any(c.element_info.control_type == "Text"
+                        and c.element_info.name == "场地预约" for c in controls)
+            )
+
+        if not on_gym_page():
+            time.sleep(max(0.0, pre_click_delay))
+            actions = []
+            window = desktop.window(handle=hwnd).wrapper_object()
+            for ctrl in window.descendants(control_type="Text"):
+                if ctrl.element_info.name != "场地预约" or not ctrl.is_enabled():
+                    continue
+                try:
+                    invoke = ctrl.iface_invoke
+                except NoPatternInterfaceError:
+                    continue
+                if invoke is not None:
+                    actions.append(invoke)
+            if len(actions) != 1:
+                log.warning("[refresh] 可调用的场地预约控件数量=%d，取消刷新", len(actions))
                 return False
-        except Exception:
-            pass
+            actions[0].Invoke()
+            log.info("[refresh] 已调用「场地预约」")
 
-        _send_ctrl_r()
-        ok = True
-    except Exception as e:
-        print(f"[refresh] error: {e}")
-        _cached_hwnd = 0
+            deadline = time.monotonic() + 5.0
+            while not on_gym_page():
+                if time.monotonic() >= deadline:
+                    log.warning("[refresh] 未返回场馆列表，取消刷新")
+                    return False
+                time.sleep(0.2)
+
+        log.info("[refresh] 已确认场馆列表页面")
+
+        time.sleep(max(0.0, post_click_delay))
+        deadline = time.monotonic() + max(0.0, fg_timeout)
+        if not native.has_focus():
+            native.set_focus()
+        while not native.has_focus():
+            if time.monotonic() >= deadline:
+                log.warning("[refresh] 无法确认前台窗口，取消刷新")
+                return False
+            time.sleep(0.03)
+        if not on_gym_page() or not native.has_focus():
+            log.warning("[refresh] 页面或前台窗口已变化，取消刷新")
+            return False
+        native.type_keys("^r", set_foreground=False, turn_off_numlock=False)
+        log.info("[refresh] 已发送 Ctrl+R")
+        return True
+    except ImportError:
+        log.warning("[refresh] 缺少依赖，请安装 pywinauto")
+        return False
+    except Exception as exc:
+        log.warning("[refresh] UIA 刷新失败: %s", type(exc).__name__)
+        return False
     finally:
-        if old_pos is not None:
-            try:
-                win32api.SetCursorPos(old_pos)
-            except Exception:
-                pass
-
-    if ok:
-        print("[refresh] 已发送 Ctrl+R")
-    return ok
+        if com_initialized:
+            comtypes.CoUninitialize()
 
 
 # ══════════════════════════════════════════════════════
