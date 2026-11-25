@@ -350,6 +350,41 @@ if (($UserPath -split ";") -notcontains $UvDir) {
 }
 $env:Path = "$UvDir;$env:Path"
 
+# Stop the recorded server first; refuse to delete a live environment.
+function Stop-EnvironmentUsers {
+    $stop = Join-Path $Root 'stop.ps1'
+    if (Test-Path -LiteralPath (Join-Path $Root '.run\app-process.json')) {
+        if (-not (Test-Path -LiteralPath $stop)) { Fail 'Missing stop.ps1' }
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $stop
+        if ($LASTEXITCODE -ne 0) { Fail 'Cannot stop project server; environment unchanged' }
+    }
+    $prefix = (Join-Path $Root '.venv\Scripts') + '\'
+    $users = @(Get-CimInstance Win32_Process | Where-Object {
+        $_.ExecutablePath -and $_.ExecutablePath.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)
+    })
+    foreach ($proc in $users) {
+        Info "Stopping project environment process PID=$($proc.ProcessId)"
+        Stop-Process -Id $proc.ProcessId -Force -ErrorAction Stop
+        Wait-Process -Id $proc.ProcessId -Timeout 10 -ErrorAction SilentlyContinue
+    }
+}
+
+function Remove-ProjectVenv {
+    $path = Join-Path $Root '.venv'
+    if (-not (Test-Path -LiteralPath $path)) { return }
+    $item = Get-Item -LiteralPath $path -Force
+    if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        Fail 'Refusing to recursively remove a linked .venv directory'
+    }
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        try { Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction Stop }
+        catch { Warn "Environment removal attempt ${attempt}: $($_.Exception.Message)" }
+        if (-not (Test-Path -LiteralPath $path)) { return }
+        Start-Sleep -Milliseconds 500
+    }
+    Fail 'Cannot completely remove .venv. Close project terminals and retry.'
+}
+
 # 3. Python 3.11 + .venv
 # 先对 uv-managed Python 目录做快照，只有 setup 真正新增了 3.11 时才记录为“可卸载”。
 $UvPythonDir = (& $Uv python dir | Out-String).Trim()
@@ -378,14 +413,38 @@ if ($afterManaged311.Count -gt $beforeManaged311.Count) {
     Set-Content -Path (Join-Path $StateDir "python311_installed_by_setup.flag") -Value "1" -Encoding ASCII
 }
 
-$Python = Join-Path $Root ".venv\Scripts\python.exe"
-if (-not (Test-Path $Python)) {
-    Info "创建 Python 3.11 .venv..."
-    & $Uv venv --python 3.11 .venv
-    if ($LASTEXITCODE -ne 0) { Fail "创建 .venv 失败" }
-    Set-Content -Path (Join-Path $StateDir "venv_created_by_setup.flag") -Value "1" -Encoding ASCII
+$Venv = Join-Path $Root '.venv'
+$Python = Join-Path $Venv 'Scripts\python.exe'
+
+function Test-ProjectVenv {
+    foreach ($file in @('pyvenv.cfg', 'Scripts\python.exe', 'Scripts\Activate.ps1', 'Scripts\activate.bat')) {
+        if (-not (Test-Path -LiteralPath (Join-Path $Venv $file) -PathType Leaf)) { return $false }
+    }
+    try {
+        & $Python -c "import sys,pathlib; assert sys.version_info[:2] == (3,11); assert pathlib.Path(sys.prefix).resolve() == pathlib.Path(sys.argv[1]).resolve() and sys.prefix != sys.base_prefix" $Venv 2>$null
+        return ($LASTEXITCODE -eq 0)
+    } catch { return $false }
+}
+
+if (-not (Test-ProjectVenv)) {
+    Info 'Creating or repairing incomplete Python 3.11 environment...'
+    Stop-EnvironmentUsers
+    Remove-ProjectVenv
+    & $Uv venv --python 3.11 --seed $Venv
+    if ($LASTEXITCODE -ne 0) { Fail 'Virtual environment creation failed' }
+    if (-not (Test-ProjectVenv)) { Fail 'New environment failed integrity validation' }
+    Set-Content -Path (Join-Path $StateDir 'venv_created_by_setup.flag') -Value '1' -Encoding ASCII
 } else {
-    Ok "检测到已有 .venv"
+    Ok 'Existing virtual environment passed integrity validation'
+    $pipOk = $false
+    try {
+        & $Python -m pip --version 2>$null | Out-Null
+        $pipOk = ($LASTEXITCODE -eq 0)
+    } catch {}
+    if (-not $pipOk) {
+        & $Uv pip install --python $Python pip
+        if ($LASTEXITCODE -ne 0) { Fail 'pip installation failed' }
+    }
 }
 
 # 4. 安装依赖
@@ -403,6 +462,9 @@ import numpy
 import PIL
 "@
 if ($LASTEXITCODE -ne 0) { Fail "Python 依赖检查失败" }
+if (-not (Test-ProjectVenv)) { Fail "Virtual environment integrity check failed" }
+& $Python -m pip --version
+if ($LASTEXITCODE -ne 0) { Fail "pip validation failed" }
 Ok "Python 环境完成"
 
 # 5. config.toml

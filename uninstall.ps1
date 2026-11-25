@@ -69,6 +69,41 @@ function Find-Uv {
     return $null
 }
 
+# Stop the recorded server first; refuse to delete a live environment.
+function Stop-EnvironmentUsers {
+    $stop = Join-Path $Root 'stop.ps1'
+    if (Test-Path -LiteralPath (Join-Path $Root '.run\app-process.json')) {
+        if (-not (Test-Path -LiteralPath $stop)) { Fail 'Missing stop.ps1' }
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $stop
+        if ($LASTEXITCODE -ne 0) { Fail 'Cannot stop project server; environment unchanged' }
+    }
+    $prefix = (Join-Path $Root '.venv\Scripts') + '\'
+    $users = @(Get-CimInstance Win32_Process | Where-Object {
+        $_.ExecutablePath -and $_.ExecutablePath.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)
+    })
+    foreach ($proc in $users) {
+        Info "Stopping project environment process PID=$($proc.ProcessId)"
+        Stop-Process -Id $proc.ProcessId -Force -ErrorAction Stop
+        Wait-Process -Id $proc.ProcessId -Timeout 10 -ErrorAction SilentlyContinue
+    }
+}
+
+function Remove-ProjectVenv {
+    $path = Join-Path $Root '.venv'
+    if (-not (Test-Path -LiteralPath $path)) { return }
+    $item = Get-Item -LiteralPath $path -Force
+    if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        Fail 'Refusing to recursively remove a linked .venv directory'
+    }
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        try { Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction Stop }
+        catch { Warn "Environment removal attempt ${attempt}: $($_.Exception.Message)" }
+        if (-not (Test-Path -LiteralPath $path)) { return }
+        Start-Sleep -Milliseconds 500
+    }
+    Fail 'Cannot completely remove .venv. Close project terminals and retry.'
+}
+
 function Stop-ProjectMitm {
     $venvPrefix = (Join-Path $Root ".venv\Scripts").ToLowerInvariant()
     $addonPath = (Join-Path $Root "mitm_addon.py").ToLowerInvariant()
@@ -191,6 +226,7 @@ Write-Host "  RestoreClashGlobalScript   = $RestoreClashGlobalScript"
 Write-Host "  RemoveConfigToml           = $RemoveConfigToml"
 Write-Host ""
 
+if ($RemoveVenv -eq 1) { Stop-EnvironmentUsers }
 Stop-ProjectMitm
 
 # 1. Clash 原始脚本恢复
@@ -206,7 +242,7 @@ if ($RemoveVenv -eq 1) {
     $venv = Join-Path $Root ".venv"
     if (Test-Path $venv) {
         Info "删除 .venv..."
-        Remove-Item $venv -Recurse -Force
+        Remove-ProjectVenv
         Ok ".venv 已删除"
     } else {
         Ok ".venv 不存在"
@@ -217,7 +253,9 @@ if ($RemoveVenv -eq 1) {
 }
 
 # 3. uv + setup 安装的 uv-managed Python 3.11
-if ($RemoveUv -eq 1) {
+if ($RemoveUv -eq 1 -and (Test-Path -LiteralPath (Join-Path $Root ".venv"))) {
+    Warn "Preserving uv and managed Python because .venv is retained"
+} elseif ($RemoveUv -eq 1) {
     $Uv = Find-Uv
     $pyFlag = Join-Path $StateDir "python311_installed_by_setup.flag"
 
@@ -225,7 +263,7 @@ if ($RemoveUv -eq 1) {
         Info "卸载 setup 额外安装的 uv-managed Python 3.11..."
         & $Uv python uninstall 3.11
         if ($LASTEXITCODE -ne 0) {
-            Warn "uv python uninstall 3.11 返回非 0；继续清理其它内容"
+            Fail "uv python uninstall 3.11 failed; preserving installation state for retry"
         } else {
             Ok "uv-managed Python 3.11 已卸载"
         }
@@ -234,18 +272,16 @@ if ($RemoveUv -eq 1) {
 
     $uvOwned = Join-Path $StateDir "uv_installed_by_setup.flag"
     if (Test-Path $uvOwned) {
-        $uvInstallDir = Join-Path $env:LOCALAPPDATA "uv"
-        if (Test-Path $uvInstallDir) {
-            Info "删除 setup 安装的 uv: $uvInstallDir"
-            Remove-Item $uvInstallDir -Recurse -Force -ErrorAction SilentlyContinue
+        $ownedPathFile = Join-Path $StateDir 'uv_path.txt'
+        if (-not (Test-Path -LiteralPath $ownedPathFile)) { Fail 'Missing recorded uv install path' }
+        $ownedExe = (Get-Content -LiteralPath $ownedPathFile -Raw -Encoding UTF8).Trim()
+        $allowedExe = Join-Path $env:LOCALAPPDATA 'uv\uv.exe'
+        if (-not [string]::Equals($ownedExe, $allowedExe, [System.StringComparison]::OrdinalIgnoreCase)) {
+            Fail 'Unexpected uv installation path; inspect manually'
         }
-
-        # 兼容官方安装器的另一常见位置，仅在 setup 记录为自己安装时清理。
-        foreach ($p in @(
-            (Join-Path $env:USERPROFILE ".local\bin\uv.exe"),
-            (Join-Path $env:USERPROFILE ".local\bin\uvx.exe")
-        )) {
-            Remove-Item $p -Force -ErrorAction SilentlyContinue
+        foreach ($exe in @($ownedExe, (Join-Path (Split-Path -Parent $ownedExe) 'uvx.exe'))) {
+            if (Test-Path -LiteralPath $exe) { Remove-Item -LiteralPath $exe -Force -ErrorAction Stop }
+            if (Test-Path -LiteralPath $exe) { Fail "Cannot remove $exe" }
         }
 
         Ok "setup 安装的 uv 已删除"
