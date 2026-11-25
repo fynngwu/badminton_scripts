@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import re
 import subprocess
 import time
 import threading
@@ -48,7 +49,7 @@ class Tuning:
     probe_max_tries:          int   = 6
     auth_refresh_timeout:     float = 4.0
     token_refresh_lead_sec:   int   = 120
-    token_refresh_wait_sec:   float = 5.0    # 等待 token 变化后验证鉴权
+    token_refresh_wait_sec:   float = 5.0    # 等待本轮 Token 捕获事件
 
     # ── 检漏 ──
     leak_interval:            float = 10.0
@@ -424,11 +425,8 @@ class Engine:
     # ══════════════════════════════════════════════════
     # Token 抓取
     # ══════════════════════════════════════════════════
-    # ══════════════════════════════════════════════════════
-# Token 抓取
-# ══════════════════════════════════════════════════════
     async def fetch_token(self) -> dict:
-        """刷新预约网页，再验证现有或更新后的登录凭证。"""
+        """刷新网页并同步本轮捕获的 Token；不在此处判断鉴权。"""
         if self._token_fetch_busy:
             return {"ok": False, "msg": "刷新正在进行，请稍候"}
 
@@ -440,6 +438,10 @@ class Engine:
 
             self.reload_config()
             old_token = self.session.token
+            # 在刷新之前记录日志序号，避免漏掉刷新过程中到达的捕获事件。
+            with _log_lock:
+                since = _log_seq
+
             log.info("触发预约窗口刷新（Ctrl+R）…")
             if not await asyncio.to_thread(
                 refresh_window,
@@ -451,47 +453,45 @@ class Engine:
                 return {"ok": False, "msg": msg}
 
             wait_sec = max(0.5, float(self.tuning.token_refresh_wait_sec))
-            log.info("等待 Token 更新（最多 %.1fs），随后验证鉴权", wait_sec)
-            await self._wait_token_change(old_token, timeout=wait_sec)
-            token = self.session.token
-            if not token or not self.config.courts:
-                msg = "缺少 Token 或场地配置，无法验证鉴权"
+            log.info("等待本轮 Token 捕获（最多 %.1fs）…", wait_sec)
+            token = await self._wait_token_capture(since, timeout=wait_sec)
+            if not token:
+                msg = f"{wait_sec:.1f}s 内未确认本轮 Token 捕获"
                 log.warning("%s", msg)
                 return {"ok": False, "msg": msg}
 
-            # 单次正常只读查询验证凭证，复用项目已有的限流机制。
-            res = await get_order_once(
-                self.config.courts[0], self.target_date, token,
-                self.config.user_id, quiet=True,
-            )
-            if not res.get("ok"):
-                msg = f"Token 鉴权未通过: {res.get('error', '未知错误')}"
-                log.warning("%s", msg)
-                return {"ok": False, "msg": msg}
-
-            msg = "Token 已更新，鉴权成功" if token != old_token else "Token 未变化，鉴权成功"
+            msg = "Token 捕获成功（NEW）" if token != old_token else "Token 捕获成功（SAME）"
             self._token_fetch_ok = True
-            log.info("✅ %s", msg)
+            log.info("✅ %s；鉴权由后续业务请求确认", msg)
             return {"ok": True, "msg": msg, "token_preview": token[:8] + "...", "attempts": 1}
         finally:
             self._token_fetch_busy = False
 
-    async def _wait_token_change(self, old_token: str, timeout: float = 5.0) -> str:
-        """轮询等待 config.toml 中的 token 变化。
-
-        返回新 token；超时返回空串。
-        期间任何 config 变化都会广播 config.updated（与 _watch_config 行为一致），
-        并更新 self.session.token，保证后续抢场用新值。
-        """
+    async def _wait_token_capture(self, since: int, timeout: float = 5.0) -> str:
+        """等待本轮 mitm 捕获日志，并确认配置中存在对应的 Token。"""
+        pattern = re.compile(
+            r"^\[mitm\] \[\d{2}:\d{2}:\d{2}\] \[TOKEN\] "
+            r"(?:捕获成功 SAME (.{1,8})\.\.\. \S+|更新成功 .*? -> (.{1,8})\.\.\.)$"
+        )
         deadline = time.monotonic() + max(0.1, timeout)
+        prefix = None
         while True:
-            if self.reload_config():
-                await self.bus.publish("config.updated", self.public_config())
-            if self.session.token and self.session.token != old_token:
-                return self.session.token
+            for event in get_logs(since):
+                since = event["seq"]
+                match = pattern.fullmatch(event["msg"])
+                if match:
+                    prefix = match.group(1) or match.group(2)
+
+            if prefix is not None:
+                if self.reload_config(force=True):
+                    await self.bus.publish("config.updated", self.public_config())
+                    token = self.session.token
+                    if token and token[:8] == prefix:
+                        return token
+
             if time.monotonic() >= deadline:
                 return ""
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(0.1)
 
     # ══════════════════════════════════════════════════
     # VID 池
@@ -911,8 +911,8 @@ class Engine:
                 try:
                     r = await self.fetch_token()
                     if r.get("ok"):
-                        log.info("自动模式: ✅ Token 已刷新 (%s)", r.get("token_preview", ""))
-                        self.auto.msg = f"Token 已刷新（{r.get('token_preview', '')}）"
+                        log.info("自动模式: ✅ Token 已捕获 (%s)", r.get("token_preview", ""))
+                        self.auto.msg = f"Token 已捕获（{r.get('token_preview', '')}）"
                     else:
                         log.warning("自动模式: ⚠ Token 刷新失败: %s", r.get("msg"))
                         self.auto.msg = f"Token 刷新失败: {r.get('msg')}"
@@ -1273,7 +1273,7 @@ class Engine:
                             if res.get("auth_fail") or "鉴权失败" in str(res.get("error", "")):
                                 self._leak_msg = "鉴权失败，正在自动获取 Token"
                                 recovered = await self._recover_token(request_token)
-                                self._leak_msg = ("Token 恢复成功，等待下一轮" if recovered
+                                self._leak_msg = ("已取得 Token，下一轮重新鉴权" if recovered
                                                   else "Token 恢复失败，等待重新登录")
                             delay = 30
                             break
