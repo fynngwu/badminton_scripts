@@ -260,6 +260,15 @@ button:disabled {
   <div id="leak-found" class="row" style="margin-top:8px;"></div>
 </div>
 
+<div class="card">
+  <div class="row">
+    <label style="font-weight:700;">我的预约</label>
+    <button class="primary" id="btn-orders">刷新订单</button>
+    <span class="mini" id="orders-status">等待查询</span>
+  </div>
+  <div id="my-orders" style="margin-top:10px;"></div>
+</div>
+
 <div class="card" id="auto-status" style="display:none">
   <span class="pill" id="auto-phase">idle</span>
   <span class="mini" id="auto-msg" style="margin-left:10px;"></span>
@@ -691,6 +700,63 @@ function renderControls() {
   }
 }
 
+let ordersBusy = false;
+function renderOrders(d) {
+  if (!d) return;
+  const box = $("my-orders");
+  box.replaceChildren();
+  $("orders-status").textContent = d.ok
+    ? `当前有效预约 ${d.orders.length} 笔` : `订单未同步：${d.msg || "未知错误"}`;
+  for (const o of d.orders || []) {
+    const row = document.createElement("div");
+    row.className = "row";
+    row.style.marginTop = "8px";
+    const label = document.createElement("span");
+    label.textContent = `${o.date} · ${o.gym} ${o.court} · ${o.start}-${o.end}`;
+    const button = document.createElement("button");
+    button.textContent = "取消预约";
+    button.disabled = ordersBusy || !d.ok;
+    button.onclick = async () => {
+      if (ordersBusy || !confirm(`确定取消这笔预约？\n${label.textContent}`)) return;
+      ordersBusy = true;
+      button.disabled = true;
+      try {
+        const r = await fetch(`/api/orders/${encodeURIComponent(o.id)}`, {method: "DELETE"});
+        const result = await r.json();
+        toast(result.msg || "取消结果未知", result.ok ? "ok" : "err");
+      } catch (e) {
+        toast("取消结果未知，请刷新订单核对", "err");
+      } finally {
+        ordersBusy = false;
+        await refreshOrders();
+      }
+    };
+    row.append(label, button);
+    box.append(row);
+  }
+  if (d.ok && !d.orders.length) box.textContent = "暂无有效预约";
+}
+async function refreshOrders() {
+  if (ordersBusy) return;
+  ordersBusy = true;
+  $("btn-orders").disabled = true;
+  $("orders-status").textContent = "正在查询订单…";
+  try {
+    const r = await fetch("/api/orders", {cache: "no-store"});
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const result = await r.json();
+    ordersBusy = false;
+    renderOrders(result);
+  } catch (e) {
+    $("orders-status").textContent = `查询失败：${e.message}`;
+    $("my-orders").querySelectorAll("button").forEach(b => b.disabled = true);
+  } finally {
+    ordersBusy = false;
+    $("btn-orders").disabled = false;
+  }
+}
+$("btn-orders").onclick = refreshOrders;
+
 function applySnapshot(d) {
   applyConfig(d.config);
   state.courts = new Map(d.courts.map(r => [`${r.date}/${r.court}`, r]));
@@ -699,6 +765,7 @@ function applySnapshot(d) {
   d.logs.forEach(addLog);
   renderJobs(d.jobs);
   renderLeak(d.leak_found);
+  renderOrders(d.orders);
   render();
   snapshotReady = true;
 }
@@ -729,6 +796,7 @@ function connectSSE() {
       console.error(e);
     }
   });
+  sse.addEventListener("orders.updated", ev => renderOrders(JSON.parse(ev.data).data));
   sse.addEventListener("jobs", ev => renderJobs(JSON.parse(ev.data).data));
   sse.addEventListener("log", ev => addLog(JSON.parse(ev.data).data));
   sse.addEventListener("leak.found", ev => renderLeak(JSON.parse(ev.data).data));
@@ -745,6 +813,7 @@ function connectSSE() {
 
   sse.addEventListener("order.result", ev => {
     const d = JSON.parse(ev.data).data || {};
+    if (d.kind === "ok") { renderLeak(null); refreshOrders(); }
     const kind  = d.kind === "ok" ? "ok" : (d.kind === "busy" ? "warn" : "err");
     const label = d.label || (d.kind === "ok" ? "✅ 预约成功"
                              : d.kind === "busy" ? "⚠ 系统繁忙"
@@ -929,6 +998,7 @@ document.addEventListener("click", async ev => {
 
 window.addEventListener("DOMContentLoaded", async () => {
   connectSSE();
+  refreshOrders();
   try {
     const d = await readState();
     if (!streamReady) applySnapshot(d);

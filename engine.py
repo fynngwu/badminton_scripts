@@ -30,7 +30,7 @@ from utils import (
     refresh_window,
     classify_order_reply,
     port_listening, kill_port_holder, spawn_mitmdump,
-    close_cffi_session,
+    close_cffi_session, limited_get, get_cffi_session, is_auth_fail, BASE_URL,
 )
 
 
@@ -141,7 +141,9 @@ class Engine:
         self.auto = AutoState()
         self._leak_scanning = False
         self._leak_msg = "未启动"
-        self._leak_dates_done: set[str] = set()
+        self._orders: list[dict] = []
+        self._orders_error = "尚未查询"
+        self._orders_lock = asyncio.Lock()
         self._leak_cursor = 0
 
         self._vid_queue: asyncio.Queue = asyncio.Queue(maxsize=6)
@@ -215,7 +217,7 @@ class Engine:
     def snapshot(self):
         return {"config": self.public_config(), "jobs": self.job_states(),
                 "courts": list(self.schedules.values()), "logs": get_logs(),
-                "leak_found": self.leak_found}
+                "leak_found": self.leak_found, "orders": self.orders_state()}
 
     async def _publish_state_changes(self):
         """One shared sampler, independent of the number of connected browsers."""
@@ -805,8 +807,6 @@ class Engine:
         )
 
     async def _publish_order_result(self, court: Court, result: dict, date: str):
-        if result.get("success"):
-            self._leak_dates_done.add(date)
         kind, label = classify_order_reply(result)
         try:
             await self.bus.publish("order.result", {
@@ -1023,6 +1023,127 @@ class Engine:
             self.auto.finished_at = datetime.now().strftime("%H:%M:%S")
 
     # ══════════════════════════════════════════════════
+    # 当前有效订单：服务器是唯一事实来源
+    # ══════════════════════════════════════════════════
+    def orders_state(self):
+        return {"ok": not self._orders_error, "msg": self._orders_error,
+                "orders": list(self._orders)}
+
+    def _booked_dates(self):
+        if self._orders_error:
+            return set()
+        return {o["date"] for o in self._orders
+                if o["gym_id"] == str(self.config.gym_id)}
+
+    async def _recover_token(self, old_token):
+        self.reload_config()
+        if self.session.token and self.session.token != old_token:
+            return True
+        if self._token_fetch_busy:
+            return bool(await self._wait_token_change(old_token, timeout=30))
+        try:
+            result = await self.fetch_token()
+            return bool(result.get("ok"))
+        except Exception as exc:
+            log.warning("Token 恢复异常: %s", type(exc).__name__)
+            return False
+
+    async def _order_api(self, endpoint, *, method="GET", params=None,
+                         payload=None, recover=True):
+        url = BASE_URL + "/api/blade-app/qywx/" + endpoint
+        for attempt in range(2 if recover else 1):
+            token = self.session.token
+            if not token:
+                if recover and attempt == 0 and await self._recover_token(token):
+                    continue
+                raise RuntimeError("未取得有效 Token")
+            query = {**(params or {}), "userid": self.config.user_id, "token": token}
+            if method == "GET":
+                response = await limited_get(url, params=query, quiet=True)
+            else:
+                kwargs = {"params": query}
+                if payload is not None:
+                    kwargs["json"] = payload
+                response = await get_cffi_session().post(url, **kwargs)
+            try:
+                result = response.json()
+            except ValueError:
+                result = {}
+            if not isinstance(result, dict):
+                raise RuntimeError("订单接口响应格式异常")
+            if response.status_code in (401, 403) or is_auth_fail(result):
+                if recover and attempt == 0 and await self._recover_token(token):
+                    continue
+                raise RuntimeError("订单接口鉴权失败")
+            if response.status_code != 200 or result.get("success") is not True:
+                raise RuntimeError(f"订单接口失败（HTTP {response.status_code}）：{result.get('msg', '未知错误')}")
+            return result.get("data")
+        raise RuntimeError("Token 恢复后仍无法查询订单")
+
+    @staticmethod
+    def _active_order(row):
+        return (str(row.get("status")) == "2"
+                and str(row.get("isDeleted")) == "0" and not row.get("cancelTime"))
+
+    async def _read_orders(self):
+        rows = []
+        page = 1
+        while True:
+            data = await self._order_api("getOrderPageListByParam", params={
+                "current": page, "size": 20, "status": 2,
+                "date": int(time.time() * 1000)})
+            if not isinstance(data, dict) or not isinstance(data.get("records"), list):
+                raise RuntimeError("订单列表格式异常")
+            for row in data["records"]:
+                if self._active_order(row):
+                    rows.append({"id": str(row["id"]), "date": row["orderDate"][:10],
+                                 "start": row["startTime"][11:16], "end": row["endTime"][11:16],
+                                 "gym_id": str(row["gymId"]), "gym": row.get("gymName") or "",
+                                 "court": row.get("groundName") or ""})
+            if page >= int(data["pages"]):
+                break
+            page += 1
+        self._orders = sorted(rows, key=lambda o: (o["date"], o["start"]))
+        self._orders_error = ""
+
+    async def refresh_orders(self):
+        async with self._orders_lock:
+            try:
+                await self._read_orders()
+            except Exception as exc:
+                self._orders_error = str(exc)
+                log.warning("订单查询失败: %s", self._orders_error)
+            result = self.orders_state()
+            await self.bus.publish("orders.updated", result)
+            return result
+
+    async def cancel_order(self, order_id):
+        async with self._orders_lock:
+            try:
+                await self._read_orders()
+                order = next((o for o in self._orders if o["id"] == order_id), None)
+                if not order:
+                    raise RuntimeError("该订单已不存在或不可取消")
+                detail = await self._order_api("getOrderDetailByParam", method="POST",
+                                               params={"orderId": order_id})
+                if (not isinstance(detail, dict) or str(detail.get("id")) != order_id
+                        or not self._active_order(detail)):
+                    raise RuntimeError("订单状态已变化，请刷新")
+                payload = {**detail, "status": 6,
+                           "appointmentTime": f"{order['date'].replace('-', '/')} {order['start']}-{order['end']}"}
+                # 取消是写操作：不自动重发，避免响应丢失时重复提交。
+                await self._order_api("operatOrder", method="POST", payload=payload, recover=False)
+            except Exception as exc:
+                return {"ok": False, "msg": f"取消未确认：{exc}；请刷新订单核对"}
+            try:
+                await self._read_orders()
+            except Exception as exc:
+                self._orders_error = str(exc)
+            await self.bus.publish("orders.updated", self.orders_state())
+            log.info("取消预约成功")
+            return {"ok": True, "msg": "取消预约成功", "orders_state": self.orders_state()}
+
+    # ══════════════════════════════════════════════════
     # 常驻检漏：独立日期、单轮最多一个日期、发现空位后提示预约
     # ══════════════════════════════════════════════════
     @staticmethod
@@ -1063,7 +1184,7 @@ class Engine:
     def leak_state(self) -> dict:
         return {"running": self.jobs.running("leak"),
                 "msg": self._leak_msg, "dates": self._leak_dates(),
-                "done_dates": sorted(self._leak_dates_done),
+                "done_dates": sorted(self._booked_dates()),
                 "paused": self._leak_paused(),
                 "pause_start": self.tuning.leak_pause_start,
                 "pause_end": self.tuning.leak_pause_end}
@@ -1071,8 +1192,8 @@ class Engine:
     async def start_leak(self) -> dict:
         if self.leak_state()["running"]:
             return {"ok": True}
-        if not self.session.token or not self.config.courts:
-            return {"ok": False, "msg": "请先配置 Token 和场地"}
+        if not self.config.courts:
+            return {"ok": False, "msg": "请先配置场地"}
         self._leak_msg = "等待检查"
         log.info("检漏模式已启动")
         self.leak_found = None
@@ -1107,19 +1228,34 @@ class Engine:
                 if time.monotonic() - last_summary >= self.tuning.leak_summary_interval:
                     log.info("检漏运行正常，累计查询 %d 次", queries)
                     last_summary = time.monotonic()
-                self._leak_dates_done.intersection_update(self._leak_dates(now))
                 dates = [d for d in self._leak_dates(now)
-                         if d not in self._leak_dates_done
-                         and datetime.fromisoformat(d + "T20:00") > now]
+                         if datetime.fromisoformat(d + "T20:00") > now]
                 auto_busy = self.jobs.running("auto") and self.auto.phase != "waiting_token"
                 if not dates or auto_busy or self.refresh_running or self.reserve_inflight:
                     self._leak_msg = "等待目标日期或其他任务结束"
+                    await asyncio.sleep(self.tuning.leak_interval)
+                    continue
+                if self._leak_query_budget(datetime.now()) < 4.0:
+                    await asyncio.sleep(self.tuning.leak_interval)
+                    continue
+                self._leak_msg = "正在核对有效订单"
+                orders = await self.refresh_orders()
+                if self._leak_paused():
+                    continue
+                if not orders.get("ok"):
+                    self._leak_msg = f"订单查询失败，等待恢复：{orders.get('msg')}"
+                    await asyncio.sleep(30)
+                    continue
+                dates = [d for d in dates if d not in self._booked_dates()]
+                if not dates:
+                    self._leak_msg = "目标日期已有预约，等待订单变化"
                     await asyncio.sleep(self.tuning.leak_interval)
                     continue
                 date = dates[self._leak_cursor % len(dates)]
                 self._leak_cursor += 1
                 self._leak_msg = f"正在检查 {date}"
                 self._leak_scanning = True
+                delay = self.tuning.leak_interval
                 try:
                     for court in list(self.config.courts)[:10]:
                         if ((self.jobs.running("auto") and self.auto.phase != "waiting_token")
@@ -1130,15 +1266,22 @@ class Engine:
                         if budget < 4.0:
                             # 临近暂停起点时不再开始新查询。
                             break
+                        request_token = self.session.token
                         _, res = await self._refresh_one(
                             court, date, timeout=budget, publish=False, quiet=True)
                         queries += 1
                         if self._leak_paused():
                             break
                         if not res.get("ok"):
-                            self._leak_msg = f"查询失败，已暂停：{res.get('error', '未知错误')}"
+                            self._leak_msg = f"查询失败，等待重试：{res.get('error', '未知错误')}"
                             log.warning("检漏 %s %s", date, self._leak_msg)
-                            return
+                            if res.get("auth_fail") or "鉴权失败" in str(res.get("error", "")):
+                                self._leak_msg = "鉴权失败，正在自动获取 Token"
+                                recovered = await self._recover_token(request_token)
+                                self._leak_msg = ("Token 已更新，等待下一轮" if recovered
+                                                  else "Token 恢复失败，等待重新登录")
+                            delay = 30
+                            break
                         slot = self._leak_slot(date, res.get("avail", {}))
                         if slot:
                             self._leak_msg = f"发现 {date} {court.name} {slot[0]}-{slot[1]}，请确认预约"
@@ -1147,10 +1290,11 @@ class Engine:
                                                "start": slot[0], "end": slot[1]}
                             await self.bus.publish("leak.found", self.leak_found)
                             return
-                    self._leak_msg = f"{date} 本轮检查结束"
+                    else:
+                        self._leak_msg = f"{date} 本轮检查结束"
                 finally:
                     self._leak_scanning = False
-                await asyncio.sleep(self.tuning.leak_interval)
+                await asyncio.sleep(delay)
         except asyncio.CancelledError:
             raise
         except Exception as exc:

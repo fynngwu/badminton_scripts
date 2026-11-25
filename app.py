@@ -43,7 +43,7 @@ app = FastAPI(title="Court Reserver", lifespan=lifespan)
 # ══════════════════════════════════════════════════════
 @app.get("/")
 def index():
-    return FileResponse(ROOT / "index.html")
+    return FileResponse(ROOT / "index.html", headers={"Cache-Control": "no-store"})
 
 
 # ══════════════════════════════════════════════════════
@@ -123,6 +123,16 @@ class ReserveIn(BaseModel):
 @app.post("/api/reserve")
 async def reserve_ep(d: ReserveIn):
     return await engine.reserve(d.court_no, d.start, d.end, d.date.isoformat() if d.date else None)
+
+
+@app.get("/api/orders")
+async def orders_ep():
+    return await engine.refresh_orders()
+
+
+@app.delete("/api/orders/{order_id}")
+async def cancel_order_ep(order_id: str):
+    return await engine.cancel_order(order_id)
 
 
 @app.get("/api/stream")
