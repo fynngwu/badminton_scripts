@@ -544,6 +544,7 @@ def refresh_window(
 ) -> bool:
     """先恢复原生窗口，再定位网页导航；True 表示已发送 Ctrl+R。"""
     com_initialized = False
+    native = None
     stage = "初始化"
     try:
         from pywinauto import Desktop, keyboard
@@ -683,6 +684,13 @@ def refresh_window(
         log.exception("[refresh] %s失败: %s: %r", stage, type(exc).__name__, exc)
         return False
     finally:
+        if native is not None:
+            try:
+                if not native.is_minimized():
+                    native.minimize()
+                    log.info("[refresh] 预约窗口已最小化")
+            except Exception as exc:
+                log.warning("[refresh] 预约窗口最小化失败: %r", exc)
         if com_initialized:
             comtypes.CoUninitialize()
 
