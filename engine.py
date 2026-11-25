@@ -48,8 +48,7 @@ class Tuning:
     probe_max_tries:          int   = 6
     auth_refresh_timeout:     float = 4.0
     token_refresh_lead_sec:   int   = 120
-    token_refresh_wait_sec:   float = 5.0    # 每次刷新后等待 token 变化
-    token_refresh_max_tries:  int   = 3      # 最多刷新 3 次
+    token_refresh_wait_sec:   float = 5.0    # 等待 token 变化后验证鉴权
 
     # ── 检漏 ──
     leak_interval:            float = 10.0
@@ -156,6 +155,7 @@ class Engine:
         self._mitm_lock: asyncio.Lock | None = None
 
         self._token_fetch_busy = False
+        self._token_fetch_ok = False
 
 
         # 首帧加载
@@ -428,59 +428,51 @@ class Engine:
 # Token 抓取
 # ══════════════════════════════════════════════════════
     async def fetch_token(self) -> dict:
-        """刷新预约窗口并等待 mitmproxy 写入新 token。
-
-        - 每次刷新后最多等 ``token_refresh_wait_sec`` 秒；
-        - 若 token 未变，重新刷新，最多 ``token_refresh_max_tries`` 次；
-        - 全部失败返回 ``ok=False``；
-        - ``refresh_window`` 返回 False（找不到窗口 / 无法置前）时立即失败，不重试。
-        """
+        """刷新预约网页，再验证现有或更新后的登录凭证。"""
         if self._token_fetch_busy:
             return {"ok": False, "msg": "刷新正在进行，请稍候"}
 
         self._token_fetch_busy = True
+        self._token_fetch_ok = False
         try:
-            ok = await self._ensure_mitm()
-            if not ok:
-                log.error("❌ mitmdump 未就绪")
+            if not await self._ensure_mitm():
                 return {"ok": False, "msg": "mitmdump 未就绪，请查看日志"}
 
+            self.reload_config()
             old_token = self.session.token
+            log.info("触发预约窗口刷新（Ctrl+R）…")
+            if not await asyncio.to_thread(
+                refresh_window,
+                pre_click_delay=self.tuning.refresh_pre_click_delay,
+                post_click_delay=self.tuning.refresh_post_click_delay,
+            ):
+                msg = "预约窗口刷新失败，具体阶段见 refresh 日志"
+                log.warning("%s", msg)
+                return {"ok": False, "msg": msg}
+
             wait_sec = max(0.5, float(self.tuning.token_refresh_wait_sec))
-            max_tries = max(1, int(self.tuning.token_refresh_max_tries))
-            last_msg = ""
+            log.info("等待 Token 更新（最多 %.1fs），随后验证鉴权", wait_sec)
+            await self._wait_token_change(old_token, timeout=wait_sec)
+            token = self.session.token
+            if not token or not self.config.courts:
+                msg = "缺少 Token 或场地配置，无法验证鉴权"
+                log.warning("%s", msg)
+                return {"ok": False, "msg": msg}
 
-            for attempt in range(1, max_tries + 1):
-                log.info("🪟 [%d/%d] 触发预约窗口刷新（Ctrl+R）…", attempt, max_tries)
-                ok = await asyncio.to_thread(
-                    refresh_window,
-                    pre_click_delay=self.tuning.refresh_pre_click_delay,
-                    post_click_delay=self.tuning.refresh_post_click_delay,
-                )
-                if not ok:
-                    last_msg = "未找到预约窗口或窗口无法置前"
-                    log.warning("❌ %s（重试也不会成功，直接返回）", last_msg)
-                    return {"ok": False, "msg": last_msg}
+            # 单次正常只读查询验证凭证，复用项目已有的限流机制。
+            res = await get_order_once(
+                self.config.courts[0], self.target_date, token,
+                self.config.user_id, quiet=True,
+            )
+            if not res.get("ok"):
+                msg = f"Token 鉴权未通过: {res.get('error', '未知错误')}"
+                log.warning("%s", msg)
+                return {"ok": False, "msg": msg}
 
-                log.info("✓ 已发送 Ctrl+R，等待 mitmproxy 捕获新 Token（最多 %.0fs）…", wait_sec)
-                new_token = await self._wait_token_change(old_token, timeout=wait_sec)
-                if new_token and new_token != old_token:
-                    preview = new_token[:8] + "..."
-                    log.info("✅ Token 已更新：%s → %s（第 %d 次尝试）",
-                            (old_token[:8] + "...") if old_token else "(空)",
-                            preview, attempt)
-                    return {
-                        "ok": True,
-                        "msg": f"Token 已更新（第 {attempt} 次尝试）",
-                        "token_preview": preview,
-                        "attempts": attempt,
-                    }
-
-                last_msg = f"第 {attempt} 次刷新后 {wait_sec:.0f}s 内未捕获到新 Token"
-                log.warning("⚠ %s", last_msg)
-
-            log.error("❌ Token 刷新失败：%d 次尝试均未捕获到新 Token", max_tries)
-            return {"ok": False, "msg": f"{max_tries} 次尝试均失败：{last_msg}"}
+            msg = "Token 已更新，鉴权成功" if token != old_token else "Token 未变化，鉴权成功"
+            self._token_fetch_ok = True
+            log.info("✅ %s", msg)
+            return {"ok": True, "msg": msg, "token_preview": token[:8] + "...", "attempts": 1}
         finally:
             self._token_fetch_busy = False
 
@@ -1040,7 +1032,10 @@ class Engine:
         if self.session.token and self.session.token != old_token:
             return True
         if self._token_fetch_busy:
-            return bool(await self._wait_token_change(old_token, timeout=30))
+            deadline = time.monotonic() + 30
+            while self._token_fetch_busy and time.monotonic() < deadline:
+                await asyncio.sleep(0.2)
+            return not self._token_fetch_busy and self._token_fetch_ok
         try:
             result = await self.fetch_token()
             return bool(result.get("ok"))
@@ -1278,7 +1273,7 @@ class Engine:
                             if res.get("auth_fail") or "鉴权失败" in str(res.get("error", "")):
                                 self._leak_msg = "鉴权失败，正在自动获取 Token"
                                 recovered = await self._recover_token(request_token)
-                                self._leak_msg = ("Token 已更新，等待下一轮" if recovered
+                                self._leak_msg = ("Token 恢复成功，等待下一轮" if recovered
                                                   else "Token 恢复失败，等待重新登录")
                             delay = 30
                             break

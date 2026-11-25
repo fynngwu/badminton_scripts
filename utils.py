@@ -542,101 +542,113 @@ def refresh_window(
     fg_timeout: float = 0.6,
     double_click: bool = True,
 ) -> bool:
-    """通过 pywinauto 导航并刷新；True 表示已发送 Ctrl+R。
-
-    double_click 仅为兼容旧调用。需要未锁定的交互桌面。
-    """
+    """先恢复原生窗口，再定位网页导航；True 表示已发送 Ctrl+R。"""
     com_initialized = False
+    stage = "初始化"
     try:
         from pywinauto import Desktop, keyboard
         from pywinauto.uia_defines import NoPatternInterfaceError
         import comtypes
 
-        # asyncio.to_thread 的每个工作线程都需要自己的 COM 初始化。
         comtypes.CoInitializeEx()
         com_initialized = True
 
-        desktop = Desktop(backend="uia")
-        windows = [w for w in desktop.windows()
+        stage = "枚举原生窗口"
+        windows = [w for w in Desktop(backend="win32").windows(visible_only=False)
                    if w.window_text().startswith((RESERVATION_HOST, f"https://{RESERVATION_HOST}"))]
         if len(windows) != 1:
-            log.warning("[refresh] 预约窗口数量=%d，需要唯一窗口", len(windows))
+            log.warning("[refresh] Win32 匹配预约窗口数量=%d，需要唯一窗口", len(windows))
             return False
 
-        hwnd = windows[0].handle
-        native = Desktop(backend="win32").window(handle=hwnd).wrapper_object()
-        log.info("[refresh] 找到预约窗口: HWND=%d", hwnd)
+        native = windows[0]
+        hwnd = native.handle
+        log.info("[refresh] Win32 找到预约窗口: HWND=%d, 最小化=%s", hwnd, native.is_minimized())
+        stage = "恢复窗口"
         if native.is_minimized():
             native.restore()
-            time.sleep(0.2)
+            deadline = time.monotonic() + 3.0
+            while native.is_minimized():
+                if time.monotonic() >= deadline:
+                    log.warning("[refresh] 窗口恢复超时")
+                    return False
+                time.sleep(0.1)
+            log.info("[refresh] 最小化窗口已恢复")
 
-        def on_gym_page() -> bool:
-            page = desktop.window(handle=hwnd).wrapper_object()
-            controls = page.descendants()
-            return (
-                any(c.element_info.control_type == "Edit"
-                    and c.element_info.name == "请输入搜索的场馆" for c in controls)
-                and any(c.element_info.control_type == "Text"
-                        and c.element_info.name == "场地预约" for c in controls)
-            )
-
-        # 先置前，再点击明确识别出的底部导航控件，使网页获得实际输入焦点。
-        deadline = time.monotonic() + max(0.0, fg_timeout)
+        stage = "置前窗口"
         if not native.has_focus():
             native.set_focus()
+        deadline = time.monotonic() + max(0.0, fg_timeout)
         while not native.has_focus():
             if time.monotonic() >= deadline:
-                log.warning("[refresh] 无法确认前台窗口，取消刷新")
+                log.warning("[refresh] 预约窗口无法获得前台焦点")
                 return False
             time.sleep(0.03)
 
+        stage = "读取网页控件"
+        desktop = Desktop(backend="uia")
+        def controls():
+            return desktop.window(handle=hwnd).wrapper_object().descendants()
+
+        def on_gym_page(items):
+            return (any(c.element_info.control_type == "Edit"
+                        and c.element_info.name == "请输入搜索的场馆" for c in items)
+                    and any(c.element_info.control_type == "Text"
+                            and c.element_info.name == "场地预约" for c in items))
+
         time.sleep(max(0.0, pre_click_delay))
-        window = desktop.window(handle=hwnd).wrapper_object()
-        targets = []
-        for ctrl in window.descendants(control_type="Text"):
-            if (ctrl.element_info.name != "场地预约"
-                    or not ctrl.is_enabled() or not ctrl.is_visible()):
-                continue
-            try:
-                invoke = ctrl.iface_invoke
-            except NoPatternInterfaceError:
-                continue
-            if invoke is not None:
-                targets.append(ctrl)
+        deadline = time.monotonic() + 5.0
+        while True:
+            targets = []
+            for ctrl in controls():
+                if (ctrl.element_info.control_type != "Text"
+                        or ctrl.element_info.name != "场地预约"
+                        or not ctrl.is_enabled() or not ctrl.is_visible()):
+                    continue
+                try:
+                    if ctrl.iface_invoke is not None:
+                        targets.append(ctrl)
+                except NoPatternInterfaceError:
+                    continue
+            if len(targets) == 1:
+                break
+            if time.monotonic() >= deadline:
+                log.warning("[refresh] 导航控件数量=%d，无法唯一定位", len(targets))
+                return False
+            time.sleep(0.2)
 
-        if len(targets) != 1 or not native.has_focus():
-            log.warning("[refresh] 导航控件数量=%d 或窗口失焦，取消刷新", len(targets))
+        stage = "点击场地预约"
+        if not native.has_focus():
+            log.warning("[refresh] 点击前预约窗口失焦")
             return False
-
         targets[0].click_input()
         log.info("[refresh] 已点击「场地预约」导航控件")
 
+        stage = "确认场馆列表"
         deadline = time.monotonic() + 5.0
-        while not on_gym_page():
+        while not on_gym_page(controls()):
             if time.monotonic() >= deadline:
                 log.warning("[refresh] 未返回场馆列表，取消刷新")
                 return False
             time.sleep(0.2)
 
         time.sleep(max(0.2, post_click_delay))
-        if not on_gym_page() or not native.has_focus():
-            log.warning("[refresh] 页面或前台窗口已变化，取消刷新")
+        if not on_gym_page(controls()):
+            log.warning("[refresh] 刷新前场馆列表已变化")
+            return False
+        if not native.has_focus():
+            log.warning("[refresh] 刷新前预约窗口失焦")
             return False
 
-        log.info("[refresh] 场馆列表已确认，发送 Ctrl+R")
+        stage = "发送 Ctrl+R"
         keyboard.send_keys("^r", pause=0.08, turn_off_numlock=False, vk_packet=False)
         log.info("[refresh] 已发送 Ctrl+R")
         return True
-    except ImportError:
-        log.warning("[refresh] 缺少依赖，请安装 pywinauto")
-        return False
     except Exception as exc:
-        log.warning("[refresh] UIA 刷新失败: %s", type(exc).__name__)
+        log.exception("[refresh] %s失败: %s: %r", stage, type(exc).__name__, exc)
         return False
     finally:
         if com_initialized:
             comtypes.CoUninitialize()
-
 
 # ══════════════════════════════════════════════════════
 # mitmproxy 抓 token（供 mitm_addon.py 调用）
