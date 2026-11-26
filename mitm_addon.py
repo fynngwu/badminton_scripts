@@ -53,11 +53,10 @@ def _capture_issued_token(flow) -> None:  # type: ignore[no-untyped-def]
         if not token:
             return
 
+        if flow.request.query.get("token") is not None:
+            return
         path = flow.request.path.split("?", 1)[0]
         stamp = time.strftime("%H:%M:%S")
-        if flow.request.query.get("token") is not None:
-            print(f"[{stamp}] [TOKEN] 忽略响应凭证 {token[:8]}... {path}")
-            return
 
         current = str(read_config_dict().get("order", {}).get("token", "") or "")
         if current == token:

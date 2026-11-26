@@ -2,6 +2,7 @@
 import asyncio
 import importlib
 import json
+import logging
 import re
 import sys
 import threading
@@ -315,6 +316,39 @@ def test_order_query_recovers_through_fetch_token(runtime, monkeypatch):
 
         assert result['ok'] is True
         assert seen == ['private-token', 'recovered-token-value']
+    asyncio.run(run())
+
+
+def test_order_auth_failure_logs_reason_then_recovers(runtime, monkeypatch, caplog):
+    async def run():
+        e = runtime.Engine()
+        e._ensure_mitm = AsyncMock(return_value=True)
+        seen = []
+
+        async def limited_get(url, *, params=None, **kwargs):
+            seen.append(params['token'])
+            if len(seen) == 1:
+                return SimpleNamespace(status_code=200, json=lambda: {
+                    'success': False, 'code': 400, 'msg': '鉴权失败2'})
+            return SimpleNamespace(status_code=200, json=lambda: {
+                'success': True, 'data': {'records': [], 'pages': 1}})
+
+        def refresh(**kwargs):
+            _write_token(runtime.CONFIG_PATH, 'recovered-token-value')
+            return True
+
+        monkeypatch.setattr(runtime, 'limited_get', limited_get)
+        monkeypatch.setattr(runtime, 'refresh_window', refresh)
+        with caplog.at_level(logging.INFO, logger='court'):
+            result = await e.refresh_orders()
+
+        messages = [r.getMessage() for r in caplog.records if r.name == 'court']
+        assert result['ok'] is True
+        assert seen == ['private-token', 'recovered-token-value']
+        assert any('订单查询 getOrderPageListByParam 鉴权失败：HTTP 200 | code=400 | msg=鉴权失败2，自动获取 Token…' in m
+                   for m in messages)
+        assert any('会话刷新 1/3' in m for m in messages)
+        assert any('恢复后重试成功' in m for m in messages)
     asyncio.run(run())
 
 

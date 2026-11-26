@@ -1010,11 +1010,15 @@ class Engine:
     async def _order_api(self, endpoint, *, method="GET", params=None,
                          payload=None, recover=True):
         url = BASE_URL + "/api/blade-app/qywx/" + endpoint
+        recovered = False
         for attempt in range(2 if recover else 1):
             token = self.session.token
             if not token:
-                if recover and attempt == 0 and (await self.fetch_token()).get("ok"):
-                    continue
+                if recover and attempt == 0:
+                    log.warning("订单查询 %s 无有效 Token，自动获取 Token…", endpoint)
+                    if (await self.fetch_token()).get("ok"):
+                        recovered = True
+                        continue
                 raise RuntimeError("未取得有效 Token")
             query = {**(params or {}), "userid": self.config.user_id, "token": token}
             if method == "GET":
@@ -1031,11 +1035,18 @@ class Engine:
             if not isinstance(result, dict):
                 raise RuntimeError("订单接口响应格式异常")
             if response.status_code in (401, 403) or is_auth_fail(result):
-                if recover and attempt == 0 and (await self.fetch_token()).get("ok"):
-                    continue
+                if recover and attempt == 0:
+                    log.warning("订单查询 %s 鉴权失败：HTTP %d | code=%s | msg=%s，自动获取 Token…",
+                                endpoint, response.status_code,
+                                result.get("code"), result.get("msg", ""))
+                    if (await self.fetch_token()).get("ok"):
+                        recovered = True
+                        continue
                 raise RuntimeError("订单接口鉴权失败")
             if response.status_code != 200 or result.get("success") is not True:
                 raise RuntimeError(f"订单接口失败（HTTP {response.status_code}）：{result.get('msg', '未知错误')}")
+            if recovered:
+                log.info("订单查询 %s 恢复后重试成功", endpoint)
             return result.get("data")
         raise RuntimeError("Token 恢复后仍无法查询订单")
 
