@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -80,6 +81,21 @@ class AutoState:
     started_at: str = ""
     finished_at: str = ""
     plan: AutoPlan | None = None
+
+@dataclass
+class CurrentOrder:
+    scope: str
+    date: str
+    court: "Court"
+    start: str
+    end: str
+    phase: str = "preparing"
+    attempt_at: datetime = field(default_factory=datetime.now)
+    record: dict | None = None
+    sent_at: str = ""
+    returned_at: str = ""
+    first_empty_at: datetime | None = None
+    result: str = ""
 
 
 # ══════════════════════════════════════════════════════

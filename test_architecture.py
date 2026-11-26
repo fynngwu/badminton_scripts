@@ -529,12 +529,14 @@ def test_auto_waits_then_orders_only_target_court_once(runtime, monkeypatch):
         assert query.await_count == 0
         assert e.auto.phase == 'done'
         entry = e.auto.applied[0]
-        assert (entry['court'], entry['name'], entry['ok'], entry['result']) == (
-            4, '4号场', True, 'ok')
+        assert (entry['court'], entry['name'], entry['result']) == (
+            4, '4号场', 'ok')
         for key in ('scheduled_at', 'sent_at', 'returned_at', 'confirmed_at'):
             assert re.fullmatch(r'\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}',
                                 entry[key])
         assert entry['scheduled_at'] <= entry['sent_at'] <= entry['returned_at']
+        assert entry['confirmed_at'] == entry['returned_at']
+        assert e.current_order is None
 
         await asyncio.sleep(0.05)
         assert len(calls) == 1
@@ -564,7 +566,12 @@ def test_auto_ends_after_explicit_failure_with_one_request(runtime, monkeypatch)
         assert calls[0]['court'].no == 4
         assert query.await_count == 0
         assert e.auto.phase == 'done'
-        assert e.auto.applied and e.auto.applied[0]['ok'] is False
+        entry = e.auto.applied[0]
+        assert entry['result'] == 'busy'
+        assert all(entry[k] for k in ('sent_at', 'returned_at', 'confirmed_at'))
+        assert entry['confirmed_at'] == entry['returned_at']
+        assert e.current_order is None
+        assert '❌ 未成功' in e.auto_state()['msg']
 
         await asyncio.sleep(0.05)
         assert len(calls) == 1
@@ -574,17 +581,69 @@ def test_auto_ends_after_explicit_failure_with_one_request(runtime, monkeypatch)
 # ══════════════════════════════════════════════════════
 # 检漏模式：发现即预约，成功停止，失败继续
 # ══════════════════════════════════════════════════════
-def _prepare_leak(e, monkeypatch):
+def _prepare_leak(e, monkeypatch, *, stub_refresh=True):
     date = (datetime.now() + timedelta(days=1)).date().isoformat()
     court = e.config.courts[0]
     e._leak_dates = lambda now=None: [date]
     e._leak_slot = lambda d, avail: ('19:00', '21:00')
     e._leak_paused = lambda now=None: False
     e._leak_query_budget = lambda now: 4.0
-    e.refresh_orders = AsyncMock(return_value={'ok': True, 'msg': '', 'orders': []})
+    if stub_refresh:
+        e.refresh_orders = AsyncMock(return_value={'ok': True, 'msg': '', 'orders': []})
     e._refresh_one = AsyncMock(return_value=(court, {'ok': True, 'avail': {}}))
     e.tuning.leak_interval = 0.02
     return date, court
+
+
+def _order_row(date, start='19:00', end='21:00', *, court=None, gym_id='other-gym'):
+    court = court or SimpleNamespace(id='court-3', name='3号场')
+    return {'date': date, 'start': start, 'end': end,
+            'court': court.name, 'court_id': court.id, 'gym_id': gym_id}
+
+
+def _seed_order(e, runtime, *, scope, court, date, start='19:00', end='21:00',
+                phase='unconfirmed', record=None, sent_at='', returned_at='',
+                attempt_at=None):
+    order = runtime.CurrentOrder(
+        scope=scope, date=date, court=court, start=start, end=end,
+        phase=phase, record=record, sent_at=sent_at, returned_at=returned_at,
+        attempt_at=attempt_at or datetime.now() - timedelta(seconds=1))
+    if phase == 'unconfirmed' and record is not None and record.get('result') == 'pending':
+        record.update(result='uncertain', sent_at=sent_at, returned_at=returned_at)
+    e.current_order = order
+    return order
+
+
+def _fake_read(e, rows=(), *, error=None):
+    async def read():
+        if error:
+            raise RuntimeError(error)
+        e._orders = list(rows)
+        e._orders_error = ''
+    e._read_orders = read
+
+
+def _events(q, topic):
+    out = []
+    while True:
+        try:
+            item = q.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+        if item is not None and item['_topic'] == topic:
+            out.append(item['data'])
+    return out
+
+
+def _record(date, *, court_no=3, name='3号场', start='19:00', end='21:00'):
+    return {'found_at': runtime_stamp(), 'court': court_no, 'name': name,
+            'date': date, 'start': start, 'end': end,
+            'sent_at': '', 'returned_at': '', 'confirmed_at': '',
+            'result': 'pending', 'elapsed_ms': 0}
+
+
+def runtime_stamp():
+    return datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
 
 
 def test_leak_reserves_automatically_then_stops(runtime, monkeypatch, caplog):
@@ -617,7 +676,7 @@ def test_leak_reserves_automatically_then_stops(runtime, monkeypatch, caplog):
         assert calls[0]['start'] == '19:00' and calls[0]['end'] == '21:00'
         assert not e.jobs.running('leak')
         record = e.leak_found
-        assert record and record['booked'] is True
+        assert record and record['result'] == 'ok'
         assert record['court'] == court.no
         assert record['date'] == date
         assert (record['start'], record['end']) == ('19:00', '21:00')
@@ -642,8 +701,13 @@ def test_leak_reserves_automatically_then_stops(runtime, monkeypatch, caplog):
         saved = dict(record)
         await e.stop_leak()
         await e.apply_config_change()
+        assert e.leak_found is record
+        assert e.snapshot()['leak_found'] is record
         assert e.leak_found['found_at'] == saved['found_at']
-        assert e.snapshot()['leak_found']['found_at'] == saved['found_at']
+        assert e.leak_found['result'] == 'ok'
+        assert e.snapshot()['leak_found']['result'] == 'ok'
+        assert e.snapshot()['leak_found']['sent_at'] == saved['sent_at']
+        assert e.current_order is None
 
         await asyncio.sleep(0.05)
         assert len(calls) == 1
@@ -672,7 +736,6 @@ def test_leak_failure_keeps_last_discovery(runtime, monkeypatch):
 
         record = dict(e.leak_found)
         assert record['result'] == 'busy'
-        assert record['booked'] is False
         assert record['found_at']
         assert record['sent_at'] and record['returned_at']
         assert record['confirmed_at'] == record['returned_at']
@@ -703,38 +766,50 @@ def test_leak_explicit_failure_continues_until_success(runtime, monkeypatch):
         await _run_job(e, 'leak')
 
         assert len(calls) == 2
-        assert e.leak_found and e.leak_found['booked'] is True
+        assert e.leak_found and e.leak_found['result'] == 'ok'
+        assert e.leak_found['confirmed_at'] == e.leak_found['returned_at']
         assert '预约成功' in e._leak_msg
+        assert e.current_order is None
     asyncio.run(run())
 
 
 def test_leak_uncertain_result_confirms_order_before_stopping(runtime, monkeypatch):
     async def run():
         e = runtime.Engine()
-        _prepare_leak(e, monkeypatch)
+        date, court = _prepare_leak(e, monkeypatch, stub_refresh=False)
         calls = []
 
         async def save_order(**kwargs):
             calls.append(kwargs)
-            return {'success': False, 'msg': 'timeout', 'uncertain': True}
+            return {'success': False, 'msg': 'timeout', 'uncertain': True,
+                    'sent_at': '2026-11-26 20:16:32.130',
+                    'returned_at': '2026-11-26 20:16:32.456'}
 
         monkeypatch.setattr(runtime, 'save_order_once', save_order)
-        e._confirm_order = AsyncMock(return_value='created')
+        _fake_read(e, [_order_row(date, court=court)])
 
         assert (await e.start_leak())['ok']
         await _run_job(e, 'leak')
 
         assert len(calls) == 1
-        assert e._confirm_order.await_count == 1
-        assert e.leak_found and e.leak_found['booked'] is True
+        record = e.leak_found
+        assert record['result'] == 'ok'
+        assert record['sent_at'] == '2026-11-26 20:16:32.130'
+        assert record['returned_at'] == '2026-11-26 20:16:32.456'
+        assert record['confirmed_at'] and record['confirmed_at'] != record['returned_at']
+        assert e.current_order is None
         assert '预约成功' in e._leak_msg
+        assert not e.jobs.running('leak')
     asyncio.run(run())
 
 
-def test_leak_uncertain_without_order_waits_before_retrying(runtime, monkeypatch):
+def test_leak_resumes_only_after_verified_none(runtime, monkeypatch):
+    """The retry follows a settled 'none', not one empty list read (bug G)."""
     async def run():
         e = runtime.Engine()
-        _prepare_leak(e, monkeypatch)
+        date, _ = _prepare_leak(e, monkeypatch, stub_refresh=False)
+        e.ORDER_CONFIRM_GRACE = 0
+        _fake_read(e, [])
         calls = []
         results = iter([{'success': False, 'msg': 'timeout', 'uncertain': True},
                         {'success': True, 'msg': 'ok'}])
@@ -744,14 +819,15 @@ def test_leak_uncertain_without_order_waits_before_retrying(runtime, monkeypatch
             return next(results)
 
         monkeypatch.setattr(runtime, 'save_order_once', save_order)
-        e._confirm_order = AsyncMock(return_value='none')
 
         assert (await e.start_leak())['ok']
         await _run_job(e, 'leak')
 
         assert len(calls) == 2
-        assert e._confirm_order.await_count == 1
-        assert e.leak_found and e.leak_found['booked'] is True
+        assert e.leak_found['result'] == 'ok'
+        assert e.leak_found['confirmed_at'] == e.leak_found['returned_at']
+        assert e.current_order is None
+        assert not e.jobs.running('leak')
     asyncio.run(run())
 
 
@@ -761,22 +837,36 @@ def test_auto_config_multi_court_payload_rejected(runtime):
         app.ConfigIn(court_no=[3, 4])
 
 
-def test_confirm_order_distinguishes_query_failure(runtime):
+def test_settlement_distinguishes_query_failure_created_and_none(runtime):
     async def run():
-        e = runtime.Engine()
-        court = e.config.courts[0]
         date = '2026-12-01'
-        e.refresh_orders = AsyncMock(return_value={'ok': False, 'msg': '网络异常'})
-        assert await e._confirm_order(date, court, '19:00', '21:00') == 'unknown'
+        court = runtime.Engine().config.courts[0]
 
-        e.refresh_orders = AsyncMock(return_value={'ok': True, 'msg': '',
-                                                   'orders': []})
-        e._orders = [{'date': date, 'start': '19:00', 'end': '21:00',
-                      'court': '3号场地', 'court_id': ''}]
-        assert await e._confirm_order(date, court, '19:00', '21:00') == 'created'
+        async def case(rows, *, error=None, grace=None):
+            e = runtime.Engine()
+            record = _record(date)
+            order = _seed_order(e, runtime, scope='leak', court=court,
+                                date=date, record=record)
+            if grace is not None:
+                e.ORDER_CONFIRM_GRACE = grace
+            _fake_read(e, rows, error=error)
+            status = await e._refresh_and_status(order)
+            return e, record, status
 
-        e._orders = []
-        assert await e._confirm_order(date, court, '19:00', '21:00') == 'none'
+        e, record, status = await case([], error='网络异常')
+        assert status == 'unknown'
+        assert e.current_order is not None and e.current_order.phase == 'unconfirmed'
+        assert record['result'] == 'uncertain' and record['confirmed_at'] == ''
+
+        e, record, status = await case([_order_row(date, court=court)])
+        assert status == 'created'
+        assert e.current_order is None
+        assert record['result'] == 'ok' and record['confirmed_at']
+
+        e, record, status = await case([], grace=0)
+        assert status == 'none'
+        assert e.current_order is None
+        assert record['result'] == 'error' and record['confirmed_at']
     asyncio.run(run())
 
 
@@ -795,86 +885,159 @@ def test_order_matches_accepts_ground_id(runtime):
 def test_reserve_rejected_for_active_task_but_not_history(runtime, monkeypatch):
     async def run():
         e = runtime.Engine()
+        date = '2026-12-01'
 
         async def blocked():
             await asyncio.Event().wait()
 
-        e.jobs.start(('2026-12-01', 3, '19:00', '21:00'), blocked())
-        result = await e.reserve(3, '18:00', '19:00', '2026-12-01')
+        e.jobs.start((date, 3, '19:00', '21:00'), blocked())
+        result = await e.reserve(3, '19:00', '21:00', date)
         assert result['accepted'] is False
-        assert '提交' in result['msg']
-        await e.jobs.stop_all()
+        assert '提交' in result['label'] and '同一时段' in result['msg']
 
         async def save_order(**kwargs):
             return {'success': True, 'msg': 'ok'}
 
         monkeypatch.setattr(runtime, 'save_order_once', save_order)
+        free = await e.reserve(3, '18:00', '19:00', date)
+        assert free['accepted'] is True
+        await _run_job(e, (date, 3, '18:00', '19:00'))
+        assert e.current_order is None
+
         e.leak_found = {'result': 'pending'}
-        result = await e.reserve(3, '19:00', '21:00', '2026-12-01')
-        assert result['accepted'] is True
-        await asyncio.sleep(0.02)
+        history = await e.reserve(3, '17:00', '18:00', date)
+        assert history['accepted'] is True
+        await _run_job(e, (date, 3, '17:00', '18:00'))
+        assert not e.reserve_inflight
+
+        order = _seed_order(e, runtime, scope='manual',
+                            court=e.config.courts[0], date=date,
+                            start='20:00', end='22:00', phase='sending')
+        result = await e.reserve(3, '16:00', '17:00', date)
+        assert result['accepted'] is False
+        assert '已有下单任务' in result['msg']
+        assert e.reserve_inflight and e.current_order is order
+        await e.jobs.stop_all()
     asyncio.run(run())
 
 
-def test_stop_leak_cancels_pending_and_allows_manual(runtime, monkeypatch):
+def test_cancel_before_send_releases_everything(runtime, monkeypatch):
+    """A cancelled 'preparing' order publishes no POST and frees manual reserve."""
     async def run():
         e = runtime.Engine()
         date, _ = _prepare_leak(e, monkeypatch)
         e.tuning.leak_interval = 1.0
         started = asyncio.Event()
-        release = asyncio.Event()
+        calls = []
+
+        async def blocked_vid(**kwargs):
+            started.set()
+            await asyncio.Event().wait()
+            return ('fake-vid', {})
+
+        async def save_order(**kwargs):
+            calls.append(kwargs)
+            return {'success': True, 'msg': 'ok'}
+
+        monkeypatch.setattr(runtime, 'get_vid_once', blocked_vid)
+        monkeypatch.setattr(runtime, 'save_order_once', save_order)
+        queue = e.bus.subscribe()
+
+        assert (await e.start_leak())['ok']
+        await asyncio.wait_for(started.wait(), 2)
+        assert e.current_order is not None
+        assert e.current_order.phase == 'preparing'
+        assert e.leak_found['result'] == 'pending'
+
+        await e.stop_leak()
+        assert calls == []
+        assert e.current_order is None and not e.reserve_inflight
+        assert not e.jobs.running('leak')
+        record = e.leak_found
+        assert record['result'] == 'cancelled'
+        assert all(record[k] == '' for k in ('sent_at', 'returned_at', 'confirmed_at'))
+        assert any(ev['result'] == 'cancelled' for ev in _events(queue, 'leak.found'))
+
+        monkeypatch.setattr(runtime, 'get_vid_once',
+                            AsyncMock(return_value=('fake-vid', {})))
+        result = await e.reserve(3, '18:00', '19:00', date)
+        assert result['accepted'] is True
+        await _run_job(e, (date, 3, '18:00', '19:00'))
+        assert len(calls) == 1
+        assert e.current_order is None
+    asyncio.run(run())
+
+
+def test_cancel_after_send_keeps_unconfirmed_order(runtime, monkeypatch, caplog):
+    """A cancelled 'sending' order stays uncertain until the list is checked."""
+    async def run():
+        e = runtime.Engine()
+        date, court = _prepare_leak(e, monkeypatch, stub_refresh=False)
+        started = asyncio.Event()
         calls = []
 
         async def blocking_save(**kwargs):
             calls.append(kwargs)
             started.set()
-            await release.wait()
+            await asyncio.Event().wait()
             return {'success': True, 'msg': 'ok'}
 
         monkeypatch.setattr(runtime, 'save_order_once', blocking_save)
-        e.refresh_orders = AsyncMock(return_value={'ok': True, 'msg': '',
-                                                   'orders': []})
+        _fake_read(e, [])
         assert (await e.start_leak())['ok']
         await asyncio.wait_for(started.wait(), 2)
-        assert e.leak_found['result'] == 'pending'
+        assert e.current_order.phase == 'sending'
 
         await e.stop_leak()
-        assert e.leak_found['result'] in ('cancelled', 'uncertain')
-        assert e._leak_order_intent is False
-        assert not e.jobs.running('leak')
+        order = e.current_order
+        assert order is not None and order.phase == 'unconfirmed'
+        assert order.scope == 'leak' and order.sent_at and order.returned_at
+        record = e.leak_found
+        assert record['result'] == 'uncertain'
+        assert record['sent_at'] == order.sent_at
+        assert record['returned_at'] == order.returned_at
+        assert record['confirmed_at'] == ''
+        assert len(calls) == 1
 
-        async def quick_save(**kwargs):
-            return {'success': True, 'msg': 'ok'}
+        _fake_read(e, [], error='网络异常')
+        blocked = await e.reserve(3, '18:00', '19:00', date)
+        assert blocked['accepted'] is False
+        assert '未确认' in blocked['msg']
+        assert e.current_order is order and len(calls) == 1
 
-        monkeypatch.setattr(runtime, 'save_order_once', quick_save)
-        result = await e.reserve(3, '18:00', '19:00', date)
-        assert result['accepted'] is True
-        await asyncio.sleep(0.02)
-        release.set()
+        _fake_read(e, [_order_row(date, court=court)])
+        monkeypatch.setattr(runtime, 'format_stamp',
+                            lambda dt=None: '2026-12-01 20:00:01.000')
+        with caplog.at_level(logging.INFO, logger='court'):
+            confirmed = await e.reserve(3, '18:00', '19:00', date)
+        assert confirmed['accepted'] is False
+        assert '已确认' in confirmed['msg']
+        assert e.current_order is None
+        assert record['result'] == 'ok'
+        assert record['sent_at'] == order.sent_at
+        assert record['returned_at'] == order.returned_at
+        assert record['confirmed_at'] and record['confirmed_at'] != record['returned_at']
+        assert len(calls) == 1
+        assert any('订单核对完成：已创建' in r.getMessage()
+                   for r in caplog.records if r.name == 'court')
     asyncio.run(run())
 
 
 def test_leak_uncertain_query_failure_never_resubmits(runtime, monkeypatch):
     async def run():
         e = runtime.Engine()
-        date, _ = _prepare_leak(e, monkeypatch)
+        date, _ = _prepare_leak(e, monkeypatch, stub_refresh=False)
         calls = []
 
         async def save_order(**kwargs):
             calls.append(kwargs)
-            return {'success': False, 'msg': 'timeout', 'uncertain': True}
+            return {'success': False, 'msg': 'timeout', 'uncertain': True,
+                    'sent_at': '2026-11-26 20:16:32.130',
+                    'returned_at': '2026-11-26 20:16:32.456'}
 
         monkeypatch.setattr(runtime, 'save_order_once', save_order)
-        refreshes = 0
+        _fake_read(e, [])
 
-        async def refresh_orders():
-            nonlocal refreshes
-            refreshes += 1
-            if refreshes == 1:
-                return {'ok': True, 'msg': '', 'orders': []}
-            return {'ok': False, 'msg': '网络异常', 'orders': []}
-
-        e.refresh_orders = refresh_orders
         assert (await e.start_leak())['ok']
         for _ in range(200):
             if e.leak_found and e.leak_found.get('result') == 'uncertain':
@@ -883,9 +1046,10 @@ def test_leak_uncertain_query_failure_never_resubmits(runtime, monkeypatch):
         else:
             raise AssertionError('检漏未保留未确认状态')
 
-        await asyncio.sleep(0.1)
+        _fake_read(e, [], error='网络异常')
+        await asyncio.sleep(0.05)
         assert len(calls) == 1
-        assert e._uncertain_order is not None
+        assert e.current_order is not None and e.current_order.phase == 'unconfirmed'
         result = await e.reserve(3, '18:00', '19:00', date)
         assert result['accepted'] is False
         assert '未确认' in result['msg']
@@ -917,10 +1081,11 @@ def test_manual_order_blocks_auto_submission(runtime, monkeypatch):
         await _run_job(e, 'auto')
         assert len(calls) == 1
         entry = e.auto.applied[0]
-        assert entry['ok'] is False
+        assert entry['result'] == 'error'
         assert entry['sent_at'] == ''
         assert entry['returned_at'] == ''
         assert entry['confirmed_at'] == ''
+        assert e.current_order is not None
 
         release.set()
         await asyncio.sleep(0.02)
@@ -951,7 +1116,11 @@ def test_leak_order_blocks_auto_submission(runtime, monkeypatch):
         assert (await e.start_auto())['ok']
         await _run_job(e, 'auto')
         assert len(calls) == 1
-        assert e.auto.applied and e.auto.applied[0]['ok'] is False
+        entry = e.auto.applied[0]
+        assert entry['result'] == 'error'
+        assert entry['sent_at'] == ''
+        assert entry['returned_at'] == ''
+        assert entry['confirmed_at'] == ''
 
         await e.stop_leak()
         release.set()
@@ -962,7 +1131,7 @@ def test_leak_order_blocks_auto_submission(runtime, monkeypatch):
 def test_uncertain_confirmation_preserves_http_times(runtime, monkeypatch):
     async def run():
         e = runtime.Engine()
-        _prepare_leak(e, monkeypatch)
+        date, court = _prepare_leak(e, monkeypatch, stub_refresh=False)
         sent_at = '2026-11-26 20:16:32.130'
         returned_at = '2026-11-26 20:16:32.456'
 
@@ -972,7 +1141,7 @@ def test_uncertain_confirmation_preserves_http_times(runtime, monkeypatch):
                     'elapsed_ms': 326}
 
         monkeypatch.setattr(runtime, 'save_order_once', save_order)
-        e._confirm_order = AsyncMock(return_value='created')
+        _fake_read(e, [_order_row(date, court=court)])
         assert (await e.start_leak())['ok']
         await _run_job(e, 'leak')
 
@@ -982,7 +1151,7 @@ def test_uncertain_confirmation_preserves_http_times(runtime, monkeypatch):
         assert record['returned_at'] == returned_at
         assert record['confirmed_at']
         assert record['confirmed_at'] not in (sent_at, returned_at)
-        assert e._uncertain_order is None
+        assert e.current_order is None
     asyncio.run(run())
 
 
@@ -999,52 +1168,40 @@ def test_manual_uncertain_blocks_repeat_until_order_check(runtime, monkeypatch):
         monkeypatch.setattr(runtime, 'save_order_once', save_order)
         first = await e.reserve(3, '19:00', '21:00', date)
         assert first['accepted'] is True
-        await asyncio.sleep(0.02)
-        assert e._uncertain_order is not None
+        await _run_job(e, (date, 3, '19:00', '21:00'))
+        order = e.current_order
+        assert order is not None and order.phase == 'unconfirmed'
 
-        e.refresh_orders = AsyncMock(return_value={'ok': False, 'msg': '网络异常',
-                                                   'orders': []})
+        _fake_read(e, [], error='网络异常')
         blocked = await e.reserve(3, '18:00', '19:00', date)
         assert blocked['accepted'] is False
         assert '未确认' in blocked['msg']
+        assert e.current_order is order
 
-        e.refresh_orders = AsyncMock(return_value={'ok': True, 'msg': '',
-                                                   'orders': []})
+        e.ORDER_CONFIRM_GRACE = 0
+        _fake_read(e, [])
         allowed = await e.reserve(3, '18:00', '19:00', date)
         assert allowed['accepted'] is True
-        await asyncio.sleep(0.02)
+        assert e.current_order is not None and e.current_order is not order
+        await _run_job(e, (date, 3, '18:00', '19:00'))
+        second = e.current_order
+        assert second is not None and second is not order
+        assert second.phase == 'unconfirmed'
     asyncio.run(run())
 
 
 def test_leak_resolves_uncertain_order_on_later_query(runtime, monkeypatch):
     async def run():
         e = runtime.Engine()
-        date, court = _prepare_leak(e, monkeypatch)
-        record = {
-            'found_at': runtime.format_stamp(), 'court': court.no,
-            'name': court.name,
-            'date': date, 'start': '19:00', 'end': '21:00',
-            'sent_at': '2026-11-26 20:16:32.130',
-            'returned_at': '2026-11-26 20:16:32.456',
-            'confirmed_at': '', 'result': 'uncertain', 'elapsed_ms': 0,
-            'booked': False,
-        }
+        date, court = _prepare_leak(e, monkeypatch, stub_refresh=False)
+        record = _record(date, court_no=court.no, name=court.name)
+        record.update(sent_at='2026-11-26 20:16:32.130',
+                      returned_at='2026-11-26 20:16:32.456', result='uncertain')
         e.leak_found = record
-        e._uncertain_order = {
-            'scope': 'leak', 'date': date, 'court': court,
-            'start': '19:00', 'end': '21:00',
-            'attempt_at': datetime.now() - timedelta(milliseconds=300),
-            'record': record,
-        }
-
-        async def refresh_orders():
-            e._orders = [{'date': date, 'start': '19:00', 'end': '21:00',
-                          'court': court.name, 'court_id': court.id,
-                          'gym_id': ''}]
-            e._orders_error = ''
-            return {'ok': True, 'msg': '', 'orders': list(e._orders)}
-
-        e.refresh_orders = refresh_orders
+        _seed_order(e, runtime, scope='leak', court=court, date=date,
+                    record=record, attempt_at=datetime.now() - timedelta(milliseconds=300),
+                    sent_at=record['sent_at'], returned_at=record['returned_at'])
+        _fake_read(e, [_order_row(date, court=court)])
         start_calls = []
 
         async def save_order(**kwargs):
@@ -1057,13 +1214,13 @@ def test_leak_resolves_uncertain_order_on_later_query(runtime, monkeypatch):
 
         assert start_calls == []
         assert record['result'] == 'ok'
-        assert record['booked'] is True
         assert record['sent_at'] == '2026-11-26 20:16:32.130'
         assert record['returned_at'] == '2026-11-26 20:16:32.456'
         assert record['confirmed_at']
         assert record['confirmed_at'] != record['returned_at']
-        assert e._uncertain_order is None
+        assert e.current_order is None
         assert '预约成功' in e._leak_msg
+        assert not e.jobs.running('leak')
     asyncio.run(run())
 
 
@@ -1095,31 +1252,22 @@ def test_manual_rejected_while_leak_order_inflight(runtime, monkeypatch):
 def test_leak_recheck_handles_foreign_uncertain_order(runtime, monkeypatch):
     async def run():
         e = runtime.Engine()
-        date, court = _prepare_leak(e, monkeypatch)
+        date, court = _prepare_leak(e, monkeypatch, stub_refresh=False)
         e._leak_slot = lambda d, avail: None
         e._refresh_one = AsyncMock(return_value=(court, {'ok': True, 'avail': {}}))
-        e._uncertain_order = {
-            'scope': 'manual', 'date': date, 'court': court,
-            'start': '19:00', 'end': '21:00',
-            'attempt_at': datetime.now(), 'record': None,
-        }
+        e.ORDER_CONFIRM_GRACE = 0
+        order = _seed_order(e, runtime, scope='manual', court=court, date=date)
+        _fake_read(e, [])
 
-        async def refresh_orders():
-            e._orders = [{'date': date, 'start': '19:00', 'end': '21:00',
-                          'court': court.name, 'court_id': court.id,
-                          'gym_id': ''}]
-            e._orders_error = ''
-            return {'ok': True, 'msg': '', 'orders': list(e._orders)}
-
-        e.refresh_orders = refresh_orders
         assert (await e.start_leak())['ok']
         for _ in range(200):
-            if e._uncertain_order is None:
+            if e.current_order is None:
                 break
             await asyncio.sleep(0.01)
         else:
             raise AssertionError('检漏未清除其他模式的未确认订单')
 
+        assert order.result == 'none'
         assert e.jobs.running('leak')
         assert e.leak_found is None
         await e.stop_leak()
@@ -1131,22 +1279,348 @@ def test_manual_resolution_uses_captured_uncertain_target(runtime, monkeypatch):
         e = runtime.Engine()
         date = '2026-12-01'
         court = e.config.courts[0]
-        e._uncertain_order = {
-            'scope': 'auto', 'date': date, 'court': court,
-            'start': '19:00', 'end': '21:00',
-            'attempt_at': datetime.now(), 'record': None,
-        }
+        order = _seed_order(e, runtime, scope='auto', court=court, date=date)
+        _fake_read(e, [_order_row(date, court=court)])
 
-        async def refresh_orders():
-            e._orders = [{'date': date, 'start': '19:00', 'end': '21:00',
-                          'court': court.name, 'court_id': court.id,
-                          'gym_id': ''}]
-            e._orders_error = ''
-            e._uncertain_order = None
-            return {'ok': True, 'msg': '', 'orders': list(e._orders)}
-
-        e.refresh_orders = refresh_orders
         result = await e.reserve(3, '19:00', '21:00', date)
         assert result['accepted'] is False
         assert '已确认' in result['msg']
+        assert order.result == 'created'
+        assert e.current_order is None
+    asyncio.run(run())
+
+
+# ══════════════════════════════════════════════════════
+# 订单生命周期行为回归：取消、延迟确认、并发复核、跨模式互斥
+# ══════════════════════════════════════════════════════
+def test_explicit_result_survives_cancel_during_publish(runtime, monkeypatch):
+    """Cancellation during result publication must not turn ok into uncertain."""
+    async def run():
+        e = runtime.Engine()
+        _auto_engine(e, runtime, '20:00:04', court_no=3)
+        e._parse_hms = lambda value: datetime.now() - timedelta(seconds=1)
+        entered = asyncio.Event()
+
+        async def save_order(**kwargs):
+            return {'success': True, 'msg': 'ok'}
+
+        async def publish(court, date, kind, msg, result=None):
+            entered.set()
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(runtime, 'save_order_once', save_order)
+        e._publish_order_result = publish
+
+        assert (await e.start_auto())['ok']
+        await asyncio.wait_for(entered.wait(), 2)
+        await e.stop_auto()
+
+        assert e.current_order is None
+        assert not e.jobs.running('auto')
+        entry = e.auto.applied[0]
+        assert entry['result'] == 'ok'
+        assert entry['sent_at'] and entry['returned_at']
+        assert entry['confirmed_at'] == entry['returned_at']
+        assert entry['confirmed_at'] >= entry['sent_at']
+        assert all(r['result'] != 'uncertain' for r in e.auto.applied)
+    asyncio.run(run())
+
+
+def test_auto_delayed_confirmation_updates_derived_state(runtime, monkeypatch, caplog):
+    """An unconfirmed auto entry is updated in place when the order appears."""
+    async def run():
+        e = runtime.Engine()
+        _auto_engine(e, runtime, '20:00:04', court_no=3)
+        e._parse_hms = lambda value: datetime.now() - timedelta(seconds=1)
+        date, court = e.target_date, e.config.courts[0]
+        sent_at = '2026-12-01 20:00:00.100'
+        returned_at = '2026-12-01 20:00:00.400'
+
+        async def save_order(**kwargs):
+            return {'success': False, 'msg': 'timeout', 'uncertain': True,
+                    'sent_at': sent_at, 'returned_at': returned_at}
+
+        monkeypatch.setattr(runtime, 'save_order_once', save_order)
+        _fake_read(e, [])
+
+        with caplog.at_level(logging.INFO, logger='court'):
+            assert (await e.start_auto())['ok']
+            await _run_job(e, 'auto')
+            entry = e.auto.applied[0]
+            assert entry['result'] == 'uncertain'
+            assert '❌ 未成功' in e.auto_state()['msg']
+            assert entry['confirmed_at'] == ''
+            assert entry['sent_at'] == sent_at
+            assert entry['returned_at'] == returned_at
+            assert e.current_order is not None and e.current_order.phase == 'unconfirmed'
+
+            _fake_read(e, [_order_row(date, court=court)])
+            await e.refresh_orders()
+            assert e.auto.applied[0] is entry
+            assert entry['result'] == 'ok'
+            assert '✅ 成功' in e.auto_state()['msg']
+            assert entry['confirmed_at'] and entry['confirmed_at'] != returned_at
+            assert entry['sent_at'] == sent_at
+            assert entry['returned_at'] == returned_at
+            assert e.current_order is None
+
+        assert any('订单核对完成：已创建' in r.getMessage()
+                   for r in caplog.records if r.name == 'court')
+    asyncio.run(run())
+
+
+def test_auto_delayed_confirmation_settles_none_after_grace(runtime, monkeypatch):
+    async def run():
+        e = runtime.Engine()
+        _auto_engine(e, runtime, '20:00:04', court_no=3)
+        e._parse_hms = lambda value: datetime.now() - timedelta(seconds=1)
+        e.ORDER_CONFIRM_GRACE = 0
+        sent_at = '2026-12-01 20:00:00.100'
+        returned_at = '2026-12-01 20:00:00.400'
+
+        async def save_order(**kwargs):
+            return {'success': False, 'msg': 'timeout', 'uncertain': True,
+                    'sent_at': sent_at, 'returned_at': returned_at}
+
+        monkeypatch.setattr(runtime, 'save_order_once', save_order)
+        _fake_read(e, [])
+
+        assert (await e.start_auto())['ok']
+        await _run_job(e, 'auto')
+
+        entry = e.auto.applied[0]
+        assert entry['result'] == 'error'
+        assert '❌ 未成功' in e.auto_state()['msg']
+        assert entry['confirmed_at'] and entry['confirmed_at'] != returned_at
+        assert entry['sent_at'] == sent_at
+        assert entry['returned_at'] == returned_at
+        assert e.current_order is None
+    asyncio.run(run())
+
+
+def test_single_empty_list_does_not_prove_absence(runtime):
+    async def run():
+        e = runtime.Engine()
+        date = '2026-12-01'
+        court = e.config.courts[0]
+        record = _record(date)
+        order = _seed_order(e, runtime, scope='leak', court=court, date=date,
+                            record=record, sent_at='2026-12-01 20:00:00.100',
+                            returned_at='2026-12-01 20:00:00.400')
+
+        e._orders = []
+        e._orders_error = ''
+        assert e._settle_from_orders() is None
+        assert e.current_order is order
+        assert order.first_empty_at is not None
+        assert record['result'] == 'uncertain' and record['confirmed_at'] == ''
+
+        _fake_read(e, [], error='网络异常')
+        assert await e._refresh_and_status(order) == 'unknown'
+        assert e.current_order is order
+        assert record['result'] == 'uncertain' and record['confirmed_at'] == ''
+
+        e.ORDER_CONFIRM_GRACE = 0
+        _fake_read(e, [])
+        result = await e.refresh_orders()
+        assert result['ok'] is True
+        assert e.current_order is None
+        assert record['result'] == 'error'
+        assert record['confirmed_at'] and record['confirmed_at'] != record['returned_at']
+    asyncio.run(run())
+
+
+def test_leak_empty_check_does_not_resubmit(runtime, monkeypatch):
+    """One empty list read only starts the grace period (bug F)."""
+    async def run():
+        e = runtime.Engine()
+        date, _ = _prepare_leak(e, monkeypatch, stub_refresh=False)
+        calls = []
+
+        async def save_order(**kwargs):
+            calls.append(kwargs)
+            return {'success': False, 'msg': 'timeout', 'uncertain': True,
+                    'sent_at': '2026-12-01 20:00:00.100',
+                    'returned_at': '2026-12-01 20:00:00.400'}
+
+        monkeypatch.setattr(runtime, 'save_order_once', save_order)
+        _fake_read(e, [])
+
+        assert (await e.start_leak())['ok']
+        for _ in range(200):
+            if e.leak_found and e.leak_found.get('result') == 'uncertain':
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError('检漏未保留未确认状态')
+        await asyncio.sleep(0.05)
+
+        assert len(calls) == 1
+        assert e.current_order is not None and e.current_order.phase == 'unconfirmed'
+        assert e.leak_found['confirmed_at'] == ''
+        await e.stop_leak()
+    asyncio.run(run())
+
+
+def test_concurrent_recheck_settles_once(runtime, monkeypatch):
+    """A blocked list read shared by leak and reserve settles one order once."""
+    async def run():
+        e = runtime.Engine()
+        date, court = _prepare_leak(e, monkeypatch, stub_refresh=False)
+        record = _record(date, court_no=court.no, name=court.name)
+        record.update(sent_at='2026-12-01 20:00:00.100',
+                      returned_at='2026-12-01 20:00:00.400', result='uncertain')
+        e.leak_found = record
+        _seed_order(e, runtime, scope='leak', court=court, date=date, record=record)
+
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def read():
+            entered.set()
+            await release.wait()
+            e._orders = [_order_row(date, court=court)]
+            e._orders_error = ''
+
+        e._read_orders = read
+        calls = []
+
+        async def save_order(**kwargs):
+            calls.append(kwargs)
+            return {'success': True, 'msg': 'ok'}
+
+        monkeypatch.setattr(runtime, 'save_order_once', save_order)
+
+        assert (await e.start_leak())['ok']
+        leak_task = e.jobs.tasks['leak']
+        await asyncio.wait_for(entered.wait(), 2)
+        manual = asyncio.create_task(e.reserve(3, '18:00', '19:00', date))
+        await asyncio.sleep(0)
+        release.set()
+
+        result = await asyncio.wait_for(manual, 2)
+        await asyncio.wait_for(leak_task, 2)
+        assert result['accepted'] is False
+        assert '已确认' in result['msg']
+        assert e.current_order is None
+        assert record['result'] == 'ok' and record['confirmed_at']
+        assert calls == []
+        assert not e.jobs.running('leak')
+
+        confirmed_at = record['confirmed_at']
+        await e.refresh_orders()
+        assert record['confirmed_at'] == confirmed_at
+        assert record['result'] == 'ok'
+    asyncio.run(run())
+
+
+def test_stale_result_does_not_touch_other_order(runtime):
+    """A stale task's refresh cannot settle an order owned by another task."""
+    async def run():
+        e = runtime.Engine()
+        date = '2026-12-01'
+        court = e.config.courts[0]
+        record = _record(date)
+        a = _seed_order(e, runtime, scope='leak', court=court, date=date,
+                        record=record, sent_at='2026-12-01 20:00:00.100',
+                        returned_at='2026-12-01 20:00:00.400')
+        b_record = _record(date, start='18:00', end='19:00')
+        b = _seed_order(e, runtime, scope='manual', court=court, date=date,
+                        start='18:00', end='19:00', phase='sending', record=b_record)
+        before_a, before_b, before_b_record = dict(record), dict(b.__dict__), dict(b_record)
+
+        e._orders = []
+        e._orders_error = ''
+        assert e._settle_from_orders() is None
+        assert e.current_order is b
+        assert dict(b.__dict__) == before_b
+
+        _fake_read(e, [])
+        assert await e._refresh_and_status(a) == 'unknown'
+        assert e.current_order is b
+        assert a.result == '' and dict(record) == before_a
+        assert dict(b.__dict__) == before_b and dict(b_record) == before_b_record
+    asyncio.run(run())
+
+
+def test_cross_mode_conflicts_with_unconfirmed_order(runtime, monkeypatch):
+    async def run():
+        date = '2026-12-01'
+        court = runtime.Engine().config.courts[0]
+        record = _record(date)
+        calls = []
+
+        async def save_order(**kwargs):
+            calls.append(kwargs)
+            return {'success': True, 'msg': 'ok'}
+
+        monkeypatch.setattr(runtime, 'save_order_once', save_order)
+
+        e = runtime.Engine()
+        order = _seed_order(e, runtime, scope='leak', court=court, date=date,
+                            record=record, sent_at='2026-12-01 20:00:00.100',
+                            returned_at='2026-12-01 20:00:00.400')
+        _fake_read(e, [], error='网络异常')
+        blocked = await e.reserve(3, '18:00', '19:00', date)
+        assert blocked['accepted'] is False and '未确认' in blocked['msg']
+
+        _auto_engine(e, runtime, '20:00:04', court_no=3)
+        e._parse_hms = lambda value: datetime.now() - timedelta(seconds=1)
+        assert (await e.start_auto())['ok']
+        await _run_job(e, 'auto')
+        entry = e.auto.applied[0]
+        assert entry['result'] == 'error'
+        assert entry['sent_at'] == entry['returned_at'] == entry['confirmed_at'] == ''
+        assert calls == []
+
+        _prepare_leak(e, monkeypatch, stub_refresh=False)
+        _fake_read(e, [], error='网络异常')
+        assert (await e.start_leak())['ok']
+        await asyncio.sleep(0.05)
+        assert e.current_order is order
+        assert calls == []
+        await e.stop_leak()
+
+        confirmed = runtime.Engine()
+        confirmed_order = _seed_order(confirmed, runtime, scope='auto',
+                                      court=confirmed.config.courts[0], date=date)
+        _fake_read(confirmed, [_order_row(date, court=confirmed.config.courts[0])])
+        result = await confirmed.reserve(3, '18:00', '19:00', date)
+        assert result['accepted'] is False and '已确认' in result['msg']
+        assert confirmed_order.result == 'created'
+    asyncio.run(run())
+
+
+def test_cross_mode_conflicts_with_sending_order(runtime, monkeypatch):
+    async def run():
+        e = runtime.Engine()
+        date = '2026-12-01'
+        court = e.config.courts[0]
+        order = _seed_order(e, runtime, scope='leak', court=court, date=date,
+                            phase='sending')
+        calls = []
+
+        async def save_order(**kwargs):
+            calls.append(kwargs)
+            return {'success': True, 'msg': 'ok'}
+
+        monkeypatch.setattr(runtime, 'save_order_once', save_order)
+
+        blocked = await e.reserve(3, '18:00', '19:00', date)
+        assert blocked['accepted'] is False and '已有下单任务' in blocked['msg']
+
+        _auto_engine(e, runtime, '20:00:04', court_no=3)
+        e._parse_hms = lambda value: datetime.now() - timedelta(seconds=1)
+        assert (await e.start_auto())['ok']
+        await _run_job(e, 'auto')
+        entry = e.auto.applied[0]
+        assert entry['result'] == 'error'
+        assert entry['sent_at'] == entry['returned_at'] == entry['confirmed_at'] == ''
+
+        _prepare_leak(e, monkeypatch)
+        assert (await e.start_leak())['ok']
+        await asyncio.sleep(0.05)
+        assert e.current_order is order
+        assert calls == []
+        await e.stop_leak()
     asyncio.run(run())
