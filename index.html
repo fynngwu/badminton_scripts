@@ -676,7 +676,16 @@ function renderJobs(jobs) {
   $("auto-status").style.display = auto.phase === "idle" ? "none" : "";
   $("auto-phase").textContent = auto.phase;
   $("auto-msg").textContent = auto.msg;
-  $("auto-applied").textContent = (auto.applied || []).map(a => `${a.name}${a.ok ? "✓" : "✗"}`).join(" / ") || "无";
+  $("auto-applied").textContent = (auto.applied || []).map(a => {
+    const result = LEAK_RESULT[a.result] || a.result || (a.ok ? "✅" : "❌");
+    const parts = [`${a.name} ${result}`];
+    if (a.scheduled_at) parts.push(`触发 ${a.scheduled_at}`);
+    if (a.sent_at) parts.push(`发送 ${a.sent_at}`);
+    if (a.returned_at) parts.push(`返回 ${a.returned_at}`);
+    if (a.confirmed_at) parts.push(`确认 ${a.confirmed_at}`);
+    if (a.elapsed_ms) parts.push(`耗时 ${a.elapsed_ms}ms`);
+    return parts.join(" · ");
+  }).join(" / ") || "无";
   $("btn-leak").textContent = leak.running ? "停止检漏" : "启动检漏";
   const indicator = $("leak-indicator");
   indicator.textContent = !streamReady ? "○ 状态未实时同步" : leak.running
@@ -693,6 +702,7 @@ const LEAK_RESULT = {
   busy: "⚠ 系统繁忙",
   uncertain: "⚠ 结果不明确",
   error: "❌ 预约失败",
+  cancelled: "⏹ 已取消",
 };
 
 function renderLeak(d) {
@@ -705,9 +715,9 @@ function renderLeak(d) {
   const order = document.createElement("div");
   order.className = "mini";
   const result = LEAK_RESULT[d.result] || d.result || "-";
-  const returned = d.result_at ? ` ${d.result_at}` : "";
   const elapsed = d.elapsed_ms ? ` · 耗时 ${d.elapsed_ms}ms` : "";
-  order.textContent = `🚀 下单 ${d.order_at || "-"} · ${result}${returned}${elapsed}`;
+  order.textContent = `🚀 发送 ${d.sent_at || "-"} · 返回 ${d.returned_at || "-"}`
+    + ` · 确认 ${d.confirmed_at || "-"} · ${result}${elapsed}`;
   $("leak-found").append(found, order);
 }
 

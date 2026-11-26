@@ -145,6 +145,9 @@ class Engine:
         self._orders_error = "尚未查询"
         self._orders_lock = asyncio.Lock()
         self._order_lock = asyncio.Lock()
+        self._order_owner: str | None = None
+        self._uncertain_order: dict | None = None
+        self._leak_order_intent = False
         self._leak_cursor = 0
         self._legacy_court_warned = False
 
@@ -242,8 +245,12 @@ class Engine:
 
     @property
     def reserve_inflight(self):
-        return self._order_lock.locked() or any(
-            isinstance(k, tuple) and self.jobs.running(k) for k in self.jobs.tasks)
+        return (self._order_owner is not None
+                or self._leak_order_intent
+                or self._uncertain_order is not None
+                or self._order_lock.locked()
+                or any(isinstance(k, tuple) and self.jobs.running(k)
+                       for k in self.jobs.tasks))
 
     def update_offset_days(self, offset: int) -> None:
         offset = max(0, min(2, int(offset)))
@@ -749,43 +756,64 @@ class Engine:
             return {"accepted": False, "kind": "warn",
                     "label": "⏳ 该时段已在提交",
                     "msg": "同一时段已有请求在飞"}
-        if self.reserve_inflight or (
-                self.leak_found and self.leak_found.get("result") == "pending"):
+        if self._uncertain_order is not None:
+            status = await self._resolve_uncertain()
+            if status == "created":
+                return {"accepted": False, "kind": "warn",
+                        "label": "⚠ 上一笔订单已确认",
+                        "msg": "上一笔结果不明确的订单已确认成功，请刷新订单"}
+            if status == "unknown":
+                return {"accepted": False, "kind": "warn",
+                        "label": "⚠ 订单结果未确认",
+                        "msg": "上一笔订单结果未确认，请先刷新订单核对"}
+        if self.reserve_inflight:
             return {"accepted": False, "kind": "warn",
                     "label": "⏳ 已有下单任务",
-                    "msg": "检漏/手动下单正在提交，请稍后"}
+                    "msg": "已有下单任务正在提交，请稍后"}
 
         self.jobs.start(key, self._reserve_worker(court, start, end, date))
 
         return {"accepted": True, "court": court.no, "name": court.name,
                 "start": start, "end": end, "date": date}
 
-    async def _place_order(self, court: Court, start: str, end: str, date: str) -> dict:
-        """同一时间只允许一个下单任务；返回原始 saveOrder 结果。"""
-        async with self._order_lock:
-            try:
-                vid: str | None = None
-                if self.vid_running:
-                    vid = await self.take_vid(timeout=1.5)
+    async def _place_order(self, court: Court, start: str, end: str,
+                           date: str, owner: str) -> dict:
+        """抢占唯一下单权；已有订单意图或未确认订单时拒绝执行。"""
+        if self._uncertain_order is not None:
+            return {"success": False, "msg": "上一笔订单结果未确认，禁止重复提交",
+                    "sent_at": "", "returned_at": ""}
+        if self._order_owner is not None:
+            return {"success": False, "msg": "已有下单任务在提交",
+                    "sent_at": "", "returned_at": ""}
+        self._order_owner = owner
+        try:
+            async with self._order_lock:
+                try:
+                    vid: str | None = None
+                    if self.vid_running:
+                        vid = await self.take_vid(timeout=1.5)
+                        if not vid:
+                            log.info("VID 池暂无货，现解一个…")
+
                     if not vid:
-                        log.info("VID 池暂无货，现解一个…")
+                        async with self._solve_sem:
+                            vid, _ = await get_vid_once(timeout=self.tuning.vid_timeout,
+                                                        impersonate="chrome124")
 
-                if not vid:
-                    async with self._solve_sem:
-                        vid, _ = await get_vid_once(timeout=self.tuning.vid_timeout,
-                                                    impersonate="chrome124")
-
-                return await self._save_order(vid, court, date,
-                                              start, end, self.session.token)
-            except Exception as e:
-                log.warning("下单准备失败 %s: %s", court.name, e)
-                return {"success": False, "msg": f"下单准备失败: {e}",
-                        "sent_at": "", "returned_at": format_stamp()}
+                    return await self._save_order(vid, court, date,
+                                                  start, end, self.session.token)
+                except Exception as e:
+                    log.warning("下单准备失败 %s: %s", court.name, e)
+                    return {"success": False, "msg": f"下单准备失败: {e}",
+                            "sent_at": "", "returned_at": ""}
+        finally:
+            if self._order_owner == owner:
+                self._order_owner = None
 
     async def _try_order(self, court: Court, start: str, end: str,
-                         date: str) -> tuple[str, str, dict]:
+                         date: str, owner: str) -> tuple[str, str, dict]:
         started = datetime.now()
-        r = await self._place_order(court, start, end, date)
+        r = await self._place_order(court, start, end, date, owner)
         finished = datetime.now()
         r.setdefault("sent_at", format_stamp(started))
         r.setdefault("returned_at", format_stamp(finished))
@@ -795,9 +823,24 @@ class Engine:
         return kind, str(r.get("msg") or label), r
 
     async def _reserve_worker(self, court: Court, start: str, end: str, date: str):
+        attempt_at = datetime.now()
         try:
-            r = await self._place_order(court, start, end, date)
+            r = await self._place_order(court, start, end, date, "manual")
+            kind, _ = classify_order_reply(r)
+            if kind == "uncertain":
+                self._uncertain_order = {
+                    "scope": "manual", "date": date, "court": court,
+                    "start": start, "end": end,
+                    "attempt_at": attempt_at, "record": None,
+                }
             await self._publish_order_result(court, r, date)
+        except asyncio.CancelledError:
+            self._uncertain_order = {
+                "scope": "manual", "date": date, "court": court,
+                "start": start, "end": end,
+                "attempt_at": attempt_at, "record": None,
+            }
+            raise
         except Exception as e:
             log.exception("reserve worker 异常: %s", e)
             await self.bus.publish("order.result", {
@@ -827,6 +870,52 @@ class Engine:
                       or name.startswith(f"{court.no}号"))
         return (order.get("date") == date and order.get("start") == start
                 and order.get("end") == end and same_court)
+
+    def _uncertain_from_orders(self, orders_ok: bool | None = None,
+                               pending: dict | None = None) -> str:
+        pending = pending or self._uncertain_order
+        if pending is None:
+            return "none"
+        if orders_ok is False or (orders_ok is None and self._orders_error):
+            return "unknown"
+        if any(self._order_matches(o, pending["date"], pending["court"],
+                                   pending["start"], pending["end"])
+               for o in self._orders):
+            return "created"
+        return "none"
+
+    def _apply_uncertain(self, status: str) -> None:
+        pending = self._uncertain_order
+        if pending is None or status == "unknown":
+            return
+        record = pending.get("record")
+        if record is not None:
+            confirmed_at = format_stamp()
+            elapsed_ms = int(
+                (datetime.now() - pending["attempt_at"]).total_seconds() * 1000)
+            if status == "created":
+                record.update(result="ok", booked=True, msg="订单已确认",
+                              confirmed_at=confirmed_at, elapsed_ms=elapsed_ms)
+            else:
+                record.update(result="error", booked=False,
+                              confirmed_at=confirmed_at, elapsed_ms=elapsed_ms,
+                              msg="确认未产生订单")
+        self._uncertain_order = None
+
+    async def _resolve_uncertain(self) -> str:
+        pending = self._uncertain_order
+        if pending is None:
+            return "none"
+        result = await self.refresh_orders()
+        if not result.get("ok"):
+            return "unknown"
+        status = self._uncertain_from_orders(True, pending)
+        if self._uncertain_order is pending:
+            self._apply_uncertain(status)
+            if (status in ("created", "none")
+                    and pending.get("record") is self.leak_found):
+                await self.bus.publish("leak.found", self.leak_found)
+        return status
 
     async def _save_order(self, vid, court: Court, date: str,
                           start: str, end: str, token: str) -> dict:
@@ -904,9 +993,8 @@ class Engine:
         court = plan.court
         date = plan.date
 
-        def record(ok: bool, msg: str = "") -> None:
-            applied.append({"court": court.no, "name": court.name,
-                            "ok": ok, "msg": msg})
+        def record(entry: dict) -> None:
+            applied.append(entry)
             self.auto.applied = list(applied)
 
         try:
@@ -964,15 +1052,49 @@ class Engine:
             self.auto.phase = "ordering"
             self.auto.msg = f"{court.name} 正在下单"
             log.info("自动模式: 已到触发时刻，向 %s 提交唯一一次预约", court.name)
-            kind, msg, _ = await self._try_order(court, slot_start, slot_end, date)
+            attempt_at = datetime.now()
+            try:
+                kind, msg, outcome = await self._try_order(
+                    court, slot_start, slot_end, date, "auto")
+            except asyncio.CancelledError:
+                self._uncertain_order = {
+                    "scope": "auto", "date": date, "court": court,
+                    "start": slot_start, "end": slot_end,
+                    "attempt_at": attempt_at, "record": None,
+                }
+                raise
+            sent_at = str(outcome.get("sent_at") or "")
+            returned_at = str(outcome.get("returned_at") or "")
+            confirmed_at = returned_at if kind != "uncertain" else ""
+            elapsed_ms = (int(outcome.get("elapsed_ms") or 0)
+                          if sent_at and kind != "uncertain" else 0)
+            entry = {
+                "court": court.no, "name": court.name,
+                "ok": kind == "ok", "msg": msg, "result": kind,
+                "scheduled_at": format_stamp(save_dt),
+                "sent_at": sent_at, "returned_at": returned_at,
+                "confirmed_at": confirmed_at, "elapsed_ms": elapsed_ms,
+            }
             if kind == "uncertain":
+                self._uncertain_order = {
+                    "scope": "auto", "date": date, "court": court,
+                    "start": slot_start, "end": slot_end,
+                    "attempt_at": attempt_at, "record": entry,
+                }
                 confirmation = await self._confirm_order(
                     date, court, slot_start, slot_end)
+                if confirmation in ("created", "none"):
+                    self._apply_uncertain(confirmation)
                 if confirmation == "created":
                     kind, msg = "ok", "订单已确认"
-                elif confirmation == "unknown":
+                    entry.update(ok=True, result="ok", msg=msg)
+                elif confirmation == "none":
+                    kind, msg = "error", "确认未产生订单"
+                    entry.update(ok=False, result="error", msg=msg)
+                else:
                     msg = f"结果不明确且订单核对失败：{msg}"
-            record(kind == "ok", msg)
+                    entry["msg"] = msg
+            record(entry)
             log.info("自动模式: %s 下单%s: %s",
                      court.name, "成功" if kind == "ok" else "失败", msg)
 
@@ -1170,6 +1292,14 @@ class Engine:
     async def stop_leak(self):
         await self.jobs.stop("leak")
         self._leak_msg = "已停止"
+        self._leak_order_intent = False
+        if (self.leak_found
+                and self.leak_found.get("result") == "pending"):
+            self.leak_found.update(
+                result="cancelled", confirmed_at=format_stamp(),
+                booked=False, msg="检漏停止，下单任务取消")
+        if self.leak_found:
+            await self.bus.publish("leak.found", self.leak_found)
 
     async def _leak_success(self, record: dict, court: Court, elapsed_ms: int):
         record.update(result="ok", booked=True, elapsed_ms=elapsed_ms)
@@ -1200,6 +1330,40 @@ class Engine:
                 if time.monotonic() - last_summary >= self.tuning.leak_summary_interval:
                     log.info("检漏运行正常，累计查询 %d 次", queries)
                     last_summary = time.monotonic()
+
+                orders = None
+                if self._uncertain_order is not None:
+                    self._leak_msg = "正在核对上一笔未确认订单"
+                    orders = await self.refresh_orders()
+                    if not orders.get("ok"):
+                        self._leak_msg = "上一笔订单结果未确认，等待订单查询恢复"
+                        await asyncio.sleep(30)
+                        continue
+                    pending = self._uncertain_order
+                    status = self._uncertain_from_orders(True)
+                    self._apply_uncertain(status)
+                    if pending.get("scope") == "leak":
+                        if status == "created":
+                            await self._leak_success(
+                                pending["record"], pending["court"],
+                                pending["record"].get("elapsed_ms", 0))
+                            return
+                        if status == "none":
+                            await self.bus.publish("leak.found", pending["record"])
+                            self._leak_msg = "上一笔订单已确认未产生，恢复检查"
+                            log.info("检漏复核：确认未产生订单，恢复检查")
+                        else:
+                            self._leak_msg = "上一笔订单结果未确认，等待订单查询恢复"
+                            await asyncio.sleep(30)
+                            continue
+                    elif status == "unknown":
+                        self._leak_msg = "其他模式订单结果未确认，等待订单查询恢复"
+                        await asyncio.sleep(30)
+                        continue
+                    else:
+                        self._leak_msg = "其他模式未确认订单已核对，恢复检查"
+                        log.info("检漏复核：其他模式订单核对完成（%s）", status)
+
                 dates = [d for d in self._leak_dates(now)
                          if datetime.fromisoformat(d + "T20:00") > now]
                 auto_busy = self.jobs.running("auto") and self.auto.phase != "waiting_token"
@@ -1210,8 +1374,9 @@ class Engine:
                 if self._leak_query_budget(datetime.now()) < 4.0:
                     await asyncio.sleep(self.tuning.leak_interval)
                     continue
-                self._leak_msg = "正在核对有效订单"
-                orders = await self.refresh_orders()
+                if orders is None:
+                    self._leak_msg = "正在核对有效订单"
+                    orders = await self.refresh_orders()
                 if self._leak_paused():
                     continue
                 if not orders.get("ok"):
@@ -1266,59 +1431,85 @@ class Engine:
                                 "found_at": format_stamp(),
                                 "court": court.no, "name": court.name,
                                 "date": date, "start": start, "end": end,
-                                "order_at": "", "result": "pending",
-                                "result_at": "", "elapsed_ms": 0,
-                                "booked": False,
+                                "sent_at": "", "returned_at": "",
+                                "confirmed_at": "", "result": "pending",
+                                "elapsed_ms": 0, "booked": False,
                             }
                             self._leak_msg = (f"发现 {date} {court.name} {start}-{end}，"
                                               f"正在自动预约")
                             self.leak_found = record
+                            self._leak_order_intent = True
                             log.info("检漏发现：%s %s %s-%s",
                                      date, court.name, start, end)
                             await self.bus.publish("leak.found", record)
 
                             attempt_at = datetime.now()
                             log.info("检漏下单：%s", court.name)
-                            kind, msg, outcome = await self._try_order(
-                                court, start, end, date)
-                            result_at = outcome.get("returned_at") or format_stamp()
-                            elapsed_ms = int(outcome.get("elapsed_ms") or 0)
-                            confirmation = ""
+                            try:
+                                kind, msg, outcome = await self._try_order(
+                                    court, start, end, date, "leak")
+                            except asyncio.CancelledError:
+                                record.update(result="uncertain", booked=False)
+                                self._uncertain_order = {
+                                    "scope": "leak", "date": date,
+                                    "court": court, "start": start, "end": end,
+                                    "attempt_at": attempt_at, "record": record,
+                                }
+                                raise
+                            finally:
+                                self._leak_order_intent = False
+
+                            sent_at = str(outcome.get("sent_at") or "")
+                            returned_at = str(outcome.get("returned_at") or "")
+                            confirmed_at = returned_at if kind != "uncertain" else ""
+                            elapsed_ms = (int(outcome.get("elapsed_ms") or 0)
+                                          if sent_at and kind != "uncertain" else 0)
+                            record.update(sent_at=sent_at, returned_at=returned_at,
+                                          result=kind, confirmed_at=confirmed_at,
+                                          elapsed_ms=elapsed_ms)
                             if kind == "uncertain":
+                                self._uncertain_order = {
+                                    "scope": "leak", "date": date,
+                                    "court": court, "start": start, "end": end,
+                                    "attempt_at": attempt_at, "record": record,
+                                }
                                 confirmation = await self._confirm_order(
                                     date, court, start, end)
+                                if confirmation in ("created", "none"):
+                                    self._apply_uncertain(confirmation)
                                 if confirmation == "created":
                                     kind, msg = "ok", "订单已确认"
-                                    result_at = format_stamp()
-                                    elapsed_ms = int(
-                                        (datetime.now() - attempt_at).total_seconds() * 1000)
+                                elif confirmation == "none":
+                                    kind, msg = "error", "确认未产生订单"
+                                else:
+                                    msg = f"结果不明确且订单核对失败：{msg}"
                             if kind == "ok":
-                                record.update(order_at=outcome.get("sent_at", ""),
-                                              result_at=result_at)
-                                await self._leak_success(record, court, elapsed_ms)
+                                await self._leak_success(
+                                    record, court, record.get("elapsed_ms", 0))
                                 return
 
-                            record.update(order_at=outcome.get("sent_at", ""),
-                                          result=kind, result_at=result_at,
-                                          elapsed_ms=elapsed_ms)
                             self.leak_found = record
                             await self.bus.publish("leak.found", record)
-                            if kind == "uncertain" and confirmation == "unknown":
-                                self._leak_msg = ("预约结果不明确，订单核对失败，"
-                                                  "等待下一轮复核")
-                                delay = 30
-                            elif kind == "uncertain":
-                                self._leak_msg = ("预约结果不明确，未确认到订单，"
-                                                  "继续检漏")
+                            if kind == "uncertain":
+                                if self._uncertain_order is not None:
+                                    self._leak_msg = ("预约结果不明确，订单核对失败，"
+                                                      "等待下一轮复核")
+                                    delay = 30
                             else:
                                 self._leak_msg = f"预约未成功，继续检漏：{msg}"
                             log.warning("检漏预约失败：%s，耗时%dms：%s",
-                                        court.name, elapsed_ms, msg)
+                                        court.name, record.get("elapsed_ms", 0), msg)
                             break
                     else:
                         self._leak_msg = f"{date} 本轮检查结束"
                 finally:
                     self._leak_scanning = False
+                    self._leak_order_intent = False
+                    if (self.leak_found
+                            and self.leak_found.get("result") == "pending"):
+                        self.leak_found.update(
+                            result="cancelled", confirmed_at=format_stamp(),
+                            booked=False, msg="检漏停止，下单任务取消")
                 await asyncio.sleep(delay)
         except asyncio.CancelledError:
             raise

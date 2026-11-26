@@ -124,14 +124,17 @@ const assertions = `
   const record = {
     found_at: "2026-11-26 20:16:32.128", court: 8, name: "8号场",
     date: "2026-11-26", start: "18:30", end: "20:30",
-    order_at: "2026-11-26 20:16:32.130", result: "ok",
-    result_at: "2026-11-26 20:16:32.456", elapsed_ms: 326, booked: true,
+    sent_at: "2026-11-26 20:16:32.130",
+    returned_at: "2026-11-26 20:16:32.456",
+    confirmed_at: "2026-11-26 20:16:32.457",
+    result: "ok", elapsed_ms: 327, booked: true,
   };
   renderLeak(record);
   const leakText = document.getElementById("leak-found").children
     .map(el => el.textContent).join(" | ");
   for (const part of [record.found_at, "8号场", record.date,
-                      "18:30-20:30", record.order_at, "326ms"]) {
+                      "18:30-20:30", record.sent_at, record.returned_at,
+                      record.confirmed_at, "327ms"]) {
     if (!leakText.includes(part)) throw new Error("发现记录缺少字段：" + part);
   }
   renderLeak(record);
