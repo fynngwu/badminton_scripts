@@ -25,10 +25,10 @@ from utils import (
     CONFIG_PATH,
     MITM_HOST, MITM_PORT, MITM_UPSTREAM,
     read_config_dict, write_config_string, write_config_int,
-    write_config_string_renamed, write_config_int_list,
+    write_config_string_renamed, write_config_int_renamed,
     get_vid_once, get_order_once, save_order_once,
     refresh_window,
-    classify_order_reply,
+    classify_order_reply, format_stamp,
     port_listening, kill_port_holder, spawn_mitmdump,
     close_cffi_session, limited_get, get_cffi_session, is_auth_fail, BASE_URL,
 )
@@ -144,7 +144,9 @@ class Engine:
         self._orders: list[dict] = []
         self._orders_error = "尚未查询"
         self._orders_lock = asyncio.Lock()
+        self._order_lock = asyncio.Lock()
         self._leak_cursor = 0
+        self._legacy_court_warned = False
 
         self._vid_queue: asyncio.Queue = asyncio.Queue(maxsize=6)
         self._vid_stats: deque = deque(maxlen=30)
@@ -185,10 +187,16 @@ class Engine:
             u, g, o, a = (data.get(k, {}) or {} for k in ("user", "gym", "order", "auto"))
             courts = tuple(Court(int(k), str(v), f"{int(k)}号场")
                            for k, v in sorted(data.get("courts", {}).items(), key=lambda x: int(x[0])))
+            court_no = a.get("court_no")
+            if isinstance(court_no, bool) or not isinstance(court_no, int) or court_no <= 0:
+                court_no = 0
+            if not court_no and a.get("court_order") and not self._legacy_court_warned:
+                self._legacy_court_warned = True
+                log.warning("检测到旧版多场地配置，请重新选择一个目标场地")
             auto = AutoConfig(str(a.get("slot_start", "19:30")),
                               str(a.get("slot_end", "21:30")),
                               str(a.get("save_order_at") or a.get("refresh_at", "20:00:04")),
-                              tuple(int(n) for n in a.get("court_order", [3, 4, 10]) if int(n) > 0))
+                              court_no)
             config = Config(*(str(v or "") for v in (u.get("id"), u.get("customer_id"),
                             u.get("name"), u.get("tel"), g.get("id"), g.get("name"))),
                             courts=courts, offset_days=max(0, min(2, int(o.get("offset_days", 1)))), auto=auto)
@@ -234,7 +242,8 @@ class Engine:
 
     @property
     def reserve_inflight(self):
-        return any(isinstance(k, tuple) and self.jobs.running(k) for k in self.jobs.tasks)
+        return self._order_lock.locked() or any(
+            isinstance(k, tuple) and self.jobs.running(k) for k in self.jobs.tasks)
 
     def update_offset_days(self, offset: int) -> None:
         offset = max(0, min(2, int(offset)))
@@ -247,12 +256,14 @@ class Engine:
 
     async def update_auto_config(self, slot_start: str, slot_end: str,
                                  save_order_at: str,
-                                 court_order: list[int] | None = None) -> None:
+                                 court_no: int | None = None) -> None:
+        if court_no is not None and court_no not in {c.no for c in self.config.courts}:
+            raise ValueError(f"非法场地号 {court_no}，请选择一个已配置的场地")
         write_config_string("slot_start", slot_start.strip())
         write_config_string("slot_end",   slot_end.strip())
         write_config_string_renamed("save_order_at", "refresh_at", save_order_at.strip())
-        if court_order is not None:
-            write_config_int_list("court_order", court_order)
+        if court_no is not None:
+            write_config_int_renamed("court_no", "court_order", court_no)
 
     async def apply_config_change(self):
         self.reload_config(force=True)
@@ -738,28 +749,54 @@ class Engine:
             return {"accepted": False, "kind": "warn",
                     "label": "⏳ 该时段已在提交",
                     "msg": "同一时段已有请求在飞"}
+        if self.reserve_inflight or (
+                self.leak_found and self.leak_found.get("result") == "pending"):
+            return {"accepted": False, "kind": "warn",
+                    "label": "⏳ 已有下单任务",
+                    "msg": "检漏/手动下单正在提交，请稍后"}
 
         self.jobs.start(key, self._reserve_worker(court, start, end, date))
 
         return {"accepted": True, "court": court.no, "name": court.name,
                 "start": start, "end": end, "date": date}
 
+    async def _place_order(self, court: Court, start: str, end: str, date: str) -> dict:
+        """同一时间只允许一个下单任务；返回原始 saveOrder 结果。"""
+        async with self._order_lock:
+            try:
+                vid: str | None = None
+                if self.vid_running:
+                    vid = await self.take_vid(timeout=1.5)
+                    if not vid:
+                        log.info("VID 池暂无货，现解一个…")
+
+                if not vid:
+                    async with self._solve_sem:
+                        vid, _ = await get_vid_once(timeout=self.tuning.vid_timeout,
+                                                    impersonate="chrome124")
+
+                return await self._save_order(vid, court, date,
+                                              start, end, self.session.token)
+            except Exception as e:
+                log.warning("下单准备失败 %s: %s", court.name, e)
+                return {"success": False, "msg": f"下单准备失败: {e}",
+                        "sent_at": "", "returned_at": format_stamp()}
+
+    async def _try_order(self, court: Court, start: str, end: str,
+                         date: str) -> tuple[str, str, dict]:
+        started = datetime.now()
+        r = await self._place_order(court, start, end, date)
+        finished = datetime.now()
+        r.setdefault("sent_at", format_stamp(started))
+        r.setdefault("returned_at", format_stamp(finished))
+        r.setdefault("elapsed_ms", int((finished - started).total_seconds() * 1000))
+        await self._publish_order_result(court, r, date)
+        kind, label = classify_order_reply(r)
+        return kind, str(r.get("msg") or label), r
+
     async def _reserve_worker(self, court: Court, start: str, end: str, date: str):
         try:
-            vid: str | None = None
-
-            if self.vid_running:
-                vid = await self.take_vid(timeout=1.5)
-                if not vid:
-                    log.info("手动点击：VID 池暂无货，现解一个…")
-
-            if not vid:
-                async with self._solve_sem:
-                    vid, _ = await get_vid_once(timeout=self.tuning.vid_timeout,
-                                                impersonate="chrome124")
-
-            r = await self._save_order(vid, court, date,
-                                       start, end, self.session.token)
+            r = await self._place_order(court, start, end, date)
             await self._publish_order_result(court, r, date)
         except Exception as e:
             log.exception("reserve worker 异常: %s", e)
@@ -769,6 +806,27 @@ class Engine:
                 "msg": str(e),
                 "ts": datetime.now().strftime("%H:%M:%S"),
             })
+
+    async def _confirm_order(self, date: str, court: Court,
+                             start: str, end: str) -> str:
+        """以订单列表确认结果：created / none / unknown。"""
+        result = await self.refresh_orders()
+        if not result.get("ok"):
+            return "unknown"
+        if any(self._order_matches(o, date, court, start, end)
+               for o in self._orders):
+            return "created"
+        return "none"
+
+    @staticmethod
+    def _order_matches(order: dict, date: str, court: Court,
+                       start: str, end: str) -> bool:
+        name = str(order.get("court") or "")
+        same_court = (str(order.get("court_id") or "") == court.id
+                      or name == court.name
+                      or name.startswith(f"{court.no}号"))
+        return (order.get("date") == date and order.get("start") == start
+                and order.get("end") == end and same_court)
 
     async def _save_order(self, vid, court: Court, date: str,
                           start: str, end: str, token: str) -> dict:
@@ -807,7 +865,8 @@ class Engine:
             "running": self.jobs.running("auto"), "phase": s.phase, "msg": s.msg,
             "applied": s.applied,
             "started_at": s.started_at, "finished_at": s.finished_at,
-            "plan": ({"date": s.plan.date, **asdict(s.plan.config)} if s.plan else {}),
+            "plan": ({"date": s.plan.date, "court": s.plan.court.no,
+                      **asdict(s.plan.config)} if s.plan else {}),
         }
 
     async def start_auto(self) -> dict:
@@ -815,16 +874,18 @@ class Engine:
             return {"ok": False, "msg": "未配置 token"}
         if self.jobs.running("auto"):
             return {"ok": False, "msg": "自动模式已在运行"}
-        if not self.config.auto.court_order:
-            return {"ok": False, "msg": "未配置候选场地（court_order）"}
 
         a = self.config.auto
+        court = next((c for c in self.config.courts if c.no == a.court_no), None)
+        if court is None:
+            return {"ok": False, "msg": "请选择一个唯一目标场地（court_no）"}
+
         self.auto.phase = "init"
         self.auto.msg = "初始化"
         self.auto.applied = []
         self.auto.started_at = datetime.now().strftime("%H:%M:%S")
         self.auto.finished_at = ""
-        self.auto.plan = AutoPlan(self.target_date, a, self.config.courts)
+        self.auto.plan = AutoPlan(self.target_date, a, court)
         self.jobs.start("auto", self._auto_loop())
         return {"ok": True}
 
@@ -836,46 +897,22 @@ class Engine:
         self.auto.msg = "已手动停止"
         self.auto.finished_at = datetime.now().strftime("%H:%M:%S")
 
-    async def _try_auto_order(self, court, start, end, date: str):
-        try:
-            vid = await self.take_vid(timeout=2.0)
-            if not vid:
-                async with self._solve_sem:
-                    vid, _ = await get_vid_once(timeout=self.tuning.vid_timeout)
-            r = await self._save_order(vid, court, date, start, end, self.session.token)
-        except Exception as e:
-            r = {"success": False, "msg": f"下单异常: {type(e).__name__}: {e}"}
-        await self._publish_order_result(court, r, date)
-        return bool(r.get("success")), str(r.get("msg", "") or "")
-
     async def _auto_loop(self):
         applied: list[dict] = []
         plan = self.auto.plan
         assert plan is not None
+        court = plan.court
         date = plan.date
 
-        def has_success() -> bool:
-            return any(a["ok"] for a in applied)
-
-        def record(court: Court, ok: bool, msg: str = "") -> None:
+        def record(ok: bool, msg: str = "") -> None:
             applied.append({"court": court.no, "name": court.name,
                             "ok": ok, "msg": msg})
             self.auto.applied = list(applied)
 
-        async def _grab_one(court: Court, start: str, end: str) -> None:
-            try:
-                ok, msg = await self._try_auto_order(court, start, end, date)
-            except Exception as e:
-                ok, msg = False, f"异常: {type(e).__name__}: {e}"
-            record(court, ok, msg)
-            log.info("自动模式: %s 下单%s: %s",
-                    court.name, "成功" if ok else "失败", msg)
-
         try:
             slot_start = plan.config.slot_start
             slot_end = plan.config.slot_end
-            save_order_at = plan.config.save_order_at
-            save_dt = self._parse_hms(save_order_at)
+            save_dt = self._parse_hms(plan.config.save_order_at)
 
             # ── ① Token 自动刷新 ──
             if datetime.now() < save_dt:
@@ -916,68 +953,28 @@ class Engine:
             else:
                 log.info("自动模式: VID 池已在运行，跳过启动")
 
-
-            # ── ③ 触发前 2s，同时查询所选的前三个场地 ──
-            query_dt = save_dt - timedelta(seconds=1.4)
+            # ── ③ 等待 Save Order At，向唯一目标场地下单一次 ──
             self.auto.phase = "waiting"
-            self.auto.msg = f"等待并发查询（{query_dt.strftime('%H:%M:%S.%f')[:-3]}）"
-            log.info("自动模式: 等待并发查询 %s", query_dt.strftime("%H:%M:%S.%f")[:-3])
-            await self._sleep_until(query_dt)
+            self.auto.msg = f"等待下单（{save_dt.strftime('%H:%M:%S.%f')[:-3]}）"
+            log.info("自动模式: 等待下单 %s（目标 %s %s-%s）",
+                     save_dt.strftime("%H:%M:%S.%f")[:-3],
+                     court.name, slot_start, slot_end)
+            await self._sleep_until(save_dt)
 
-            courts = [c for n in plan.config.court_order[:3]
-                      for c in plan.courts if c.no == n]
-            if not courts:
-                log.warning("自动模式: 前三个候选场地均未配置")
-            else:
-                log.info("自动模式: 并发查询 %s（目标 %s-%s）",
-                         ", ".join(c.name for c in courts), slot_start, slot_end)
-                self.auto.phase = "querying"
-                self.auto.msg = "并发查询前三个候选场地"
-
-                async def query_one(court):
-                    return await self._refresh_one(court, date, timeout=4.0)
-
-                tasks = [asyncio.create_task(query_one(c)) for c in courts]
-                try:
-                    start_dt = datetime.strptime(slot_start, "%H:%M")
-                    end_dt = datetime.strptime(slot_end, "%H:%M")
-                    slots = []
-                    while start_dt < end_dt:
-                        slots.append(start_dt.strftime("%H:%M"))
-                        start_dt += timedelta(minutes=30)
-
-                    for completed in asyncio.as_completed(tasks):
-                        court, res = await completed
-                        if not res.get("ok"):
-                            log.warning("自动模式: %s 查询失败: %s",
-                                        court.name, res.get("error", "未知错误"))
-                            continue
-                        avail = res.get("avail", {})
-                        if not slots or not all(str(avail.get(t)) == "1" for t in slots):
-                            log.info("自动模式: %s 目标时段无完整空位", court.name)
-                            continue
-
-                        log.info("自动模式: %s 首个返回完整空位，等待触发时间 %s",
-                                 court.name, save_dt.strftime("%H:%M:%S.%f")[:-3])
-                        for task in tasks:
-                            if not task.done():
-                                task.cancel()
-                        self.auto.phase = "waiting_order"
-                        self.auto.msg = f"{court.name} 有空位，等待触发时刻"
-                        await self._sleep_until(save_dt)
-                        self.auto.phase = "ordering"
-                        self.auto.msg = f"{court.name} 有空位，正在下单"
-                        log.info("自动模式: 已到触发时刻，开始下单 %s", court.name)
-                        await _grab_one(court, slot_start, slot_end)
-                        break
-                finally:
-                    for task in tasks:
-                        if not task.done():
-                            task.cancel()
-                    await asyncio.gather(*tasks, return_exceptions=True)
-
-            log.info("自动模式: 并发结束 | 已尝试下单 %d 次 | 成功 %s",
-                    len(applied), "是" if has_success() else "否")
+            self.auto.phase = "ordering"
+            self.auto.msg = f"{court.name} 正在下单"
+            log.info("自动模式: 已到触发时刻，向 %s 提交唯一一次预约", court.name)
+            kind, msg, _ = await self._try_order(court, slot_start, slot_end, date)
+            if kind == "uncertain":
+                confirmation = await self._confirm_order(
+                    date, court, slot_start, slot_end)
+                if confirmation == "created":
+                    kind, msg = "ok", "订单已确认"
+                elif confirmation == "unknown":
+                    msg = f"结果不明确且订单核对失败：{msg}"
+            record(kind == "ok", msg)
+            log.info("自动模式: %s 下单%s: %s",
+                     court.name, "成功" if kind == "ok" else "失败", msg)
 
         except asyncio.CancelledError:
             log.info("自动模式: 被取消")
@@ -990,8 +987,8 @@ class Engine:
                 await self.stop_vid_pool()
 
             self.auto.phase = "done"
-            self.auto.msg = (f"结束：{'✅ 成功' if has_success() else '❌ 未成功'}"
-                            f"（尝试 {len(applied)} 个）")
+            self.auto.msg = (f"结束：{'✅ 成功' if applied and applied[0]['ok'] else '❌ 未成功'}"
+                            f"（目标 {court.name}）")
             self.auto.finished_at = datetime.now().strftime("%H:%M:%S")
 
     # ══════════════════════════════════════════════════
@@ -1069,7 +1066,8 @@ class Engine:
                     rows.append({"id": str(row["id"]), "date": row["orderDate"][:10],
                                  "start": row["startTime"][11:16], "end": row["endTime"][11:16],
                                  "gym_id": str(row["gymId"]), "gym": row.get("gymName") or "",
-                                 "court": row.get("groundName") or ""})
+                                 "court": row.get("groundName") or "",
+                                 "court_id": str(row.get("groundId") or "")})
             if page >= int(data["pages"]):
                 break
             page += 1
@@ -1166,16 +1164,20 @@ class Engine:
             return {"ok": False, "msg": "请先配置场地"}
         self._leak_msg = "等待检查"
         log.info("检漏模式已启动")
-        self.leak_found = None
-        await self.bus.publish("leak.found", None)
         self.jobs.start("leak", self._leak_loop())
         return {"ok": True}
 
     async def stop_leak(self):
         await self.jobs.stop("leak")
         self._leak_msg = "已停止"
-        self.leak_found = None
-        await self.bus.publish("leak.found", None)
+
+    async def _leak_success(self, record: dict, court: Court, elapsed_ms: int):
+        record.update(result="ok", booked=True, elapsed_ms=elapsed_ms)
+        self.leak_found = record
+        self._leak_msg = (f"预约成功：{record['date']} {court.name} "
+                          f"{record['start']}-{record['end']}，检漏已停止")
+        log.info("检漏预约成功：%s，耗时%dms", court.name, elapsed_ms)
+        await self.bus.publish("leak.found", record)
 
     async def _leak_loop(self):
         queries = 0
@@ -1253,12 +1255,66 @@ class Engine:
                             break
                         slot = self._leak_slot(date, res.get("avail", {}))
                         if slot:
-                            self._leak_msg = f"发现 {date} {court.name} {slot[0]}-{slot[1]}，请确认预约"
-                            log.info("检漏: %s", self._leak_msg)
-                            self.leak_found = {"date": date, "court": court.no,
-                                               "start": slot[0], "end": slot[1]}
-                            await self.bus.publish("leak.found", self.leak_found)
-                            return
+                            if self.reserve_inflight:
+                                self._leak_msg = (f"发现 {date} {court.name} "
+                                                  f"{slot[0]}-{slot[1]}，但已有下单任务，"
+                                                  f"本轮不重复提交")
+                                log.info("检漏: %s", self._leak_msg)
+                                break
+                            start, end = slot
+                            record = {
+                                "found_at": format_stamp(),
+                                "court": court.no, "name": court.name,
+                                "date": date, "start": start, "end": end,
+                                "order_at": "", "result": "pending",
+                                "result_at": "", "elapsed_ms": 0,
+                                "booked": False,
+                            }
+                            self._leak_msg = (f"发现 {date} {court.name} {start}-{end}，"
+                                              f"正在自动预约")
+                            self.leak_found = record
+                            log.info("检漏发现：%s %s %s-%s",
+                                     date, court.name, start, end)
+                            await self.bus.publish("leak.found", record)
+
+                            attempt_at = datetime.now()
+                            log.info("检漏下单：%s", court.name)
+                            kind, msg, outcome = await self._try_order(
+                                court, start, end, date)
+                            result_at = outcome.get("returned_at") or format_stamp()
+                            elapsed_ms = int(outcome.get("elapsed_ms") or 0)
+                            confirmation = ""
+                            if kind == "uncertain":
+                                confirmation = await self._confirm_order(
+                                    date, court, start, end)
+                                if confirmation == "created":
+                                    kind, msg = "ok", "订单已确认"
+                                    result_at = format_stamp()
+                                    elapsed_ms = int(
+                                        (datetime.now() - attempt_at).total_seconds() * 1000)
+                            if kind == "ok":
+                                record.update(order_at=outcome.get("sent_at", ""),
+                                              result_at=result_at)
+                                await self._leak_success(record, court, elapsed_ms)
+                                return
+
+                            record.update(order_at=outcome.get("sent_at", ""),
+                                          result=kind, result_at=result_at,
+                                          elapsed_ms=elapsed_ms)
+                            self.leak_found = record
+                            await self.bus.publish("leak.found", record)
+                            if kind == "uncertain" and confirmation == "unknown":
+                                self._leak_msg = ("预约结果不明确，订单核对失败，"
+                                                  "等待下一轮复核")
+                                delay = 30
+                            elif kind == "uncertain":
+                                self._leak_msg = ("预约结果不明确，未确认到订单，"
+                                                  "继续检漏")
+                            else:
+                                self._leak_msg = f"预约未成功，继续检漏：{msg}"
+                            log.warning("检漏预约失败：%s，耗时%dms：%s",
+                                        court.name, elapsed_ms, msg)
+                            break
                     else:
                         self._leak_msg = f"{date} 本轮检查结束"
                 finally:

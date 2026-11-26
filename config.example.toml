@@ -18,10 +18,12 @@ offset_days = 1
 token = "612fb16f-8692-4a1d-a22b-a262ccc405a2"
 
 [auto]
-# 全自动抢场参数（前端修改后写回本段，多设备共享）
+# 全自动预约参数（前端修改后写回本段，多设备共享）
+# court_no 只能是一个已在 [courts] 中配置的场地号
+court_no = 8
 slot_start = "16:00"
 slot_end   = "18:00"
-refresh_at = "20:00:06"
+save_order_at = "20:00:06"
 
 [courts]
 1  = "1298272433186332673"

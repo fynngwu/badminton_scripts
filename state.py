@@ -13,7 +13,7 @@ class AutoConfig:
     slot_start: str = "19:30"
     slot_end: str = "21:30"
     save_order_at: str = "20:00:04"
-    court_order: tuple[int, ...] = (3, 4, 10)
+    court_no: int = 0
 
 @dataclass(frozen=True)
 class Config:
@@ -70,7 +70,7 @@ class Jobs:
 class AutoPlan:
     date: str
     config: AutoConfig
-    courts: tuple[Court, ...]
+    court: Court
 
 @dataclass
 class AutoState:

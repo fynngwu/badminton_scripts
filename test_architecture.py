@@ -4,11 +4,18 @@ import importlib
 import json
 import logging
 import re
+import shutil
+import subprocess
 import sys
 import threading
 import time
 import types
+try:
+    import tomllib
+except ImportError:
+    import tomli as tomllib
 from dataclasses import dataclass, replace
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -61,7 +68,9 @@ def runtime(monkeypatch, tmp_path):
     config_path = tmp_path / 'config.toml'
     config_path.write_text(
         '[user]\nid = "private-id"\n[order]\ntoken = "private-token"\n'
-        '[courts]\n3 = "court-3"\n[auto]\ncourt_order = [3]\n',
+        '[courts]\n3 = "court-3"\n4 = "court-4"\n'
+        '[auto]\ncourt_no = 3\nslot_start = "19:00"\nslot_end = "21:00"\n'
+        'save_order_at = "20:00:04"\n',
         encoding="utf-8",
     )
     adapter.CONFIG_PATH = config_path
@@ -70,10 +79,8 @@ def runtime(monkeypatch, tmp_path):
     adapter.BASE_URL = 'http://example.invalid'
 
     def read_config_dict():
-        text = config_path.read_text(encoding="utf-8")
-        token = re.search(r'(?m)^token\s*=\s*"([^"]*)"', text).group(1)
-        return {'user': {'id': 'private-id'}, 'order': {'token': token},
-                'courts': {'3': 'court-3'}, 'auto': {'court_order': [3]}}
+        with config_path.open('rb') as f:
+            return tomllib.load(f)
 
     def write_config_string(key, value):
         if key == 'token':
@@ -95,15 +102,30 @@ def runtime(monkeypatch, tmp_path):
     adapter.read_config_dict = read_config_dict
     adapter.write_config_string = write_config_string
     adapter.capture_token_from_flow = capture_token_from_flow
-    for name in ('write_config_int', 'write_config_string_renamed', 'write_config_int_list',
+    for name in ('write_config_int', 'write_config_string_renamed',
+                 'write_config_int_renamed',
                  'refresh_window', 'port_listening', 'kill_port_holder', 'spawn_mitmdump'):
         setattr(adapter, name, lambda *a, **k: None)
-    for name in ('get_vid_once', 'get_order_once', 'save_order_once',
+    for name in ('get_order_once', 'save_order_once',
                  'close_cffi_session', 'limited_get'):
         setattr(adapter, name, AsyncMock(side_effect=AssertionError('Unexpected external call')))
+    adapter.get_vid_once = AsyncMock(return_value=('fake-vid', {}))
     adapter.get_cffi_session = lambda: SimpleNamespace(post=AsyncMock())
     adapter.is_auth_fail = lambda j: '鉴权失败' in str(j.get('msg', ''))
-    adapter.classify_order_reply = lambda r: ('ok', 'ok')
+    adapter.format_stamp = lambda dt=None: (dt or datetime.now()).strftime(
+        '%Y-%m-%d %H:%M:%S.%f')[:-3]
+
+    def classify(r):
+        if r.get('success'):
+            return 'ok', 'ok'
+        if r.get('uncertain'):
+            return 'uncertain', 'uncertain'
+        msg = str(r.get('msg') or '').lower()
+        if any(k in msg for k in ('繁忙', 'busy', '稍后', '频繁')):
+            return 'busy', 'busy'
+        return 'error', 'error'
+
+    adapter.classify_order_reply = classify
     monkeypatch.setitem(sys.modules, 'utils', adapter)
     monkeypatch.delitem(sys.modules, 'engine', raising=False)
     monkeypatch.delitem(sys.modules, 'app', raising=False)
@@ -113,7 +135,7 @@ def runtime(monkeypatch, tmp_path):
 
 def test_config_and_snapshot(runtime):
     e = runtime.Engine()
-    assert e.config.auto.court_order == (3,)
+    assert e.config.auto.court_no == 3
     assert e.session.token == 'private-token'
     snapshot = json.dumps(e.snapshot())
     assert 'private-token' not in snapshot and 'private-id' not in snapshot
@@ -189,6 +211,16 @@ def test_bus_overflow():
         assert q.get_nowait() is None
         bus.unsubscribe(q)
     asyncio.run(run())
+
+
+def test_frontend_court_picker_is_strict_single_select():
+    node = shutil.which('node')
+    if not node:
+        pytest.skip('node 未安装，跳过前端行为测试')
+    script = Path(__file__).with_name('test_frontend_court_picker.mjs')
+    result = subprocess.run([node, str(script)], capture_output=True, text=True,
+                            timeout=30)
+    assert result.returncode == 0, result.stderr or result.stdout
 
 
 def test_api_routes(runtime):
@@ -412,3 +444,362 @@ def test_har_sequence_writes_only_issuance(runtime, monkeypatch):
 
     assert writes == [('token', 'new-token-value')]
     assert addon.read_config_dict()['order']['token'] == 'new-token-value'
+
+
+# ══════════════════════════════════════════════════════
+# 自动模式：单场地、单次下单、等待 Save Order At
+# ══════════════════════════════════════════════════════
+def _auto_engine(e, runtime, save_order_at, *, court_no=3, court_nos=(3, 4)):
+    courts = tuple(runtime.Court(n, f'court-{n}', f'{n}号场') for n in court_nos)
+    e.config = replace(e.config, courts=courts,
+                       auto=replace(e.config.auto, court_no=court_no,
+                                    slot_start='19:00', slot_end='21:00',
+                                    save_order_at=save_order_at))
+    e.tuning.token_refresh_lead_sec = 0
+    e.fetch_token = AsyncMock(return_value={'ok': True, 'token_preview': 'test...'})
+    e.start_vid_pool = AsyncMock()
+    return courts
+
+
+def _hms(dt):
+    return dt.strftime('%H:%M:%S.%f')[:-3]
+
+
+async def _run_job(e, name):
+    task = e.jobs.tasks[name]
+    await asyncio.wait_for(task, 3)
+
+
+def test_auto_config_rejects_empty_and_unknown_court(runtime):
+    async def run():
+        e = runtime.Engine()
+        with pytest.raises(ValueError):
+            await e.update_auto_config('19:00', '21:00', '20:00:04', 0)
+        with pytest.raises(ValueError):
+            await e.update_auto_config('19:00', '21:00', '20:00:04', 99)
+        await e.update_auto_config('19:00', '21:00', '20:00:05.123', 3)
+    asyncio.run(run())
+
+
+def test_auto_config_old_multi_court_requires_reselection(runtime, monkeypatch):
+    monkeypatch.setattr(runtime, 'read_config_dict', lambda: {
+        'user': {}, 'gym': {}, 'order': {'token': 'private-token'},
+        'courts': {'3': 'court-3', '4': 'court-4'},
+        'auto': {'court_order': [3, 4]},
+    })
+
+    async def run():
+        e = runtime.Engine()
+        assert e.config.auto.court_no == 0
+        assert (await e.start_auto())['ok'] is False
+    asyncio.run(run())
+
+
+def test_save_order_at_keeps_milliseconds(runtime):
+    e = runtime.Engine()
+    parsed = e._parse_hms('20:00:05.123')
+    assert (parsed.hour, parsed.minute, parsed.second) == (20, 0, 5)
+    assert parsed.microsecond == 123000
+
+
+def test_auto_waits_then_orders_only_target_court_once(runtime, monkeypatch):
+    async def run():
+        e = runtime.Engine()
+        target = datetime.now() + timedelta(seconds=0.35)
+        _auto_engine(e, runtime, _hms(target), court_no=4)
+        calls = []
+
+        async def save_order(**kwargs):
+            calls.append((kwargs, datetime.now()))
+            return {'success': True, 'msg': 'ok'}
+
+        query = AsyncMock(side_effect=AssertionError('自动模式不应查询场地可用性'))
+        monkeypatch.setattr(runtime, 'save_order_once', save_order)
+        monkeypatch.setattr(runtime, 'get_order_once', query)
+        e.refresh_orders = AsyncMock(side_effect=AssertionError('自动模式不应查询订单'))
+
+        assert (await e.start_auto())['ok']
+        await _run_job(e, 'auto')
+
+        assert len(calls) == 1
+        kwargs, sent_at = calls[0]
+        assert kwargs['court'].no == 4
+        assert kwargs['start'] == '19:00' and kwargs['end'] == '21:00'
+        assert sent_at >= target - timedelta(seconds=0.05)
+        assert query.await_count == 0
+        assert e.auto.phase == 'done'
+        assert e.auto.applied == [{'court': 4, 'name': '4号场',
+                                   'ok': True, 'msg': 'ok'}]
+
+        await asyncio.sleep(0.05)
+        assert len(calls) == 1
+    asyncio.run(run())
+
+
+def test_auto_ends_after_explicit_failure_with_one_request(runtime, monkeypatch):
+    async def run():
+        e = runtime.Engine()
+        _auto_engine(e, runtime, '20:00:04', court_no=4)
+        e._parse_hms = lambda value: datetime.now() - timedelta(seconds=1)
+        calls = []
+
+        async def save_order(**kwargs):
+            calls.append(kwargs)
+            return {'success': False, 'msg': '系统繁忙'}
+
+        monkeypatch.setattr(runtime, 'save_order_once', save_order)
+        query = AsyncMock(side_effect=AssertionError('自动模式不应查询场地可用性'))
+        monkeypatch.setattr(runtime, 'get_order_once', query)
+        e.refresh_orders = AsyncMock(side_effect=AssertionError('明确失败无需核对订单'))
+
+        assert (await e.start_auto())['ok']
+        await _run_job(e, 'auto')
+
+        assert len(calls) == 1
+        assert calls[0]['court'].no == 4
+        assert query.await_count == 0
+        assert e.auto.phase == 'done'
+        assert e.auto.applied and e.auto.applied[0]['ok'] is False
+
+        await asyncio.sleep(0.05)
+        assert len(calls) == 1
+    asyncio.run(run())
+
+
+# ══════════════════════════════════════════════════════
+# 检漏模式：发现即预约，成功停止，失败继续
+# ══════════════════════════════════════════════════════
+def _prepare_leak(e, monkeypatch):
+    date = (datetime.now() + timedelta(days=1)).date().isoformat()
+    court = e.config.courts[0]
+    e._leak_dates = lambda now=None: [date]
+    e._leak_slot = lambda d, avail: ('19:00', '21:00')
+    e._leak_paused = lambda now=None: False
+    e._leak_query_budget = lambda now: 4.0
+    e.refresh_orders = AsyncMock(return_value={'ok': True, 'msg': '', 'orders': []})
+    e._refresh_one = AsyncMock(return_value=(court, {'ok': True, 'avail': {}}))
+    e.tuning.leak_interval = 0.02
+    return date, court
+
+
+def test_leak_reserves_automatically_then_stops(runtime, monkeypatch, caplog):
+    async def run():
+        e = runtime.Engine()
+        date, court = _prepare_leak(e, monkeypatch)
+        query_done = []
+
+        async def refresh_one(c, d, **kwargs):
+            await asyncio.sleep(0.03)
+            query_done.append(datetime.now())
+            return court, {'ok': True, 'avail': {}}
+
+        e._refresh_one = refresh_one
+        calls = []
+
+        async def save_order(**kwargs):
+            calls.append(kwargs)
+            return {'success': True, 'msg': 'ok'}
+
+        monkeypatch.setattr(runtime, 'save_order_once', save_order)
+
+        with caplog.at_level(logging.INFO, logger='court'):
+            assert (await e.start_leak())['ok']
+            await _run_job(e, 'leak')
+
+        assert len(calls) == 1
+        assert calls[0]['court'].no == court.no
+        assert calls[0]['date'] == date
+        assert calls[0]['start'] == '19:00' and calls[0]['end'] == '21:00'
+        assert not e.jobs.running('leak')
+        record = e.leak_found
+        assert record and record['booked'] is True
+        assert record['court'] == court.no
+        assert record['date'] == date
+        assert (record['start'], record['end']) == ('19:00', '21:00')
+        assert record['result'] == 'ok'
+        for key in ('found_at', 'order_at', 'result_at'):
+            assert re.fullmatch(r'\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}',
+                                record[key])
+        found_at = datetime.strptime(record['found_at'], '%Y-%m-%d %H:%M:%S.%f')
+        order_at = datetime.strptime(record['order_at'], '%Y-%m-%d %H:%M:%S.%f')
+        result_at = datetime.strptime(record['result_at'], '%Y-%m-%d %H:%M:%S.%f')
+        assert query_done[0] - timedelta(milliseconds=1) <= found_at
+        assert found_at <= order_at <= result_at
+        assert '预约成功' in e._leak_msg
+
+        messages = [r.getMessage() for r in caplog.records if r.name == 'court']
+        assert any(m.startswith('检漏发现：') for m in messages)
+        assert any('检漏下单：' in m for m in messages)
+        assert any(re.search(r'检漏预约成功：.*耗时\d+ms', m)
+                   for m in messages)
+
+        saved = dict(record)
+        await e.stop_leak()
+        await e.apply_config_change()
+        assert e.leak_found['found_at'] == saved['found_at']
+        assert e.snapshot()['leak_found']['found_at'] == saved['found_at']
+
+        await asyncio.sleep(0.05)
+        assert len(calls) == 1
+    asyncio.run(run())
+
+
+def test_leak_failure_keeps_last_discovery(runtime, monkeypatch):
+    async def run():
+        e = runtime.Engine()
+        _prepare_leak(e, monkeypatch)
+        e.tuning.leak_interval = 1.0
+        calls = []
+
+        async def save_order(**kwargs):
+            calls.append(kwargs)
+            return {'success': False, 'msg': '系统繁忙'}
+
+        monkeypatch.setattr(runtime, 'save_order_once', save_order)
+        assert (await e.start_leak())['ok']
+        for _ in range(200):
+            if e.leak_found and e.leak_found.get('result') != 'pending':
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError('检漏未记录预约失败结果')
+
+        record = dict(e.leak_found)
+        assert record['result'] == 'busy'
+        assert record['booked'] is False
+        assert record['found_at']
+        assert record['order_at'] and record['result_at']
+
+        await e.stop_leak()
+        await e.apply_config_change()
+        assert e.leak_found['found_at'] == record['found_at']
+        assert e.snapshot()['leak_found']['found_at'] == record['found_at']
+        assert len(calls) == 1
+    asyncio.run(run())
+
+
+def test_leak_explicit_failure_continues_until_success(runtime, monkeypatch):
+    async def run():
+        e = runtime.Engine()
+        _prepare_leak(e, monkeypatch)
+        calls = []
+        results = iter([{'success': False, 'msg': '系统繁忙'},
+                        {'success': True, 'msg': 'ok'}])
+
+        async def save_order(**kwargs):
+            calls.append(kwargs)
+            return next(results)
+
+        monkeypatch.setattr(runtime, 'save_order_once', save_order)
+
+        assert (await e.start_leak())['ok']
+        await _run_job(e, 'leak')
+
+        assert len(calls) == 2
+        assert e.leak_found and e.leak_found['booked'] is True
+        assert '预约成功' in e._leak_msg
+    asyncio.run(run())
+
+
+def test_leak_uncertain_result_confirms_order_before_stopping(runtime, monkeypatch):
+    async def run():
+        e = runtime.Engine()
+        _prepare_leak(e, monkeypatch)
+        calls = []
+
+        async def save_order(**kwargs):
+            calls.append(kwargs)
+            return {'success': False, 'msg': 'timeout', 'uncertain': True}
+
+        monkeypatch.setattr(runtime, 'save_order_once', save_order)
+        e._confirm_order = AsyncMock(return_value='created')
+
+        assert (await e.start_leak())['ok']
+        await _run_job(e, 'leak')
+
+        assert len(calls) == 1
+        assert e._confirm_order.await_count == 1
+        assert e.leak_found and e.leak_found['booked'] is True
+        assert '预约成功' in e._leak_msg
+    asyncio.run(run())
+
+
+def test_leak_uncertain_without_order_waits_before_retrying(runtime, monkeypatch):
+    async def run():
+        e = runtime.Engine()
+        _prepare_leak(e, monkeypatch)
+        calls = []
+        results = iter([{'success': False, 'msg': 'timeout', 'uncertain': True},
+                        {'success': True, 'msg': 'ok'}])
+
+        async def save_order(**kwargs):
+            calls.append(kwargs)
+            return next(results)
+
+        monkeypatch.setattr(runtime, 'save_order_once', save_order)
+        e._confirm_order = AsyncMock(return_value='none')
+
+        assert (await e.start_leak())['ok']
+        await _run_job(e, 'leak')
+
+        assert len(calls) == 2
+        assert e._confirm_order.await_count == 1
+        assert e.leak_found and e.leak_found['booked'] is True
+    asyncio.run(run())
+
+
+def test_auto_config_multi_court_payload_rejected(runtime):
+    app = importlib.import_module('app')
+    with pytest.raises(Exception):
+        app.ConfigIn(court_no=[3, 4])
+
+
+def test_confirm_order_distinguishes_query_failure(runtime):
+    async def run():
+        e = runtime.Engine()
+        court = e.config.courts[0]
+        date = '2026-12-01'
+        e.refresh_orders = AsyncMock(return_value={'ok': False, 'msg': '网络异常'})
+        assert await e._confirm_order(date, court, '19:00', '21:00') == 'unknown'
+
+        e.refresh_orders = AsyncMock(return_value={'ok': True, 'msg': '',
+                                                   'orders': []})
+        e._orders = [{'date': date, 'start': '19:00', 'end': '21:00',
+                      'court': '3号场地', 'court_id': ''}]
+        assert await e._confirm_order(date, court, '19:00', '21:00') == 'created'
+
+        e._orders = []
+        assert await e._confirm_order(date, court, '19:00', '21:00') == 'none'
+    asyncio.run(run())
+
+
+def test_order_matches_accepts_ground_id(runtime):
+    e = runtime.Engine()
+    court = e.config.courts[0]
+    base = {'date': '2026-12-01', 'start': '19:00', 'end': '21:00'}
+    assert e._order_matches({**base, 'court': '其他名称',
+                             'court_id': court.id}, '2026-12-01', court,
+                            '19:00', '21:00')
+    assert e._order_matches({**base, 'court': '3号场地',
+                             'court_id': ''}, '2026-12-01', court,
+                            '19:00', '21:00')
+
+
+def test_reserve_rejected_while_an_order_is_inflight(runtime):
+    async def run():
+        e = runtime.Engine()
+
+        async def blocked():
+            await asyncio.Event().wait()
+
+        e.jobs.start(('2026-12-01', 3, '19:00', '21:00'), blocked())
+        result = await e.reserve(3, '18:00', '19:00', '2026-12-01')
+        assert result['accepted'] is False
+        assert '提交' in result['msg']
+        await e.jobs.stop_all()
+
+        e.leak_found = {'result': 'pending'}
+        result = await e.reserve(3, '19:00', '21:00', '2026-12-01')
+        assert result['accepted'] is False
+        assert '检漏' in result['msg']
+    asyncio.run(run())

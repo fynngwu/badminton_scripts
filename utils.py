@@ -111,18 +111,25 @@ def write_config_string_renamed(key: str, old_key: str, value: str,
     raise RuntimeError(f"config.toml 未找到字段 {key!r} 或 {old_key!r}")
 
 
-def write_config_int_list(key: str, values: list[int],
-                          path: Path = CONFIG_PATH) -> None:
-    """写整型数组字段；若字段不存在，插到 [auto] 段首。"""
+def write_config_int_renamed(key: str, old_key: str, value: int,
+                             path: Path = CONFIG_PATH) -> None:
+    """写整数字段；旧的数组/标量字段整行改名，新字段不存在则插到 [auto] 段首。"""
     text = path.read_text(encoding="utf-8")
-    arr = "[" + ", ".join(str(int(v)) for v in values) + "]"
-    pattern = rf'(?m)^(\s*{re.escape(key)}\s*=\s*)\[[^\]]*\]'
-    new_text, n = re.subn(pattern, rf'\g<1>{arr}', text, count=1)
-    if n == 0:
-        m = re.search(r'(?m)^\[auto\][^\n]*$', text)
-        if not m:
-            raise RuntimeError("config.toml 未找到 [auto] 段，无法写入 court_order")
-        new_text = text[:m.end()] + f"\n{key} = {arr}" + text[m.end():]
+    pattern = rf'(?m)^(\s*{re.escape(key)}\s*=\s*)[^\n]*'
+    new_text, n = re.subn(pattern, rf'\g<1>{int(value)}', text, count=1)
+    if n:
+        path.write_text(new_text, encoding="utf-8")
+        return
+    new_text, n = re.subn(
+        rf'(?m)^(\s*){re.escape(old_key)}(\s*=\s*)[^\n]*',
+        rf'\g<1>{key}\g<2>{int(value)}', text, count=1)
+    if n:
+        path.write_text(new_text, encoding="utf-8")
+        return
+    m = re.search(r'(?m)^\[auto\][^\n]*$', text)
+    if not m:
+        raise RuntimeError(f"config.toml 未找到 [auto] 段，无法写入 {key}")
+    new_text = text[:m.end()] + f"\n{key} = {int(value)}" + text[m.end():]
     path.write_text(new_text, encoding="utf-8")
 
 
@@ -209,6 +216,11 @@ async def limited_get(url, *, court_name="", quiet: bool = False, **kwargs):
 # ══════════════════════════════════════════════════════
 # 纯函数小工具
 # ══════════════════════════════════════════════════════
+def format_stamp(dt: datetime | None = None) -> str:
+    """本地时间字符串，精确到毫秒。"""
+    return (dt or datetime.now()).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+
+
 def norm_hm(t: str) -> str:
     if not t or ":" not in t:
         return t
@@ -229,9 +241,11 @@ def is_auth_fail(j: dict) -> bool:
 
 
 def classify_order_reply(r: dict) -> tuple[str, str]:
-    """saveOrder 返回分类：ok / busy / error"""
+    """saveOrder 返回分类：ok / busy / uncertain / error"""
     if r.get("success"):
         return "ok", "✅ 预约成功"
+    if r.get("uncertain"):
+        return "uncertain", "⚠ 结果不明确，正在核对订单"
     msg = str(r.get("msg", "") or "")
     for kw in ("繁忙", "稍后", "系统忙", "请求过于", "频繁",
                "frequent", "too many", "try again", "busy"):
@@ -240,17 +254,6 @@ def classify_order_reply(r: dict) -> tuple[str, str]:
     if not msg or msg == "non-json":
         return "error", "❌ 响应异常"
     return "error", "❌ 下单失败"
-
-
-def slot_covers(avail: dict, start: str, end: str) -> bool:
-    h1, m1 = map(int, start.split(":"))
-    h2, m2 = map(int, end.split(":"))
-    t, e = h1 * 60 + m1, h2 * 60 + m2
-    while t < e:
-        if avail.get(f"{t // 60:02d}:{t % 60:02d}") != "1":
-            return False
-        t += 30
-    return True
 
 
 # ══════════════════════════════════════════════════════
@@ -508,28 +511,34 @@ async def save_order_once(
         "userNum": "1",
     }
 
-    send_hms = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    sent_at = format_stamp()
     t0 = time.monotonic()
-    log.info("→ 下单 %s 发送 @ %s (vid=%s…)", court.name, send_hms, vid[:8])
+    log.info("→ 下单 %s 发送 @ %s (vid=%s…)", court.name, sent_at[11:], vid[:8])
 
     try:
         r = await get_cffi_session().post(
             URL_SAVE, params={"userid": user_id, "token": token},
             json=payload, timeout=6.0,
         )
-        dt_ms = (time.monotonic() - t0) * 1000
-        recv_hms = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-        log.info("← 下单 %s 返回 @ %s (+%.0fms): HTTP %d | %s",
-                 court.name, recv_hms, dt_ms, r.status_code, r.text[:180])
+        dt_ms = int((time.monotonic() - t0) * 1000)
+        returned_at = format_stamp()
+        log.info("← 下单 %s 返回 @ %s (+%dms): HTTP %d | %s",
+                 court.name, returned_at[11:], dt_ms, r.status_code, r.text[:180])
         try:
             result = r.json()
         except Exception:
-            result = {"success": False, "msg": "non-json"}
+            result = {"success": False, "msg": "non-json", "uncertain": True}
     except Exception as e:
-        dt_ms = (time.monotonic() - t0) * 1000
-        log.warning("✗ 下单 %s 异常 (+%.0fms): %s", court.name, dt_ms, e)
-        result = {"success": False, "msg": str(e)}
+        dt_ms = int((time.monotonic() - t0) * 1000)
+        returned_at = format_stamp()
+        log.warning("✗ 下单 %s 异常 (+%dms): %s", court.name, dt_ms, e)
+        result = {"success": False, "msg": str(e), "uncertain": True}
 
+    if not isinstance(result, dict):
+        result = {"success": False, "msg": "响应格式异常", "uncertain": True}
+    result.setdefault("sent_at", sent_at)
+    result.setdefault("returned_at", returned_at)
+    result.setdefault("elapsed_ms", dt_ms)
     return result
 
 

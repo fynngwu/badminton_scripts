@@ -163,7 +163,7 @@ button:disabled {
 ::-webkit-scrollbar-thumb:hover { background: #3c4552; background-clip: content-box; }
 #vid-count, #cur-date { color: var(--text); font-weight: 600; }
 
-/* ── 候选场地选择器 ── */
+/* ── 目标场地选择器（单选） ── */
 .court-pick {
   padding: 9px 16px; border-radius: 8px; font-size: 13px; cursor: pointer;
   text-align: center; min-width: 66px; user-select: none;
@@ -233,7 +233,7 @@ button:disabled {
     <button class="auto" id="btn-auto">启动全自动</button>
   </div>
   <div class="mini" style="margin:4px 0 8px;">
-    候选场地（点击点亮 / 熄灭；启动全自动时写入 config，并作为并发抢场目标）
+    目标场地（单选；选择新场地会取消之前的选择，启动全自动时写入 config）
   </div>
   <div id="court-picker" class="grid"></div>
 </div>
@@ -243,7 +243,7 @@ button:disabled {
     <span>📅 目标日期 <b id="p-date">-</b></span>
     <span>⏰ 时段 <b id="p-slot">-</b></span>
     <span>🚀 Save Order At <b id="p-refresh">-</b></span>
-    <span>🏸 候选场 <b id="p-courts">-</b></span>
+    <span>🏸 目标场 <b id="p-courts">-</b></span>
   </div>
 </div>
 
@@ -298,7 +298,7 @@ button:disabled {
 const $ = id => document.getElementById(id);
 
 // ── 全局状态 ──
-let pickedCourts = new Set();
+let targetCourt = 0;
 let allCourtNos = [];
 
 function toast(msg, kind="ok", ms=3200) {
@@ -589,7 +589,7 @@ function addLog(e) {
   while (el.childNodes.length > 400) el.removeChild(el.lastChild);
 }
 
-// ── 候选场地选择器 ──
+// ── 目标场地选择器（严格单选） ──
 function renderCourtPicker() {
   const box = $("court-picker");
   box.innerHTML = "";
@@ -599,12 +599,15 @@ function renderCourtPicker() {
   }
   for (const no of allCourtNos) {
     const el = document.createElement("div");
-    el.className = "court-pick" + (pickedCourts.has(no) ? " on" : "");
+    const on = targetCourt === no;
+    el.className = "court-pick" + (on ? " on" : "");
     el.textContent = `${no}号场`;
-    el.addEventListener("click", () => {
-      if (pickedCourts.has(no)) pickedCourts.delete(no);
-      else pickedCourts.add(no);
-      el.classList.toggle("on");
+    el.setAttribute("role", "radio");
+    el.setAttribute("aria-checked", on ? "true" : "false");
+    el.addEventListener("click", async () => {
+      targetCourt = no;
+      renderCourtPicker();
+      await saveAutoPlan({ requireCourt: true });
     });
     box.appendChild(el);
   }
@@ -628,17 +631,18 @@ function applyConfig(cfg) {
   $("auto-se").value = a.slot_end;
   $("auto-rt").value = a.save_order_at;
 
-  // 候选场：由 config + 场地清单驱动
+  // 目标场：由 config + 场地清单驱动；旧多场地配置显示为未选择
   const courtsCfg = cfg.courts || {};
   allCourtNos = Object.keys(courtsCfg).map(Number).sort((x, y) => x - y);
-  pickedCourts = new Set((a.court_order || []).map(Number));
+  const configured = Number(a.court_no);
+  targetCourt = allCourtNos.includes(configured) ? configured : 0;
   renderCourtPicker();
 
   // 只读参数展示
   if (o.target_date) $("p-date").textContent = o.target_date;
   $("p-slot").textContent = `${a.slot_start} - ${a.slot_end}`;
   $("p-refresh").textContent = a.save_order_at;
-  $("p-courts").textContent = (a.court_order || []).join(", ") || "未配置";
+  $("p-courts").textContent = targetCourt ? `${targetCourt}号场` : "未配置";
 }
 
 async function readState() {
@@ -683,14 +687,28 @@ function renderJobs(jobs) {
   $("leak-status").textContent = `${leak.msg} | 目标：${leak.dates.join(" / ") || "无"}`;
 }
 
+const LEAK_RESULT = {
+  pending: "⏳ 待下单",
+  ok: "✅ 预约成功",
+  busy: "⚠ 系统繁忙",
+  uncertain: "⚠ 结果不明确",
+  error: "❌ 预约失败",
+};
+
 function renderLeak(d) {
   $("leak-found").replaceChildren();
   if (!d) return;
-  const b = document.createElement("button");
-  b.className = "avail-btn";
-  Object.assign(b.dataset, {court: d.court, date: d.date, start: d.start, end: d.end});
-  b.textContent = `预约 ${d.date} ${d.court}号场 ${d.start}-${d.end}`;
-  $("leak-found").append(b);
+  const found = document.createElement("div");
+  found.className = "mini";
+  found.textContent = `🕒 发现 ${d.found_at || "-"} · ${d.court}号场 · `
+    + `📅 ${d.date} ${d.start}-${d.end}`;
+  const order = document.createElement("div");
+  order.className = "mini";
+  const result = LEAK_RESULT[d.result] || d.result || "-";
+  const returned = d.result_at ? ` ${d.result_at}` : "";
+  const elapsed = d.elapsed_ms ? ` · 耗时 ${d.elapsed_ms}ms` : "";
+  order.textContent = `🚀 下单 ${d.order_at || "-"} · ${result}${returned}${elapsed}`;
+  $("leak-found").append(found, order);
 }
 
 function renderControls() {
@@ -813,10 +831,12 @@ function connectSSE() {
 
   sse.addEventListener("order.result", ev => {
     const d = JSON.parse(ev.data).data || {};
-    if (d.kind === "ok") { renderLeak(null); refreshOrders(); }
-    const kind  = d.kind === "ok" ? "ok" : (d.kind === "busy" ? "warn" : "err");
+    if (d.kind === "ok") refreshOrders();
+    const kind  = d.kind === "ok" ? "ok"
+                : (d.kind === "busy" || d.kind === "uncertain") ? "warn" : "err";
     const label = d.label || (d.kind === "ok" ? "✅ 预约成功"
                              : d.kind === "busy" ? "⚠ 系统繁忙"
+                             : d.kind === "uncertain" ? "⚠ 结果不明确"
                              : "❌ 下单失败");
     const name  = d.name || (d.court ? `${d.court}号场` : "");
     const msg   = d.msg ? `  —  ${d.msg}` : "";
@@ -826,15 +846,20 @@ function connectSSE() {
 }
 
 // ── 全自动参数：变更即写回 config.toml，多设备共享 ──
-async function saveAutoPlan() {
+async function saveAutoPlan({requireCourt = false} = {}) {
+  if (requireCourt && !targetCourt) {
+    toast("请先选择一个目标场地", "err");
+    return false;
+  }
+  const body = {
+    slot_start: $("auto-ss").value,
+    slot_end:   $("auto-se").value,
+    save_order_at: $("auto-rt").value.trim(),
+  };
+  if (targetCourt) body.court_no = targetCourt;
   const r = await fetch("/api/config", {
     method: "PATCH", headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({
-      slot_start: $("auto-ss").value,
-      slot_end:   $("auto-se").value,
-      save_order_at: $("auto-rt").value.trim(),
-      court_order: [...pickedCourts].sort((a, b) => a - b),
-    }),
+    body: JSON.stringify(body),
   });
   const j = await r.json();
   if (!j.ok) {
@@ -931,8 +956,8 @@ async function setJob(name, running) {
       return;
     }
     if (name === "auto" && running) {
-      if (!pickedCourts.size) return toast("请先选择候选场地", "err");
-      if (!await saveAutoPlan()) return;
+      if (!targetCourt) return toast("请先选择一个目标场地", "err");
+      if (!await saveAutoPlan({requireCourt: true})) return;
     }
     const body = {running};
     if (name === "refresh") body.date = $("cur-date").textContent;

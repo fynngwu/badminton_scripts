@@ -60,7 +60,7 @@ class ConfigIn(BaseModel):
     slot_start: str | None = None
     slot_end: str | None = None
     save_order_at: str | None = None
-    court_order: list[int] | None = None
+    court_no: int | None = None
 
 
 @app.patch("/api/config")
@@ -70,10 +70,10 @@ async def set_config(d: ConfigIn):
             engine.update_offset_days(d.offset_days)
         if d.token:
             engine.update_token(d.token)
-        if any(v is not None for v in (d.slot_start, d.slot_end, d.save_order_at, d.court_order)):
+        if any(v is not None for v in (d.slot_start, d.slot_end, d.save_order_at, d.court_no)):
             a = engine.config.auto
             await engine.update_auto_config(d.slot_start or a.slot_start,
-                d.slot_end or a.slot_end, d.save_order_at or a.save_order_at, d.court_order)
+                d.slot_end or a.slot_end, d.save_order_at or a.save_order_at, d.court_no)
         await engine.apply_config_change()
         return {"ok": True, "target_date": engine.target_date}
     except Exception as exc:
