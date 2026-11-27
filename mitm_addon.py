@@ -127,7 +127,18 @@ def _capture_profile(flow) -> None:  # type: ignore[no-untyped-def]
 
         tmp = CONFIG_PATH.with_suffix(".toml.tmp")
         tmp.write_text(text, encoding="utf-8")
-        tmp.replace(CONFIG_PATH)
+        # Windows 上目标文件被服务端或编辑器读取时 MoveFileEx 会报 WinError 5；
+        # 这类占用通常是瞬间的，短重试即可。
+        for attempt in range(5):
+            try:
+                tmp.replace(CONFIG_PATH)
+                break
+            except PermissionError:
+                if attempt == 4:
+                    tmp.unlink(missing_ok=True)
+                    raise RuntimeError(
+                        "config.toml 正被其他程序占用，请关闭正在编辑它的程序后重试")
+                time.sleep(0.1)
 
         token = data.get("token")
         preview = f"{str(token)[:8]}..." if token else "none"
@@ -174,15 +185,17 @@ def _self_check() -> int:
         print("❌ 窗口刷新失败：未走到发送 Ctrl+R，失败原因见 logs/debug.log")
         return 1
 
-    deadline = time.monotonic() + 3.0
+    sent_at = time.monotonic()
+    deadline = sent_at + 3.0
     while time.monotonic() < deadline:
         token = current_token()
         if token and token != old:
-            capture_ms = (time.monotonic() - started - window_ms / 1000) * 1000
-            log.info("[自检] 结果=成功（窗口操作 %.0fms，刷新后捕获 %.0fms，合计 %.0fms）",
-                     window_ms, capture_ms, window_ms + capture_ms)
+            capture_ms = (time.monotonic() - sent_at) * 1000
+            total_ms = window_ms + capture_ms
+            log.info("[自检] 结果=成功（窗口操作 %.0fms，发送后捕获 %.0fms，合计 %.0fms）",
+                     window_ms, capture_ms, total_ms)
             print(f"✅ 窗口已刷新并换发新 Token（窗口操作 {window_ms:.0f}ms，"
-                  f"捕获 {capture_ms:.0f}ms）")
+                  f"发送后 {capture_ms:.0f}ms 拿到新 Token，合计 {total_ms:.0f}ms）")
             return 0
         time.sleep(0.1)
 

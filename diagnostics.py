@@ -39,8 +39,9 @@ DEPENDENCIES = ("pywinauto", "comtypes", "pywin32", "mitmproxy",
 
 # 「不符合想象的错误」：只有命中这些关键词的 WARNING/ERROR 才进入可疑错误一节。
 SUSPICIOUS = (
-    "[refresh]", "[自检]", "Token 获取失败", "鉴权失败", "mitmdump",
-    "[mitm]", "Traceback", "异常", "超时", "未确认",
+    "[refresh]", "[自检]", "[PROFILE]", "[TOKEN]", "Token 获取失败", "鉴权失败",
+    "mitmdump", "[mitm]", "[kill-port]", "Traceback", "异常", "超时", "未确认",
+    "拒绝访问", "失败",
 )
 # 这些行不进日志块：请求明细与凭证回显。
 DROP_PHRASES = ("params=", "json=", "← 下单", "cookie", "set-cookie")
@@ -257,8 +258,16 @@ def collect_report() -> dict:
 # ══════════════════════════════════════════════════
 # Markdown
 # ══════════════════════════════════════════════════
+_PIPE = "\\|"
+
+
+def _cell(value) -> str:
+    """表格单元格：竖线与换行会破坏 Markdown 表格。"""
+    return str(value).replace("|", _PIPE).replace("\n", " ")
+
+
 def _table(rows: list[tuple]) -> list[str]:
-    body = [f"| {str(k).replace('|', '\\|')} | {str(v).replace('|', '\\|')} |" for k, v in rows]
+    body = [f"| {_cell(k)} | {_cell(v)} |" for k, v in rows]
     return ["| 项目 | 值 |", "| --- | --- |", *body]
 
 
