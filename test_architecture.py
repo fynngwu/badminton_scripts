@@ -104,8 +104,9 @@ def runtime(monkeypatch, tmp_path):
     adapter.capture_token_from_flow = capture_token_from_flow
     for name in ('write_config_int', 'write_config_string_renamed',
                  'write_config_int_renamed',
-                 'refresh_window', 'port_listening', 'kill_port_holder', 'spawn_mitmdump'):
+                 'port_listening', 'kill_port_holder', 'spawn_mitmdump'):
         setattr(adapter, name, lambda *a, **k: None)
+    adapter.refresh_window = lambda *a, **k: 'idle'
     for name in ('get_order_once', 'save_order_once',
                  'close_cffi_session', 'limited_get'):
         setattr(adapter, name, AsyncMock(side_effect=AssertionError('Unexpected external call')))
@@ -252,7 +253,7 @@ def test_fetch_token_accepts_only_new_value(runtime, monkeypatch):
                                  {'success': True, 'data': {'token': token}})
                 addon.response(flow)
                 time.sleep(0.01)
-            return True
+            return 'sent'
 
         monkeypatch.setattr(runtime, 'refresh_window', refresh)
         result = await e.fetch_token()
@@ -277,7 +278,7 @@ def test_fetch_token_waits_each_round_then_fails(runtime, monkeypatch):
         def refresh(**kwargs):
             refreshes.append(1)
             _write_token(runtime.CONFIG_PATH, 'private-token')
-            return True
+            return 'sent'
 
         monkeypatch.setattr(runtime, 'refresh_window', refresh)
         start = time.monotonic()
@@ -305,7 +306,7 @@ def test_fetch_token_concurrent_calls_refresh_once(runtime, monkeypatch):
             refreshing.set()
             assert release.wait(2), '测试未释放窗口刷新'
             _write_token(runtime.CONFIG_PATH, 'concurrent-token')
-            return True
+            return 'sent'
 
         monkeypatch.setattr(runtime, 'refresh_window', refresh)
         first = asyncio.create_task(e.fetch_token())
@@ -321,6 +322,72 @@ def test_fetch_token_concurrent_calls_refresh_once(runtime, monkeypatch):
         assert results[0]['attempts'] == 1
         assert results[1]['attempts'] == 0
         assert all(r['token_preview'] == 'concurre...' for r in results)
+    asyncio.run(run())
+
+
+def test_fetch_token_skips_wait_when_window_did_nothing(runtime, monkeypatch):
+    async def run():
+        e = runtime.Engine()
+        e.tuning.token_refresh_wait_sec = 5.0
+        e._ensure_mitm = AsyncMock(return_value=True)
+        refreshes = []
+
+        def refresh(**kwargs):
+            refreshes.append(1)
+            return 'idle'
+
+        monkeypatch.setattr(runtime, 'refresh_window', refresh)
+        start = time.monotonic()
+        result = await e.fetch_token()
+        elapsed = time.monotonic() - start
+
+        assert result['ok'] is False
+        assert len(refreshes) == e.TOKEN_ROUNDS == 3
+        assert elapsed < 1.0
+    asyncio.run(run())
+
+
+def test_fetch_token_waits_when_click_did_not_send_hotkey(runtime, monkeypatch):
+    async def run():
+        e = runtime.Engine()
+        wait = 0.2
+        e.tuning.token_refresh_wait_sec = wait
+        e._ensure_mitm = AsyncMock(return_value=True)
+        refreshes = []
+
+        def refresh(**kwargs):
+            refreshes.append(1)
+            return 'clicked'
+
+        monkeypatch.setattr(runtime, 'refresh_window', refresh)
+        start = time.monotonic()
+        result = await e.fetch_token()
+        elapsed = time.monotonic() - start
+
+        assert result['ok'] is False
+        assert len(refreshes) == e.TOKEN_ROUNDS == 3
+        assert elapsed >= e.TOKEN_ROUNDS * wait
+    asyncio.run(run())
+
+
+def test_fetch_token_idle_round_still_accepts_arrived_token(runtime, monkeypatch):
+    async def run():
+        e = runtime.Engine()
+        e.tuning.token_refresh_wait_sec = 5.0
+        e._ensure_mitm = AsyncMock(return_value=True)
+
+        def refresh(**kwargs):
+            # 上一轮点击触发的凭证可能在本轮开始前才写入。
+            _write_token(runtime.CONFIG_PATH, 'late-token-value')
+            return 'idle'
+
+        monkeypatch.setattr(runtime, 'refresh_window', refresh)
+        start = time.monotonic()
+        result = await e.fetch_token()
+
+        assert result['ok'] is True
+        assert result['attempts'] == 1
+        assert time.monotonic() - start < 1.0
     asyncio.run(run())
 
 
@@ -340,7 +407,7 @@ def test_order_query_recovers_through_fetch_token(runtime, monkeypatch):
 
         def refresh(**kwargs):
             _write_token(runtime.CONFIG_PATH, 'recovered-token-value')
-            return True
+            return 'sent'
 
         monkeypatch.setattr(runtime, 'limited_get', limited_get)
         monkeypatch.setattr(runtime, 'refresh_window', refresh)
@@ -367,7 +434,7 @@ def test_order_auth_failure_logs_reason_then_recovers(runtime, monkeypatch, capl
 
         def refresh(**kwargs):
             _write_token(runtime.CONFIG_PATH, 'recovered-token-value')
-            return True
+            return 'sent'
 
         monkeypatch.setattr(runtime, 'limited_get', limited_get)
         monkeypatch.setattr(runtime, 'refresh_window', refresh)

@@ -450,21 +450,27 @@ class Engine:
             wait = max(0.5, float(self.tuning.token_refresh_wait_sec))
             refreshes = 0
             for round_no in range(1, self.TOKEN_ROUNDS + 1):
-                log.info("会话刷新 %d/%d：触发 Ctrl+R，随后等待 %.1fs",
+                log.info("会话刷新 %d/%d：触发窗口刷新，最多等待 %.1fs 捕获新凭证",
                          round_no, self.TOKEN_ROUNDS, wait)
                 refresh_started = time.monotonic()
                 try:
-                    sent = await asyncio.to_thread(refresh_window)
+                    outcome = await asyncio.to_thread(refresh_window)
                 except Exception as exc:
-                    sent = False
+                    # 窗口线程异常时无法判断页面是否已被操作，按可能产生凭证处理。
+                    outcome = "clicked"
                     log.warning("预约窗口刷新异常: %s", exc)
                 refresh_ms = (time.monotonic() - refresh_started) * 1000
-                capture_started = time.monotonic()
                 refreshes += 1
-                if not sent:
+
+                wait_budget = wait
+                if outcome == "idle":
+                    log.warning("预约窗口未执行页面操作，本轮只检查一次当前凭证")
+                    wait_budget = 0.0
+                elif outcome != "sent":
                     log.warning("预约窗口未确认发送 Ctrl+R，仍检查本轮是否捕获新凭证")
 
-                deadline = time.monotonic() + wait
+                capture_started = time.monotonic()
+                deadline = time.monotonic() + wait_budget
                 while True:
                     # 同一轮内的多次观察（A、A、A、B）只有不同于原值的 B 算成功。
                     self.reload_config(force=True)
@@ -481,12 +487,17 @@ class Engine:
                     if time.monotonic() >= deadline:
                         break
                     await asyncio.sleep(0.1)
-                log.warning("第 %d/%d 轮 %.1fs 内未获得新 Token",
-                            round_no, self.TOKEN_ROUNDS, wait)
+                log.warning("第 %d/%d 轮未获得新 Token（等待 %.1fs）",
+                            round_no, self.TOKEN_ROUNDS, wait_budget)
+
+            state = await asyncio.to_thread(self.mitm_state)
+            log.warning("Token 获取失败：mitm 端口监听=%s，进程存活=%s；"
+                        "请结合 [mitm]/[TOKEN] 日志确认刷新流量是否经过代理",
+                        state["port_listening"], state["proc_alive"])
 
         return {"ok": False,
                 "msg": (f"{self.TOKEN_ROUNDS} 轮会话刷新均未获得新 Token"
-                        f"（每轮等待 {wait:.1f}s）")}
+                        f"（每轮最多等待 {wait:.1f}s）")}
 
     # ══════════════════════════════════════════════════
     # VID 池
