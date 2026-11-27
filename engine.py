@@ -454,23 +454,18 @@ class Engine:
                          round_no, self.TOKEN_ROUNDS, wait)
                 refresh_started = time.monotonic()
                 try:
-                    outcome = await asyncio.to_thread(refresh_window)
+                    sent = await asyncio.to_thread(refresh_window)
                 except Exception as exc:
                     # 窗口线程异常时无法判断页面是否已被操作，按可能产生凭证处理。
-                    outcome = "clicked"
+                    sent = True
                     log.warning("预约窗口刷新异常: %s", exc)
                 refresh_ms = (time.monotonic() - refresh_started) * 1000
                 refreshes += 1
-
-                wait_budget = wait
-                if outcome == "idle":
-                    log.warning("预约窗口未执行页面操作，本轮只检查一次当前凭证")
-                    wait_budget = 0.0
-                elif outcome != "sent":
+                if not sent:
                     log.warning("预约窗口未确认发送 Ctrl+R，仍检查本轮是否捕获新凭证")
 
                 capture_started = time.monotonic()
-                deadline = time.monotonic() + wait_budget
+                deadline = time.monotonic() + wait
                 while True:
                     # 同一轮内的多次观察（A、A、A、B）只有不同于原值的 B 算成功。
                     self.reload_config(force=True)
@@ -488,7 +483,7 @@ class Engine:
                         break
                     await asyncio.sleep(0.1)
                 log.warning("第 %d/%d 轮未获得新 Token（等待 %.1fs）",
-                            round_no, self.TOKEN_ROUNDS, wait_budget)
+                            round_no, self.TOKEN_ROUNDS, wait)
 
             state = await asyncio.to_thread(self.mitm_state)
             log.warning("Token 获取失败：mitm 端口监听=%s，进程存活=%s；"

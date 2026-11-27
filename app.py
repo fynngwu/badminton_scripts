@@ -6,17 +6,20 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import logging
 import os
 import signal
 from contextlib import asynccontextmanager
+from urllib.parse import urlsplit
 
-from fastapi import FastAPI
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi import FastAPI, Request
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from datetime import date as Date
 
+import diagnostics
 from engine import engine
 from utils import ROOT
 
@@ -44,6 +47,66 @@ app = FastAPI(title="Court Reserver", lifespan=lifespan)
 @app.get("/")
 def index():
     return FileResponse(ROOT / "index.html", headers={"Cache-Control": "no-store"})
+
+
+# ══════════════════════════════════════════════════════
+# 诊断上传（只允许本机回环访问，防止局域网或 DNS rebinding 触发）
+# ══════════════════════════════════════════════════════
+LOOPBACK = {ipaddress.ip_address("127.0.0.1"), ipaddress.ip_address("::1")}
+LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
+def _deny(reason: str) -> JSONResponse:
+    return JSONResponse({"ok": False, "reason": reason}, status_code=403)
+
+
+def trusted_local(request: Request):
+    """依赖函数：本机回环来源 + 本机 Host + 同源 Origin。不满足直接返回 403。"""
+    peer = (request.client.host if request.client else "") or ""
+    try:
+        ip = ipaddress.ip_address(peer)
+    except ValueError:
+        return _deny("诊断接口仅允许本机访问：来源地址不是 IP")
+    if getattr(ip, "ipv4_mapped", None) is not None:
+        ip = ip.ipv4_mapped
+    if ip not in LOOPBACK:
+        return _deny("诊断接口仅允许本机访问")
+
+    headers = getattr(request, "headers", None) or {}
+    host_parts = urlsplit("//" + str(headers.get("host", "")))
+    host = (host_parts.hostname or "").lower()
+    if host not in LOCAL_HOSTS:
+        return _deny("诊断接口仅允许通过 127.0.0.1 / localhost 访问")
+
+    origin = headers.get("origin")
+    if origin and origin != "null":
+        o = urlsplit(origin)
+        if (o.scheme.lower(), (o.hostname or "").lower(), o.port) != \
+                (str(request.url.scheme).lower(), host, host_parts.port):
+            return _deny("诊断接口拒绝跨站请求来源")
+    return None
+
+
+@app.get("/api/diagnostics/preview")
+async def diagnostics_preview(request: Request):
+    """生成脱敏报告供用户确认；预览内容由前端保存，服务端不留状态。"""
+    denied = trusted_local(request)
+    if denied is not None:
+        return denied
+    result = await asyncio.to_thread(diagnostics.preview)
+    return result if result.get("ok") else JSONResponse(result, status_code=500)
+
+
+class DiagnosticsUploadIn(BaseModel):
+    markdown: str
+
+
+@app.post("/api/diagnostics/upload")
+async def diagnostics_upload_ep(request: Request, d: DiagnosticsUploadIn):
+    denied = trusted_local(request)
+    if denied is not None:
+        return denied
+    return await asyncio.to_thread(diagnostics.upload, d.markdown)
 
 
 # ══════════════════════════════════════════════════════

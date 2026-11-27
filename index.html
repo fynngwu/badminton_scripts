@@ -276,8 +276,25 @@ button:disabled {
 </div>
 
 <div class="section">
-  <h2>实时运行日志</h2>
+  <h2>实时运行日志
+    <button class="primary" id="btn-diag" style="float:right;font-weight:500;">🩺 上传诊断</button>
+  </h2>
   <div class="log" id="log"></div>
+</div>
+
+<div id="diag" class="card" style="display:none">
+  <div class="row">
+    <label style="font-weight:700;">诊断报告预览</label>
+    <span class="mini" id="diag-meta"></span>
+  </div>
+  <pre class="log" id="diag-text" style="max-height:320px;overflow:auto;"></pre>
+  <div class="row" style="margin-top:10px;">
+    <span class="mini" id="diag-public-note" style="display:none;color:#ffa657;">
+      ⚠ 公开仓库：创建 Issue 后内容将公开可见</span>
+    <button class="primary" id="btn-diag-create">确认并创建 Issue</button>
+    <button id="btn-diag-cancel">取消</button>
+    <span class="mini" id="diag-result"></span>
+  </div>
 </div>
 
 <div class="section">
@@ -784,6 +801,66 @@ async function refreshOrders() {
   }
 }
 $("btn-orders").onclick = refreshOrders;
+
+// ── 诊断报告：预览由浏览器保存，服务端不留状态 ──
+let diagMarkdown = "";
+function showDiag(on) { $("diag").style.display = on ? "" : "none"; }
+
+$("btn-diag").onclick = async () => {
+  const b = $("btn-diag");
+  b.disabled = true;
+  b.textContent = "🩺 生成中…";
+  $("diag-result").textContent = "";
+  showDiag(true);
+  $("diag-text").textContent = "正在采集运行状态与日志…";
+  $("diag-meta").textContent = "";
+  try {
+    const r = await fetch("/api/diagnostics/preview", {cache: "no-store"});
+    const d = await r.json();
+    if (!d.ok) throw new Error(d.reason || `HTTP ${r.status}`);
+    diagMarkdown = d.markdown;
+    $("diag-text").textContent = d.markdown;
+    $("diag-meta").textContent = `目标仓库 ${d.repo}（${d.visibility}）`;
+    $("diag-public-note").style.display = d.public ? "" : "none";
+    $("btn-diag-create").disabled = false;
+  } catch (e) {
+    diagMarkdown = "";
+    $("diag-text").textContent = `生成失败：${e.message}`;
+    $("btn-diag-create").disabled = true;
+  } finally {
+    b.disabled = false;
+    b.textContent = "🩺 上传诊断";
+  }
+};
+
+$("btn-diag-cancel").onclick = () => { showDiag(false); diagMarkdown = ""; };
+
+$("btn-diag-create").onclick = async () => {
+  if (!diagMarkdown) return;
+  const create = $("btn-diag-create");
+  create.disabled = true;
+  $("diag-result").textContent = "正在创建 Issue…";
+  try {
+    const r = await fetch("/api/diagnostics/upload", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({markdown: diagMarkdown}),
+    });
+    const d = await r.json();
+    if (!d.ok) throw new Error(d.reason || `HTTP ${r.status}`);
+    diagMarkdown = "";
+    const link = document.createElement("a");
+    link.href = d.url;
+    link.target = "_blank";
+    link.rel = "noreferrer";
+    link.textContent = "已创建诊断 Issue，点此打开";
+    $("diag-result").replaceChildren(link);
+    $("diag-text").textContent = "";
+    toast("诊断 Issue 已创建", "ok", 4000);
+  } catch (e) {
+    $("diag-result").textContent = `创建失败：${e.message}`;
+    create.disabled = false;
+  }
+};
 
 function applySnapshot(d) {
   applyConfig(d.config);

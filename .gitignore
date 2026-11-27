@@ -22,3 +22,6 @@ logs/
 .DS_Store
 Thumbs.db
 config.toml
+
+# 本地工作笔记
+.audit/

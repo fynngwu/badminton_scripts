@@ -53,7 +53,9 @@ URL_QUERY = BASE_URL + "/api/blade-app/qywx/getOrderTimeConfigList"
 
 MITM_HOST     = "127.0.0.1"
 MITM_PORT     = 8080
-MITM_UPSTREAM = os.environ.get("MITM_UPSTREAM", "").strip()
+MITM_UPSTREAM = os.environ.get("MITM_UPSTREAM", "")
+# mitmdump 启动横幅上的规则摘要，诊断报告据此判断抓不到 Token 的方向问题。
+MITM_HINT = "规则模式/Allow（Go 不会向非规则流量提供 /__mitmproxy__/hint）"
 
 RESERVATION_HOST = "reservation.sustech.edu.cn"
 
@@ -543,32 +545,14 @@ async def save_order_once(
 
 # ══════════════════════════════════════════════════════
 # Windows 窗口操作（refresh reservation 窗口）
-#
-# 唯一的跨调用缓存：预约窗口 HWND。每次使用前校验句柄与标题，
-# 失效后重新枚举；其余状态仍只存在于单次调用内。
 # ══════════════════════════════════════════════════════
-_REFRESH_TITLE_PREFIXES = (RESERVATION_HOST, f"https://{RESERVATION_HOST}")
-_refresh_hwnd: int | None = None
+def refresh_window() -> bool:
+    """进入场馆列表并刷新，随后最小化；True 表示已发送 Ctrl+R。
 
-_NAV_TITLE = "场地预约"
-_SEARCH_TITLE = "请输入搜索的场馆"
-
-
-def refresh_window(fg_timeout: float = 2.0) -> str:
-    """进入场馆列表并刷新，随后最小化。
-
-    返回本轮窗口操作的结果，供调用方决定是否等待新 Token：
-      "sent"    Ctrl+R 已确认发送；
-      "clicked" 已点击页面但未确认发送，页面访问仍可能产生新 Token；
-      "idle"    未与页面交互，本轮不可能产生新 Token。
-
-    各阶段耗时以 INFO 日志输出（毫秒），用于真实 Windows 环境验收。
+    每个阶段都以 "[refresh] 阶段耗时 Nms" 记入日志，实机验证时据此定位卡在哪一步。
     """
-    global _refresh_hwnd
     com_initialized = False
-    hwnd = 0
-    clicked = False
-    sent = False
+    native = None
     stage = "初始化"
     started = time.monotonic()
     stage_started = started
@@ -576,220 +560,146 @@ def refresh_window(fg_timeout: float = 2.0) -> str:
     def mark(name: str) -> None:
         nonlocal stage_started
         now = time.monotonic()
-        log.info("[refresh] %s耗时 %.1fms（累计 %.1fms）",
+        log.info("[refresh] %s耗时 %.0fms（累计 %.0fms）",
                  name, (now - stage_started) * 1000, (now - started) * 1000)
         stage_started = now
 
+    def stop(reason: str) -> bool:
+        """结束本次刷新，把失败原因作为独立日志行，供实机诊断与报告筛选。"""
+        log.warning("[refresh] 中止于「%s」：%s（累计 %.0fms）",
+                    stage, reason, (time.monotonic() - started) * 1000)
+        return False
+
     try:
+        from pywinauto import Desktop, keyboard
+        from pywinauto.uia_defines import NoPatternInterfaceError
         import comtypes
-        import win32api
-        import win32con
         import win32gui
-        from pywinauto import keyboard
-        from pywinauto.controls.hwndwrapper import HwndWrapper
-        from pywinauto.uia_defines import IUIA, NoPatternInterfaceError, get_elem_interface
-        from pywinauto.uia_element_info import UIAElementInfo
 
         comtypes.CoInitializeEx()
         com_initialized = True
 
-        def titled(window: int) -> bool:
-            try:
-                return win32gui.GetWindowText(window).startswith(_REFRESH_TITLE_PREFIXES)
-            except Exception:
-                return False
-
-        stage = "窗口查找"
-        if _refresh_hwnd and win32gui.IsWindow(_refresh_hwnd) and titled(_refresh_hwnd):
-            hwnd = _refresh_hwnd
-            log.info("[refresh] 复用缓存预约窗口 HWND=%d", hwnd)
-        else:
-            found: list[int] = []
-
-            def collect(window: int, _param) -> bool:
-                if titled(window):
-                    found.append(window)
-                return True
-
-            win32gui.EnumWindows(collect, None)
-            if len(found) != 1:
-                log.warning("[refresh] Win32 匹配预约窗口数量=%d，需要唯一窗口", len(found))
-                _refresh_hwnd = None
-                return "idle"
-            hwnd = _refresh_hwnd = found[0]
-            log.info("[refresh] 枚举到预约窗口 HWND=%d", hwnd)
+        stage = "枚举原生窗口"
+        windows = [w for w in Desktop(backend="win32").windows(visible_only=False)
+                   if w.window_text().startswith((RESERVATION_HOST, f"https://{RESERVATION_HOST}"))]
+        if len(windows) != 1:
+            return stop(f"Win32 匹配预约窗口数量={len(windows)}，需要唯一窗口")
         mark("窗口查找")
 
+        native = windows[0]
+        hwnd = native.handle
+        log.info("[refresh] Win32 找到预约窗口: HWND=%d, 最小化=%s", hwnd, native.is_minimized())
         stage = "恢复窗口"
-        if win32gui.IsIconic(hwnd):
-            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+        if native.is_minimized():
+            native.restore()
             deadline = time.monotonic() + 3.0
-            while win32gui.IsIconic(hwnd):
+            while native.is_minimized():
                 if time.monotonic() >= deadline:
-                    log.warning("[refresh] 窗口恢复超时")
-                    return "idle"
-                time.sleep(0.01)
+                    return stop("窗口恢复超时")
+                time.sleep(0.05)
             log.info("[refresh] 最小化窗口已恢复")
         mark("窗口恢复")
 
-        native = HwndWrapper(hwnd)
+        desktop = Desktop(backend="uia")
+
+        def controls():
+            return desktop.window(handle=hwnd).wrapper_object().descendants()
+
+        def on_gym_page(items):
+            return (any(c.element_info.control_type == "Edit"
+                        and c.element_info.name == "请输入搜索的场馆" for c in items)
+                    and any(c.element_info.control_type == "Text"
+                            and c.element_info.name == "场地预约" for c in items))
+
+        def navigation(items):
+            targets = []
+            for ctrl in items:
+                if (ctrl.element_info.control_type != "Text"
+                        or ctrl.element_info.name != "场地预约"
+                        or not ctrl.is_enabled() or not ctrl.is_visible()):
+                    continue
+                try:
+                    if ctrl.iface_invoke is not None:
+                        targets.append(ctrl)
+                except NoPatternInterfaceError:
+                    continue
+            return targets
 
         def ensure_foreground(action: str) -> bool:
             if win32gui.GetForegroundWindow() == hwnd:
                 return True
             log.info("[refresh] %s前窗口失焦: 目标 HWND=%d, 前台 HWND=%d，尝试置前",
                      action, hwnd, win32gui.GetForegroundWindow())
-            deadline = time.monotonic() + max(0.0, float(fg_timeout))
+            deadline = time.monotonic() + 2.0
             while True:
                 try:
-                    # set_focus 先注入鼠标移动事件解除 Windows 前台锁定，再恢复并置前窗口；
-                    # 后台进程直接调用 SetForegroundWindow 会被系统静默拒绝。
                     native.set_focus()
                 except Exception as exc:
                     log.debug("[refresh] 置前尝试失败: %r", exc)
                 if win32gui.GetForegroundWindow() == hwnd:
                     return True
                 if time.monotonic() >= deadline:
-                    log.warning("[refresh] %s前置前失败: 目标 HWND=%d, 前台 HWND=%d",
-                                action, hwnd, win32gui.GetForegroundWindow())
-                    return False
+                    return stop(f"{action}前置前失败: 目标 HWND={hwnd}, "
+                                f"前台 HWND={win32gui.GetForegroundWindow()}")
                 time.sleep(0.05)
 
         stage = "置前窗口"
         if not ensure_foreground("点击"):
-            return "idle"
+            return False
         mark("窗口聚焦")
-
-        stage = "定位控件"
-        window_el = UIAElementInfo(hwnd)
-        iuia = IUIA()
-        descendant_scope = iuia.tree_scope["descendants"]
-        ready_condition = iuia.build_condition(title=_SEARCH_TITLE, control_type="Edit")
-
-        def navigation():
-            targets = []
-            for el in window_el.descendants(title=_NAV_TITLE, control_type="Text"):
-                try:
-                    if not el.enabled or not el.visible:
-                        continue
-                    get_elem_interface(el.element, "Invoke")
-                except NoPatternInterfaceError:
-                    continue
-                targets.append(el)
-            return targets
-
-        def search_box_present() -> bool:
-            try:
-                return window_el.element.FindFirst(descendant_scope, ready_condition) is not None
-            except (comtypes.COMError, ValueError):
-                # 页面切换期间 UIA 树会短暂失效，继续轮询。
-                return False
-
-        deadline = time.monotonic() + 5.0
-        while True:
-            targets = navigation()
-            if len(targets) == 1:
-                target = targets[0]
-                break
-            if time.monotonic() >= deadline:
-                log.warning("[refresh] 导航控件数量=%d，无法唯一定位", len(targets))
-                return "idle"
-            time.sleep(0.02)
-
-        rect = target.rectangle
-        if rect.right <= rect.left or rect.bottom <= rect.top:
-            log.warning("[refresh] 导航控件坐标无效: (%d,%d)-(%d,%d)",
-                        rect.left, rect.top, rect.right, rect.bottom)
-            return "idle"
-        click_x = (rect.left + rect.right) // 2
-        click_y = (rect.top + rect.bottom) // 2
-        mark("控件定位")
 
         # 即使已在场馆列表，也点击导航，让网页获得键盘焦点。
         stage = "点击场地预约"
+        deadline = time.monotonic() + 5.0
+        while True:
+            targets = navigation(controls())
+            if len(targets) == 1:
+                break
+            if time.monotonic() >= deadline:
+                return stop(f"导航控件数量={len(targets)}，无法唯一定位")
+            time.sleep(0.05)
         if win32gui.GetForegroundWindow() != hwnd:
-            log.warning("[refresh] 点击前预约窗口失焦，取消点击")
-            return "idle"
-        win32api.SetCursorPos((click_x, click_y))
-        if win32api.GetCursorPos() != (click_x, click_y):
-            win32api.SetCursorPos((click_x, click_y))
-        clicked = True
-        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
-        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
-        log.info("[refresh] 已点击「场地预约」导航控件 (%d,%d)", click_x, click_y)
+            return stop("点击前预约窗口失焦，取消点击")
+        targets[0].click_input()
+        log.info("[refresh] 已点击「场地预约」导航控件")
         mark("点击")
 
         stage = "确认场馆列表"
         deadline = time.monotonic() + 5.0
-        while not search_box_present():
+        while not on_gym_page(controls()):
             if time.monotonic() >= deadline:
-                log.warning("[refresh] 未返回场馆列表，取消刷新")
-                return "clicked"
-            time.sleep(0.02)
+                return stop("点击后未返回场馆列表")
+            time.sleep(0.05)
         mark("页面确认")
 
         stage = "发送 Ctrl+R"
         # 只有发生失焦、需要重新激活时，才重新读取网页控件。
         if win32gui.GetForegroundWindow() != hwnd:
             if not ensure_foreground("刷新"):
-                return "clicked"
-            if not search_box_present():
-                log.warning("[refresh] 刷新前场馆列表已变化")
-                return "clicked"
+                return False
+            if not on_gym_page(controls()):
+                return stop("刷新前场馆列表已变化")
         if win32gui.GetForegroundWindow() != hwnd:
-            log.warning("[refresh] 发送 Ctrl+R 前再次失焦，取消发送")
-            return "clicked"
+            return stop("发送 Ctrl+R 前再次失焦，取消发送")
         keyboard.send_keys("^r", pause=0.02, turn_off_numlock=False, vk_packet=False)
-        sent = True
-        log.info("[refresh] 已发送 Ctrl+R（前台 HWND=%d）", win32gui.GetForegroundWindow())
+        log.info("[refresh] 已发送 Ctrl+R")
         mark("发送快捷键")
-        return "sent"
+        return True
     except Exception as exc:
-        log.exception("[refresh] %s失败: %s: %r", stage, type(exc).__name__, exc)
-        return "clicked" if clicked else "idle"
+        log.exception("[refresh] 中止于「%s」：%s: %r", stage, type(exc).__name__, exc)
+        return False
     finally:
-        if hwnd:
+        if native is not None:
             try:
-                if not win32gui.IsIconic(hwnd):
-                    win32gui.ShowWindow(hwnd, win32con.SW_MINIMIZE)
+                if not native.is_minimized():
+                    native.minimize()
                     log.info("[refresh] 预约窗口已最小化")
             except Exception as exc:
                 log.warning("[refresh] 预约窗口最小化失败: %r", exc)
-        outcome = "sent" if sent else ("clicked" if clicked else "idle")
-        log.info("[refresh] 窗口操作总耗时 %.1fms（结果=%s，最后阶段=%s）",
-                 (time.monotonic() - started) * 1000, outcome, stage)
+        log.info("[refresh] 窗口操作总耗时 %.0fms（最后阶段=%s）",
+                 (time.monotonic() - started) * 1000, stage)
         if com_initialized:
             comtypes.CoUninitialize()
-
-
-def capture_token_from_flow(
-    flow,
-    host: str = RESERVATION_HOST,
-    config_path: Path = CONFIG_PATH,
-) -> None:
-    """初始化专用：配置还没有凭证时，取业务请求携带的当前凭证。"""
-    try:
-        if flow.request.pretty_host != host:
-            return
-        token = flow.request.query.get("token")
-        if not token:
-            return
-
-        text = config_path.read_text(encoding="utf-8")
-        m = re.search(r'(?m)^\s*token\s*=\s*"([^"]*)"', text)
-        if m and m.group(1):
-            return
-
-        new, n = re.subn(
-            r'(?m)^(\s*token\s*=\s*)"[^"]*"',
-            rf'\1"{token}"',
-            text, count=1,
-        )
-        if n:
-            config_path.write_text(new, encoding="utf-8")
-            print(f"[{time.strftime('%H:%M:%S')}] [TOKEN] 初始凭证 {token[:8]}...")
-    except Exception as e:
-        print(f"[TOKEN] 写入失败: {e}")
 
 
 def kill_port_holder(host: str, port: int) -> list[int]:
