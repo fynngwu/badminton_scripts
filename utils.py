@@ -587,7 +587,7 @@ def refresh_window(fg_timeout: float = 2.0) -> str:
         import win32gui
         from pywinauto import keyboard
         from pywinauto.controls.hwndwrapper import HwndWrapper
-        from pywinauto.uia_defines import IUIA
+        from pywinauto.uia_defines import IUIA, NoPatternInterfaceError, get_elem_interface
         from pywinauto.uia_element_info import UIAElementInfo
 
         comtypes.CoInitializeEx()
@@ -669,8 +669,13 @@ def refresh_window(fg_timeout: float = 2.0) -> str:
         def navigation():
             targets = []
             for el in window_el.descendants(title=_NAV_TITLE, control_type="Text"):
-                if el.enabled and el.visible:
-                    targets.append(el)
+                try:
+                    if not el.enabled or not el.visible:
+                        continue
+                    get_elem_interface(el.element, "Invoke")
+                except NoPatternInterfaceError:
+                    continue
+                targets.append(el)
             return targets
 
         def search_box_present() -> bool:

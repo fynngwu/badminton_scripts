@@ -100,13 +100,13 @@ def test_save_order_timeout_is_uncertain(monkeypatch):
 class _FakeWindows:
     """记录 refresh_window 对外部世界做了什么，不模拟真实窗口行为。"""
 
-    def __init__(self, *, windows, foreground, nav_count=1, gym_search=True,
-                 iconic=False, focus_works=True):
+    def __init__(self, *, windows, foreground, nav_invokable=(True,),
+                 gym_search=True, iconic=False, focus_works=True):
         self.windows = list(windows)
         self.foreground = foreground
         self.iconic = iconic
         self.focus_works = focus_works
-        self.nav_count = nav_count
+        self.nav_invokable = list(nav_invokable)
         self.gym_search = gym_search
         self.lose_focus_on_click = False
         self.enumerate_count = 0
@@ -122,26 +122,30 @@ class _FakeWindows:
         self.clicked = False
         self.fail_ready_once = False
         self.raise_on_click = False
+        self.clock = 1000.0
 
 
 def _install_windows_fakes(monkeypatch, *, windows=(1234,), foreground=1234,
-                           nav_count=1, gym_search=True, iconic=False,
+                           nav_invokable=(True,), gym_search=True, iconic=False,
                            focus_works=True):
     state = _FakeWindows(windows=windows, foreground=foreground,
-                         nav_count=nav_count, gym_search=gym_search,
+                         nav_invokable=nav_invokable, gym_search=gym_search,
                          iconic=iconic, focus_works=focus_works)
 
     class FakeElement:
-        def __init__(self, name, control_type):
+        def __init__(self, name, control_type, *, invokable=True, index=0):
             self.name = name
             self.control_type = control_type
             self.enabled = True
             self.visible = True
-            self.element = object()
+            self.invokable = invokable
+            self.left = 10 + 100 * index
+            self.element = self
 
         @property
         def rectangle(self):
-            return types.SimpleNamespace(left=10, top=20, right=110, bottom=60)
+            return types.SimpleNamespace(left=self.left, top=20,
+                                         right=self.left + 100, bottom=60)
 
     class FakeWindowElement:
         def FindFirst(self, scope, condition):
@@ -165,8 +169,8 @@ def _install_windows_fakes(monkeypatch, *, windows=(1234,), foreground=1234,
             title = kwargs.get('title')
             control_type = kwargs.get('control_type')
             if title == '场地预约' and control_type == 'Text':
-                return [FakeElement(title, control_type)
-                        for _ in range(state.nav_count)]
+                return [FakeElement(title, control_type, invokable=flag, index=i)
+                        for i, flag in enumerate(state.nav_invokable)]
             return []
 
     class FakeIUIA:
@@ -251,8 +255,18 @@ def _install_windows_fakes(monkeypatch, *, windows=(1234,), foreground=1234,
     comtypes.CoInitializeEx = lambda: None
     comtypes.CoUninitialize = lambda: None
 
+    class NoPatternInterfaceError(Exception):
+        pass
+
+    def get_elem_interface(element, name):
+        if not element.invokable:
+            raise NoPatternInterfaceError()
+        return object()
+
     uia_defines = types.ModuleType('pywinauto.uia_defines')
     uia_defines.IUIA = FakeIUIA
+    uia_defines.NoPatternInterfaceError = NoPatternInterfaceError
+    uia_defines.get_elem_interface = get_elem_interface
     uia_element_info = types.ModuleType('pywinauto.uia_element_info')
     uia_element_info.UIAElementInfo = FakeUIAElementInfo
     keyboard = types.ModuleType('pywinauto.keyboard')
@@ -281,7 +295,12 @@ def _install_windows_fakes(monkeypatch, *, windows=(1234,), foreground=1234,
         ('pywinauto.uia_element_info', uia_element_info),
     ):
         monkeypatch.setitem(sys.modules, name, module)
-    monkeypatch.setattr('time.sleep', lambda seconds: state.sleeps.append(seconds))
+    def fake_sleep(seconds):
+        state.sleeps.append(seconds)
+        state.clock += seconds
+
+    monkeypatch.setattr('time.sleep', fake_sleep)
+    monkeypatch.setattr('time.monotonic', lambda: state.clock)
     return state
 
 
@@ -391,5 +410,35 @@ def test_refresh_window_treats_mid_click_error_as_clicked(monkeypatch):
     state.raise_on_click = True
 
     assert utils.refresh_window(fg_timeout=0.0) == 'clicked'
+    assert state.sent_keys == []
+    assert state.minimized == [1234]
+
+
+def test_refresh_window_selects_only_invokable_navigation(monkeypatch):
+    utils = _load_utils(monkeypatch)
+    state = _install_windows_fakes(monkeypatch, nav_invokable=(False, True))
+
+    assert utils.refresh_window() == 'sent'
+    assert ('move', (160, 40)) in state.clicks
+    assert state.sent_keys
+    assert state.minimized == [1234]
+
+
+def test_refresh_window_rejects_navigation_when_both_invokable(monkeypatch):
+    utils = _load_utils(monkeypatch)
+    state = _install_windows_fakes(monkeypatch, nav_invokable=(True, True))
+
+    assert utils.refresh_window() == 'idle'
+    assert state.clicks == []
+    assert state.sent_keys == []
+    assert state.minimized == [1234]
+
+
+def test_refresh_window_fails_when_navigation_not_invokable(monkeypatch):
+    utils = _load_utils(monkeypatch)
+    state = _install_windows_fakes(monkeypatch, nav_invokable=(False,))
+
+    assert utils.refresh_window() == 'idle'
+    assert state.clicks == []
     assert state.sent_keys == []
     assert state.minimized == [1234]
