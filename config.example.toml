@@ -44,10 +44,6 @@ save_order_at = "20:00:06"
 # ═══════════════════════════════════════════════════════════════
 [tuning]
 
-# ── 抓 Token ──
-refresh_pre_click_delay   = 0.05    # 点击窗口前的等待（秒）
-refresh_post_click_delay  = 0.05    # 点击后到按 Ctrl+R 之间的等待（秒）
-
 # ── 刷新场地 ──
 probe_backoff             = 3.0     # 探测场地失败后的退避（秒）
 probe_max_tries           = 6       # 探测场地最多重试次数

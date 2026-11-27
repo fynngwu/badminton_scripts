@@ -42,8 +42,6 @@ log = logging.getLogger("court")
 # ══════════════════════════════════════════════════════
 @dataclass
 class Tuning:
-    refresh_pre_click_delay:  float = 0.05
-    refresh_post_click_delay: float = 0.05
     probe_backoff:            float = 1.0
     probe_max_tries:          int   = 6
     token_refresh_lead_sec:   int   = 120
@@ -454,15 +452,14 @@ class Engine:
             for round_no in range(1, self.TOKEN_ROUNDS + 1):
                 log.info("会话刷新 %d/%d：触发 Ctrl+R，随后等待 %.1fs",
                          round_no, self.TOKEN_ROUNDS, wait)
+                refresh_started = time.monotonic()
                 try:
-                    sent = await asyncio.to_thread(
-                        refresh_window,
-                        pre_click_delay=self.tuning.refresh_pre_click_delay,
-                        post_click_delay=self.tuning.refresh_post_click_delay,
-                    )
+                    sent = await asyncio.to_thread(refresh_window)
                 except Exception as exc:
                     sent = False
                     log.warning("预约窗口刷新异常: %s", exc)
+                refresh_ms = (time.monotonic() - refresh_started) * 1000
+                capture_started = time.monotonic()
                 refreshes += 1
                 if not sent:
                     log.warning("预约窗口未确认发送 Ctrl+R，仍检查本轮是否捕获新凭证")
@@ -473,8 +470,12 @@ class Engine:
                     self.reload_config(force=True)
                     token = self.session.token
                     if token and token != old:
+                        capture_ms = (time.monotonic() - capture_started) * 1000
                         await self.bus.publish("config.updated", self.public_config())
-                        log.info("✅ Token 已更新（第 %d 轮）: %s...", round_no, token[:8])
+                        log.info("✅ Token 已更新（第 %d 轮）: %s...（窗口操作 %.0fms，"
+                                 "刷新后捕获 %.0fms，合计 %.0fms）",
+                                 round_no, token[:8], refresh_ms,
+                                 capture_ms, refresh_ms + capture_ms)
                         return {"ok": True, "msg": f"Token 已更新（第 {round_no} 轮）",
                                 "token_preview": token[:8] + "...", "attempts": refreshes}
                     if time.monotonic() >= deadline:
